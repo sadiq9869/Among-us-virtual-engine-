@@ -58,4 +58,7 @@ interface IBActivityManagerService {
     void getIntentSender(in IBinder target, String packageName, int uid, int userId);
     String getPackageForIntentSender(in IBinder target, int userId);
     int getUidForIntentSender(in IBinder target, int userId);
+
+    // Returns the virtual app id of the virtual process with this real pid, or -1 if unknown
+    int getBUidByPid(int pid);
 }
