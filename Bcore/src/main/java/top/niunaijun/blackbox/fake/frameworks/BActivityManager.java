@@ -448,4 +448,16 @@ public class BActivityManager extends BlackManager<IBActivityManagerService> {
         }
         return -1;
     }
+
+    public int getBUidByPid(int pid) {
+        try {
+            IBActivityManagerService service = getService();
+            if (service != null) {
+                return service.getBUidByPid(pid);
+            }
+        } catch (RemoteException e) {
+            Slog.w(TAG, "getBUidByPid failed: " + e.getMessage());
+        }
+        return -1;
+    }
 }
