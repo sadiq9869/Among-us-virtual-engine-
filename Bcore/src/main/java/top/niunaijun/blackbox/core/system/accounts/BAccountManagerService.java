@@ -540,8 +540,14 @@ public class BAccountManagerService extends IBAccountManagerService.Stub impleme
         final String callerPkg = loginOptions.getString(AccountManager.KEY_ANDROID_PACKAGE_NAME);
 
         
-        loginOptions.putInt(AccountManager.KEY_CALLER_UID, Binder.getCallingUid());
-        loginOptions.putInt(AccountManager.KEY_CALLER_PID, Binder.getCallingPid());
+        int callerPid = Binder.getCallingPid();
+        int callerUid = Binder.getCallingUid();
+        ProcessRecord callerProcess = BProcessManagerService.get().findProcessByPid(callerPid);
+        if (callerProcess != null) {
+            callerUid = BUserHandle.getAppId(callerProcess.buid);
+        }
+        loginOptions.putInt(AccountManager.KEY_CALLER_UID, callerUid);
+        loginOptions.putInt(AccountManager.KEY_CALLER_PID, callerPid);
 
         if (notifyOnAuthFailure) {
             loginOptions.putBoolean(AccountManagerCompat.KEY_NOTIFY_ON_FAILURE, true);
