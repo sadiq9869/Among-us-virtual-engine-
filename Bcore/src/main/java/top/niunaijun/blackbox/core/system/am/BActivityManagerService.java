@@ -20,6 +20,7 @@ import top.niunaijun.blackbox.core.system.BProcessManagerService;
 import top.niunaijun.blackbox.core.system.ISystemService;
 import top.niunaijun.blackbox.core.system.ProcessRecord;
 import top.niunaijun.blackbox.core.system.pm.BPackageManagerService;
+import top.niunaijun.blackbox.core.system.user.BUserHandle;
 import top.niunaijun.blackbox.entity.AppConfig;
 import top.niunaijun.blackbox.entity.UnbindRecord;
 import top.niunaijun.blackbox.entity.am.PendingResultData;
@@ -261,6 +262,15 @@ public class BActivityManagerService extends IBActivityManagerService.Stub imple
             }
         }
         return -1;
+    }
+
+    @Override
+    public int getBUidByPid(int pid) throws RemoteException {
+        ProcessRecord record = BProcessManagerService.get().findProcessByPid(pid);
+        if (record == null) {
+            return -1;
+        }
+        return BUserHandle.getAppId(record.buid);
     }
 
     @Override
