@@ -86,8 +86,27 @@ public class NativeCore {
         }
     }
 
+    private static volatile int sDiagCount = 0;
+
     @Keep
     public static int getCallingUid(int origCallingUid) {
+        int result = getCallingUidImpl(origCallingUid);
+        try {
+            if (sDiagCount < 300 && origCallingUid == BlackBoxCore.getHostUid()) {
+                String pkg = BlackBoxCore.getAppPackageName();
+                if (pkg != null && pkg.startsWith("com.google.android.gms")) {
+                    sDiagCount++;
+                    Log.i(TAG, "DIAG1 getCallingUid orig=" + origCallingUid + " result=" + result
+                            + " callerPid=" + android.os.Binder.getCallingPid()
+                            + " myPid=" + Process.myPid() + " pkg=" + pkg);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return result;
+    }
+
+    private static int getCallingUidImpl(int origCallingUid) {
         try {
             
             if (origCallingUid > 0 && origCallingUid < Process.FIRST_APPLICATION_UID)
