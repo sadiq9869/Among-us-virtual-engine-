@@ -2,16 +2,19 @@ package top.niunaijun.blackbox.core;
 
 
 import android.os.Process;
+import android.os.SystemClock;
 import android.util.Log;
 
 import androidx.annotation.Keep;
 
 import java.io.File;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 
 import dalvik.system.DexFile;
 import top.niunaijun.blackbox.BlackBoxCore;
 import top.niunaijun.blackbox.app.BActivityThread;
+import top.niunaijun.blackbox.fake.frameworks.BActivityManager;
 import top.niunaijun.blackbox.utils.compat.DexFileCompat;
 
 import top.niunaijun.blackbox.core.system.JarManager;
@@ -39,6 +42,50 @@ public class NativeCore {
     public static native boolean disableResourceLoading();
 
 
+    private static final ThreadLocal<Boolean> sResolvingCaller = new ThreadLocal<>();
+    private static final ConcurrentHashMap<Integer, long[]> sCallerCache = new ConcurrentHashMap<>();
+    private static final long CALLER_CACHE_HIT_MS = 5000L;
+    private static final long CALLER_CACHE_MISS_MS = 500L;
+    private static final int MAX_CALLER_CACHE = 256;
+    private static volatile int sCallerLogCount = 0;
+
+    /**
+     * Virtual app id of the process that is calling us right now (looked up by real pid
+     * from the BlackBox system service), or -1 when it cannot be resolved.
+     */
+    private static int resolveCallerBUid() {
+        if (Boolean.TRUE.equals(sResolvingCaller.get())) {
+            return -1;
+        }
+        sResolvingCaller.set(Boolean.TRUE);
+        try {
+            int callerPid = android.os.Binder.getCallingPid();
+            if (callerPid <= 0 || callerPid == Process.myPid()) {
+                return -1;
+            }
+            long now = SystemClock.uptimeMillis();
+            long[] cached = sCallerCache.get(callerPid);
+            if (cached != null && now < cached[1]) {
+                return (int) cached[0];
+            }
+            int bUid = BActivityManager.get().getBUidByPid(callerPid);
+            if (sCallerCache.size() >= MAX_CALLER_CACHE) {
+                sCallerCache.clear();
+            }
+            sCallerCache.put(callerPid, new long[]{bUid, now + (bUid > 0 ? CALLER_CACHE_HIT_MS : CALLER_CACHE_MISS_MS)});
+            if (sCallerLogCount < 40) {
+                sCallerLogCount++;
+                Log.i(TAG, "gms caller pid=" + callerPid + " -> bUid=" + bUid);
+            }
+            return bUid;
+        } catch (Throwable t) {
+            Log.w(TAG, "resolveCallerBUid failed: " + t.getMessage());
+            return -1;
+        } finally {
+            sResolvingCaller.remove();
+        }
+    }
+
     @Keep
     public static int getCallingUid(int origCallingUid) {
         try {
@@ -52,8 +99,13 @@ public class NativeCore {
             if (origCallingUid == BlackBoxCore.getHostUid()) {
                 
                 String appPackageName = BlackBoxCore.getAppPackageName();
-                if (appPackageName != null && appPackageName.equals("com.google.android.gms")){
-                    
+                if (appPackageName != null && appPackageName.equals("com.google.android.gms")) {
+                    // microG checks "does the calling uid own the package name the caller claims?".
+                    // Answer with the real caller (looked up by pid), not with a value fixed at process start.
+                    int callerBUid = resolveCallerBUid();
+                    if (callerBUid > 0 && callerBUid < Process.LAST_APPLICATION_UID) {
+                        return callerBUid;
+                    }
                 }
                 
                 
