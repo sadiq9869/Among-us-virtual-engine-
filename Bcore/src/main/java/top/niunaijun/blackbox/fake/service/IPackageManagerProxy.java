@@ -135,7 +135,7 @@ public class IPackageManagerProxy extends BinderInvocationStub {
             
             
             if ("com.android.vending".equals(packageName)) {
-                return createFakeGooglePlayServicesPackageInfo();
+                return getRealOrFakePlayStoreInfo(who, method, args);
             }
             
             PackageInfo packageInfo = BlackBoxCore.getBPackageManager().getPackageInfo(packageName, flags, BlackBoxCore.getUserId());
@@ -160,6 +160,24 @@ public class IPackageManagerProxy extends BinderInvocationStub {
             return null;
         }
         
+        private PackageInfo getRealOrFakePlayStoreInfo(Object who, Method method, Object[] args) {
+            try {
+                Object real = method.invoke(who, args);
+                if (real instanceof PackageInfo) {
+                    PackageInfo realInfo = (PackageInfo) real;
+                    boolean hasSigs = realInfo.signatures != null
+                            || (Build.VERSION.SDK_INT >= 28 && realInfo.signingInfo != null);
+                    Slog.d(TAG, "DIAG2 Play Store info from host: version=" + realInfo.versionName
+                            + " hasSignatures=" + hasSigs);
+                    return realInfo;
+                }
+                Slog.w(TAG, "DIAG2 host returned no Play Store info, using fake (no signature)");
+            } catch (Throwable t) {
+                Slog.w(TAG, "DIAG2 host Play Store lookup failed, using fake (no signature): " + t);
+            }
+            return createFakeGooglePlayServicesPackageInfo();
+        }
+
         private PackageInfo createFakeGooglePlayServicesPackageInfo() {
             PackageInfo packageInfo = new PackageInfo();
             packageInfo.packageName = "com.android.vending";
