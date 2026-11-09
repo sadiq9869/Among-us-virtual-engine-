@@ -135,6 +135,14 @@ class BlackBoxLoader {
                                                 TAG,
                                                 "beforeCreateApplication: pkg $packageName, processName $processName,userID:${BActivityThread.getUserId()}"
                                         )
+                                        if (packageName == "com.innersloth.spacemafia") {
+                                            try {
+                                                System.loadLibrary("menutest")
+                                                Log.d(TAG, "MENUTEST loadLibrary OK for $processName")
+                                            } catch (t: Throwable) {
+                                                Log.e(TAG, "MENUTEST loadLibrary FAILED: ${t}")
+                                            }
+                                        }
                                     } catch (e: Exception) {
                                         Log.e(TAG, "Error in beforeCreateApplication: ${e.message}")
                                     }
