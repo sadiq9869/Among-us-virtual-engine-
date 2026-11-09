@@ -1,9 +1,10 @@
-// MENUTEST v2: diagnostic only. Waits for libil2cpp.so to appear in this process,
-// then logs when it appeared and whether common il2cpp export functions can be resolved.
+// MENUTEST v3: diagnostic only. Waits for libil2cpp.so to appear in this process,
+// then uses xdl (namespace-independent) to check whether il2cpp export functions can be resolved.
 // It does not hook, patch or change anything in the game.
 #include <android/log.h>
 #include <jni.h>
 #include <dlfcn.h>
+#include "xdl.h"
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
@@ -73,14 +74,15 @@ static void *watcher(void *) {
     }
     LOGI("MENUTEST libil2cpp.so seen after %ld ms, base=0x%lx path=%s", nowMs() - t0, base, path);
 
-    void *h = dlopen(path, RTLD_NOW | RTLD_NOLOAD);
+    void *h = xdl_open("libil2cpp.so", XDL_DEFAULT);
+    LOGI("MENUTEST xdl_open(name) handle=%p", h);
     if (!h) {
-        const char *e = dlerror();
-        LOGI("MENUTEST dlopen(NOLOAD) failed: %s", e ? e : "(null)");
-        h = RTLD_DEFAULT;
-        LOGI("MENUTEST falling back to RTLD_DEFAULT for dlsym");
-    } else {
-        LOGI("MENUTEST dlopen(NOLOAD) OK handle=%p", h);
+        h = xdl_open(path, XDL_DEFAULT);
+        LOGI("MENUTEST xdl_open(path) handle=%p", h);
+    }
+    if (!h) {
+        LOGI("MENUTEST xdl_open failed, cannot resolve symbols");
+        return nullptr;
     }
 
     const char *names[] = {
@@ -96,8 +98,10 @@ static void *watcher(void *) {
         "il2cpp_runtime_invoke",
     };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        void *sym = dlsym(h, names[i]);
-        LOGI("MENUTEST sym %s = %p", names[i], sym);
+        size_t sz = 0;
+        void *d = xdl_dsym(h, names[i], &sz);
+        void *a = xdl_sym(h, names[i], nullptr);
+        LOGI("MENUTEST sym %s dsym=%p sym=%p", names[i], d, a);
     }
     LOGI("MENUTEST watcher done");
     return nullptr;
@@ -105,7 +109,7 @@ static void *watcher(void *) {
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v2 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v3 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
