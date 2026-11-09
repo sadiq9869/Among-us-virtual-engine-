@@ -78,13 +78,6 @@ public class ContentProviderStub extends ClassInvocationStub implements BContent
         }
         
         
-        // MICROGUID: a provider living in the container's gms process sees a virtual
-        // Binder.getCallingUid() (NativeCore), so the AttributionSource must carry the same
-        // virtual app id, otherwise "Calling uid: X doesn't match source uid: Y".
-        if ("com.google.android.gms".equals(mAppPkg) && args != null) {
-            replaceAttributionUidForVirtualGms(args, methodName);
-        }
-
         methodName = method.getName();
         if (methodName.equals("query") || methodName.equals("insert") ||
             methodName.equals("update") || methodName.equals("delete") || 
@@ -131,42 +124,6 @@ public class ContentProviderStub extends ClassInvocationStub implements BContent
         }
     }
     
-    // Works on a COPY: the caller's context shares one AttributionSource object with every
-    // other provider call of that process, so it must not be changed in place.
-    private void replaceAttributionUidForVirtualGms(Object[] args, String methodName) {
-        try {
-            int virtualUid = BUserHandle.getAppId(BActivityThread.getBUid());
-            for (int i = 0; i < args.length; i++) {
-                Object arg = args[i];
-                if (arg instanceof Parcelable
-                        && arg.getClass().getName().contains("AttributionSource")) {
-                    Object copy = copyParcelable((Parcelable) arg);
-                    if (copy != null) {
-                        ContextCompat.fixAttributionSourceState(copy, virtualUid);
-                        args[i] = copy;
-                        Slog.i(TAG, "MICROGUID " + methodName
-                                + " attribution uid -> " + virtualUid);
-                    }
-                }
-            }
-        } catch (Throwable t) {
-            Slog.w(TAG, "MICROGUID failed: " + t);
-        }
-    }
-
-    private static Object copyParcelable(Parcelable src) throws Throwable {
-        Parcel parcel = Parcel.obtain();
-        try {
-            src.writeToParcel(parcel, 0);
-            parcel.setDataPosition(0);
-            Parcelable.Creator<?> creator =
-                    (Parcelable.Creator<?>) src.getClass().getField("CREATOR").get(null);
-            return creator.createFromParcel(parcel);
-        } finally {
-            parcel.recycle();
-        }
-    }
-
     private Object getSafeDefaultValue(String methodName) {
         switch (methodName) {
             case "query":
