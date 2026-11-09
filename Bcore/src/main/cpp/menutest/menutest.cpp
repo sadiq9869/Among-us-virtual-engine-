@@ -1,4 +1,7 @@
-// MENUTEST v5: diagnostic only (read-only). No hooks, no patches, nothing is changed in the game.
+// MENUTEST v6: diagnostic only (read-only). No hooks, no patches, nothing is changed in the game.
+// Change vs v5: NO il2cpp call at all until kStartDelayMs after the watcher starts. The v5 log showed that
+// il2cpp_domain_get returns non-null while Unity is still inside il2cpp_init, and that the game then aborted
+// inside il2cpp_init. A non-null domain is therefore NOT a readiness signal.
 // Change vs v4: every il2cpp call runs inside a SIGSEGV/SIGBUS guard (sigsetjmp/siglongjmp), so a call
 // made before il2cpp is initialised does not kill the game; it is logged and retried.
 // Steps: wait for libil2cpp.so -> resolve il2cpp API with xdl -> probe il2cpp domain (guarded, retry)
@@ -289,6 +292,10 @@ static void *watcher(void *) {
 
     // probe il2cpp_domain_get: v4 crashed here-ish (null deref inside libil2cpp, 3 frames deep).
     // Now guarded: a fault means "il2cpp not ready yet", we wait and retry.
+    const long kStartDelayMs = 30000; // UNCALIBRATED guess: how long Unity needs to finish il2cpp_init
+    LOGI("MENUTEST waiting until %ld ms before the first il2cpp call (no il2cpp calls until then)", kStartDelayMs);
+    while (nowMs() - t0 < kStartDelayMs) usleep(250 * 1000);
+    LOGI("MENUTEST start delay over at %ld ms", nowMs() - t0);
     LOGI("MENUTEST calling il2cpp_domain_get (guarded)");
     void *domain = nullptr;
     int tries = 0, faults = 0;
@@ -318,14 +325,19 @@ static void *watcher(void *) {
 
     // wait for Assembly-CSharp
     AsmArg aa = {domain, nullptr, 0, false};
-    int asmFaults = 0;
+    int asmFaults = 0, asmTries = 0;
     while (nowMs() - t0 < 90000 && !aa.image && asmFaults < 10) {
         bool ok = guarded(asmFn, &aa);
         if (!ok) {
             asmFaults++;
             LOGI("MENUTEST assembly scan FAULT #%d, step=%s", asmFaults, g_step);
         }
-        if (!aa.image) usleep(1000 * 1000);
+        if (!aa.image) {
+            asmTries++;
+            if (asmTries <= 2 || asmTries % 5 == 0)
+                LOGI("MENUTEST Assembly-CSharp not yet visible (try %d, asmCount=%zu)", asmTries, aa.count);
+            usleep(1000 * 1000);
+        }
     }
     if (!aa.image) {
         LOGI("MENUTEST Assembly-CSharp not found (faults=%d)", asmFaults);
@@ -338,13 +350,13 @@ static void *watcher(void *) {
         LOGI("MENUTEST dump FAULT, last step=%s", g_step);
         return nullptr;
     }
-    LOGI("MENUTEST v5 watcher done after %ld ms", nowMs() - t0);
+    LOGI("MENUTEST v6 watcher done after %ld ms", nowMs() - t0);
     return nullptr;
 }
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v5 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v6 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
