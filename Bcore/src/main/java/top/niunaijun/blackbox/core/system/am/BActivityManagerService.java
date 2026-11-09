@@ -1,4 +1,4 @@
-package top.niunaijun.blackbox.core.system.am;
+5package top.niunaijun.blackbox.core.system.am;
 
 import android.app.ActivityManager;
 import android.content.ComponentName;
@@ -167,7 +167,14 @@ public class BActivityManagerService extends IBActivityManagerService.Stub imple
         for (ActivityManager.RunningAppProcessInfo runningProcess : runningAppProcesses) {
             runningProcessMap.put(runningProcess.pid, runningProcess);
         }
-        List<ProcessRecord> packageProcessAsUser = BProcessManagerService.get().getPackageProcessAsUser(callerPackage, userId);
+        // microG (com.google.android.gms) must be able to map the pid of any virtual app that calls it
+        // (e.g. Play Games) to a package name, so it gets every virtual process, not only its own.
+        List<ProcessRecord> packageProcessAsUser;
+        if ("com.google.android.gms".equals(callerPackage)) {
+            packageProcessAsUser = BProcessManagerService.get().getAllProcessAsUser(userId);
+        } else {
+            packageProcessAsUser = BProcessManagerService.get().getPackageProcessAsUser(callerPackage, userId);
+        }
 
         RunningAppProcessInfo appProcessInfo = new RunningAppProcessInfo();
         for (ProcessRecord processRecord : packageProcessAsUser) {
@@ -182,6 +189,13 @@ public class BActivityManagerService extends IBActivityManagerService.Stub imple
                 }
                 appProcessInfo.mAppProcessInfoList.add(runningAppProcessInfo);
             }
+        }
+        if ("com.google.android.gms".equals(callerPackage)) {
+            StringBuilder sb = new StringBuilder();
+            for (ActivityManager.RunningAppProcessInfo info : appProcessInfo.mAppProcessInfoList) {
+                sb.append(info.pid).append('=').append(info.pkgList == null ? "null" : java.util.Arrays.toString(info.pkgList)).append(' ');
+            }
+            Slog.d(TAG, "RUNPROC caller=" + callerPackage + " count=" + appProcessInfo.mAppProcessInfoList.size() + " " + sb);
         }
         return appProcessInfo;
     }
