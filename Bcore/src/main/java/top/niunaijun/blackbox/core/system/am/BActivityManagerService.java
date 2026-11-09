@@ -1,4 +1,4 @@
-5package top.niunaijun.blackbox.core.system.am;
+package top.niunaijun.blackbox.core.system.am;
 
 import android.app.ActivityManager;
 import android.content.ComponentName;
