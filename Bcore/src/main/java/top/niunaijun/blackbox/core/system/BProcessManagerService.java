@@ -260,6 +260,18 @@ public class BProcessManagerService implements ISystemService {
         }
     }
 
+    public List<ProcessRecord> getAllProcessAsUser(int userId) {
+        synchronized (mPidsSelfLocked) {
+            List<ProcessRecord> result = new ArrayList<>();
+            for (ProcessRecord processRecord : mPidsSelfLocked) {
+                if (processRecord.userId == userId) {
+                    result.add(processRecord);
+                }
+            }
+            return result;
+        }
+    }
+
     public int getBUidByPidOrPackageName(int pid, String packageName) {
         ProcessRecord callingProcess = findProcessByPid(pid);
         if (callingProcess == null) {
