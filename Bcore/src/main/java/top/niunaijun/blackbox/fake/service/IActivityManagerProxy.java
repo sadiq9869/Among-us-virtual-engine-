@@ -148,8 +148,15 @@ public class IActivityManagerProxy extends ClassInvocationStub {
                 // MICROGPROV: microG's own providers (com.google.android.gms.microg.settings,
                 // .profile) live only inside the container. If the virtual package manager
                 // knows the authority, serve it from the container instead of the real system.
+                // Only for OTHER container apps (vending, games). microG's own processes keep the
+                // old behaviour: routing them here started the main gms process in the middle of
+                // gms:ui startup and broke MainSettingsActivity.
                 boolean useVirtualMicrog = false;
-                if (((String) auth).startsWith("com.google.android.gms.microg.")) {
+                String microgCallerPkg = BActivityThread.getAppPackageName();
+                if (((String) auth).startsWith("com.google.android.gms.microg.")
+                        && "com.google.android.gms".equals(microgCallerPkg)) {
+                    Slog.i(TAG, "MICROGPROV skip auth=" + auth + " caller=" + microgCallerPkg);
+                } else if (((String) auth).startsWith("com.google.android.gms.microg.")) {
                     try {
                         ProviderInfo microgInfo = BlackBoxCore.getBPackageManager()
                                 .resolveContentProvider(
@@ -158,6 +165,7 @@ public class IActivityManagerProxy extends ClassInvocationStub {
                         Slog.i(TAG, "MICROGPROV auth=" + auth
                                 + " virtual=" + (microgInfo != null
                                 ? microgInfo.packageName + "/" + microgInfo.name : "null")
+                                + " caller=" + microgCallerPkg
                                 + " appPid=" + BActivityThread.getAppPid());
                     } catch (Throwable t) {
                         Slog.e(TAG, "MICROGPROV resolve failed for " + auth, t);
