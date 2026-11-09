@@ -5,6 +5,7 @@ import top.niunaijun.blackboxa.bean.AppInfo
 import top.niunaijun.blackboxa.data.AppsRepository
 import top.niunaijun.blackboxa.view.base.BaseViewModel
 import android.util.Log
+import top.niunaijun.blackboxa.util.HostGameSync
 
 
 class AppsViewModel(private val repo: AppsRepository) : BaseViewModel() {
@@ -70,6 +71,24 @@ class AppsViewModel(private val repo: AppsRepository) : BaseViewModel() {
     fun launchApk(packageName: String, userID: Int) {
         launchOnUI {
             repo.launchApk(packageName, userID, launchLiveData)
+        }
+    }
+
+    fun launchAmongUs(userId: Int) {
+        launchOnUI {
+            val out = HostGameSync.prepare(userId)
+            when (out.state) {
+                HostGameSync.State.NOT_ON_HOST, HostGameSync.State.FAILED -> {
+                    resultLiveData.postValue(out.msg)
+                }
+                HostGameSync.State.INSTALLED, HostGameSync.State.UPDATED -> {
+                    resultLiveData.postValue(out.msg)
+                    repo.launchApk(HostGameSync.PKG, userId, launchLiveData)
+                }
+                HostGameSync.State.READY -> {
+                    repo.launchApk(HostGameSync.PKG, userId, launchLiveData)
+                }
+            }
         }
     }
 
