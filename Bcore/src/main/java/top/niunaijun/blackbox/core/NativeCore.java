@@ -88,9 +88,45 @@ public class NativeCore {
 
     private static volatile int sDiagCount = 0;
 
+    private static volatile int sAttrLogCount = 0;
+
+    /**
+     * True when the current Java stack is inside android.content.AttributionSource. That class
+     * verifies "source uid == Binder.getCallingUid()" while unparceling, and it must see the REAL
+     * uid (shared host uid), because the uid inside the AttributionSource is a real one too.
+     * Only the first frames are scanned, the check sits right below Binder.getCallingUid.
+     */
+    private static boolean isInsideAttributionSourceCheck() {
+        try {
+            StackTraceElement[] stack = new Throwable().getStackTrace();
+            int limit = Math.min(stack.length, 16);
+            for (int i = 0; i < limit; i++) {
+                if (stack[i].getClassName().startsWith("android.content.AttributionSource")) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
     @Keep
     public static int getCallingUid(int origCallingUid) {
         int result = getCallingUidImpl(origCallingUid);
+        try {
+            // MICROGAS: only look at the stack when we are about to return a virtual uid.
+            if (result != origCallingUid && origCallingUid == BlackBoxCore.getHostUid()
+                    && isInsideAttributionSourceCheck()) {
+                if (sAttrLogCount < 40) {
+                    sAttrLogCount++;
+                    Log.i(TAG, "MICROGAS AttributionSource check: real uid " + origCallingUid
+                            + " kept (virtual would be " + result + ") pkg="
+                            + BlackBoxCore.getAppPackageName());
+                }
+                result = origCallingUid;
+            }
+        } catch (Throwable ignored) {
+        }
         try {
             if (sDiagCount < 300 && origCallingUid == BlackBoxCore.getHostUid()) {
                 String pkg = BlackBoxCore.getAppPackageName();
