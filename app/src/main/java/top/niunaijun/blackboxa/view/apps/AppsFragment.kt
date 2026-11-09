@@ -21,6 +21,7 @@ import top.niunaijun.blackbox.BlackBoxCore
 import top.niunaijun.blackboxa.R
 import top.niunaijun.blackboxa.bean.AppInfo
 import top.niunaijun.blackboxa.databinding.FragmentAppsBinding
+import top.niunaijun.blackboxa.util.HostGameSync
 import top.niunaijun.blackboxa.util.InjectionUtil
 import top.niunaijun.blackboxa.util.ShortcutUtil
 import top.niunaijun.blackboxa.util.inflate
@@ -148,7 +149,11 @@ class AppsFragment : Fragment() {
             mAdapter.setItemClickListener { _, data, _ ->
                 try {
                     showLoading()
-                    viewModel.launchApk(data.packageName, userID)
+                    if (data.packageName == HostGameSync.PKG) {
+                        viewModel.launchAmongUs(userID)
+                    } else {
+                        viewModel.launchApk(data.packageName, userID)
+                    }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error launching app: ${e.message}")
                     hideLoading()
@@ -335,6 +340,9 @@ class AppsFragment : Fragment() {
         try {
             mAdapter.setItemLongClickListener { view, data, _ ->
                 try {
+                    if (data.packageName == HostGameSync.PKG && data.sourceDir.isEmpty()) {
+                        return@setItemLongClickListener
+                    }
                     popupMenu = PopupMenu(requireContext(),view).also {
                         it.inflate(R.menu.app_menu)
                         it.setOnMenuItemClickListener { item ->
@@ -384,8 +392,9 @@ class AppsFragment : Fragment() {
             viewModel.appsLiveData.observe(viewLifecycleOwner) {
                 try {
                     if (it != null) {
-                        mAdapter.setItems(it)
-                        if (it.isEmpty()) {
+                        val shown = HostGameSync.withPinned(it)
+                        mAdapter.setItems(shown)
+                        if (shown.isEmpty()) {
                             viewBinding.stateView.showEmpty()
                         } else {
                             viewBinding.stateView.showContent()
