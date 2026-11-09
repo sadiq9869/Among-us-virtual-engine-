@@ -145,7 +145,26 @@ public class IActivityManagerProxy extends ClassInvocationStub {
                     args[1] = BlackBoxCore.getHostPkg();
                 }
 
-                if (auth.equals("settings")
+                // MICROGPROV: microG's own providers (com.google.android.gms.microg.settings,
+                // .profile) live only inside the container. If the virtual package manager
+                // knows the authority, serve it from the container instead of the real system.
+                boolean useVirtualMicrog = false;
+                if (((String) auth).startsWith("com.google.android.gms.microg.")) {
+                    try {
+                        ProviderInfo microgInfo = BlackBoxCore.getBPackageManager()
+                                .resolveContentProvider(
+                                        (String) auth, GET_META_DATA, BActivityThread.getUserId());
+                        useVirtualMicrog = microgInfo != null;
+                        Slog.i(TAG, "MICROGPROV auth=" + auth
+                                + " virtual=" + (microgInfo != null
+                                ? microgInfo.packageName + "/" + microgInfo.name : "null")
+                                + " appPid=" + BActivityThread.getAppPid());
+                    } catch (Throwable t) {
+                        Slog.e(TAG, "MICROGPROV resolve failed for " + auth, t);
+                    }
+                }
+
+                if (!useVirtualMicrog && (auth.equals("settings")
                         || auth.equals("media")
                         || auth.equals("telephony")
                         || ((String) auth).contains("com.google.android.gms")
@@ -153,7 +172,7 @@ public class IActivityManagerProxy extends ClassInvocationStub {
                         || ((String) auth).contains("com.google.android.gsf")
                         || auth.equals("com.google.android.gms.chimera")
                         || auth.equals("com.huawei.android.launcher.settings")
-                        || auth.equals("com.hihonor.android.launcher.settings")) {
+                        || auth.equals("com.hihonor.android.launcher.settings"))) {
                     content = method.invoke(who, args);
                     ContentProviderDelegate.update(content, (String) auth);
                     return content;
