@@ -174,6 +174,12 @@ public class BActivityManagerService extends IBActivityManagerService.Stub imple
             ActivityManager.RunningAppProcessInfo runningAppProcessInfo = runningProcessMap.get(processRecord.pid);
             if (runningAppProcessInfo != null) {
                 runningAppProcessInfo.processName = processRecord.processName;
+                // pkgList must name the virtual package, not the host app (top.niunaijun.blackbox):
+                // microG maps a pid to a package through this list.
+                String virtualPackage = processRecord.getPackageName();
+                if (virtualPackage != null) {
+                    runningAppProcessInfo.pkgList = new String[]{virtualPackage};
+                }
                 appProcessInfo.mAppProcessInfoList.add(runningAppProcessInfo);
             }
         }
