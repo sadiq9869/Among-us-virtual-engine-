@@ -54,3 +54,11 @@ LOCAL_CPP_FEATURES := exceptions
 LOCAL_STATIC_LIBRARIES := libdobby xdl
 LOCAL_LDLIBS := -llog -landroid -lz
 include $(BUILD_SHARED_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := menutest
+LOCAL_SRC_FILES := menutest/menutest.cpp
+LOCAL_CPPFLAGS += -std=c++17 -w
+LOCAL_LDFLAGS += -Wl,-z,max-page-size=16384
+LOCAL_LDLIBS := -llog
+include $(BUILD_SHARED_LIBRARY)
