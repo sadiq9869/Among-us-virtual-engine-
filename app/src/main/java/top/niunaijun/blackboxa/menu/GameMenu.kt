@@ -38,6 +38,8 @@ import android.widget.TextView
 object NativeMenu {
     external fun requestCompleteTasks(): Int
     external fun statusText(): String
+    external fun requestPlayers(): Int
+    external fun playersText(): String
 }
 
 /**
@@ -185,6 +187,11 @@ object GameMenu {
         closeBtn.isAllCaps = false
         panel.addView(closeBtn)
 
+        val playersBtn = Button(activity)
+        playersBtn.text = "Player info"
+        playersBtn.isAllCaps = false
+        panel.addView(playersBtn)
+
         val consoleBtn = Button(activity)
         consoleBtn.text = "Console (logs)"
         consoleBtn.isAllCaps = false
@@ -266,11 +273,6 @@ object GameMenu {
             }.start()
         }
 
-        consoleBtn.setOnClickListener {
-            console.visibility = View.VISIBLE
-            consoleTitle.text = "Console - loading..."
-            refreshConsole()
-        }
         hideBtn.setOnClickListener { console.visibility = View.GONE }
         clearBtn.setOnClickListener {
             clearMarker = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
@@ -298,6 +300,66 @@ object GameMenu {
             }
         }
         ui.postDelayed(consoleRefresher, 1000)
+
+        // ---- players box (name, role, alive/dead); refreshed every second while visible
+        val players = LinearLayout(activity)
+        players.orientation = LinearLayout.VERTICAL
+        players.visibility = View.GONE
+        players.background = cbg.constantState?.newDrawable()?.mutate() ?: cbg
+        players.setPadding(dp(activity, 8), dp(activity, 8), dp(activity, 8), dp(activity, 8))
+        val playersTitle = TextView(activity)
+        playersTitle.setTextColor(Color.WHITE)
+        playersTitle.textSize = 13f
+        playersTitle.text = "Player info"
+        players.addView(playersTitle)
+        val playersView = TextView(activity)
+        playersView.typeface = Typeface.MONOSPACE
+        playersView.textSize = 11f
+        playersView.setTextColor(Color.argb(255, 205, 210, 225))
+        val playersScroll = ScrollView(activity)
+        playersScroll.addView(playersView)
+        players.addView(playersScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        val pBtnRow = LinearLayout(activity)
+        pBtnRow.orientation = LinearLayout.HORIZONTAL
+        val pHideBtn = Button(activity)
+        pHideBtn.text = "Hide"
+        pHideBtn.isAllCaps = false
+        pBtnRow.addView(pHideBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        players.addView(pBtnRow)
+        val playersLp = FrameLayout.LayoutParams(consoleLp.width, consoleLp.height)
+        playersLp.gravity = Gravity.TOP or Gravity.START
+        playersLp.leftMargin = dp(activity, 296)
+        playersLp.topMargin = dp(activity, 16)
+        overlay.addView(players, playersLp)
+
+        fun refreshPlayers() {
+            try {
+                NativeMenu.requestPlayers()
+                playersView.text = NativeMenu.playersText()
+            } catch (t: Throwable) {
+                playersView.text = "Player info: native library not loaded ($t)"
+            }
+        }
+        playersBtn.setOnClickListener {
+            console.visibility = View.GONE
+            players.visibility = View.VISIBLE
+            refreshPlayers()
+        }
+        consoleBtn.setOnClickListener {
+            players.visibility = View.GONE
+            console.visibility = View.VISIBLE
+            consoleTitle.text = "Console - loading..."
+            refreshConsole()
+        }
+        pHideBtn.setOnClickListener { players.visibility = View.GONE }
+        val playersRefresher = object : Runnable {
+            override fun run() {
+                if (overlay.parent == null) return
+                if (players.visibility == View.VISIBLE) refreshPlayers()
+                ui.postDelayed(this, 1000)
+            }
+        }
+        ui.postDelayed(playersRefresher, 1000)
 
         // ---- draggable round button
         val size = dp(activity, 44)
@@ -358,7 +420,7 @@ object GameMenu {
                 else -> false
             }
         }
-        closeBtn.setOnClickListener { panel.visibility = View.GONE; console.visibility = View.GONE }
+        closeBtn.setOnClickListener { panel.visibility = View.GONE; console.visibility = View.GONE; players.visibility = View.GONE }
 
         // keep the status line fresh while the panel is open
         val refresher = object : Runnable {
