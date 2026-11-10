@@ -2,7 +2,20 @@ package top.niunaijun.blackboxa.menu
 
 import android.app.Activity
 import android.app.Application
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.graphics.Color
+import android.graphics.Typeface
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.widget.ScrollView
+import android.widget.Toast
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Handler
@@ -37,6 +50,44 @@ object GameMenu {
 
     private var registered = false
     private val ui = Handler(Looper.getMainLooper())
+
+    // ---- console: reads this app's own logcat lines tagged MENUTEST / GameMenu
+    private const val MAX_SHOWN = 150
+    @Volatile private var clearMarker = ""            // logcat lines older than this are hidden ("Clear log")
+    @Volatile private var allLines: List<String> = emptyList()  // everything visible (used by "Copy log")
+    private val logBusy = AtomicBoolean(false)
+
+    private fun isLogLine(l: String) = l.length > 19 && l[2] == '-' && l[5] == ' '
+
+    private fun readLogcat(): List<String> =
+        try {
+            val p = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "time", "-s", "MENUTEST:V", "GameMenu:V"))
+            val raw = p.inputStream.bufferedReader().readLines()
+            p.destroy()
+            val marker = clearMarker
+            raw.filter { isLogLine(it) && it.substring(0, 18) > marker }
+        } catch (t: Throwable) {
+            listOf("[console] cannot read logcat: $t")
+        }
+
+    private fun colorize(lines: List<String>): CharSequence {
+        val sb = SpannableStringBuilder()
+        for (l in lines) {
+            val start = sb.length
+            sb.append(l).append('\n')
+            val level = if (isLogLine(l)) l[19] else ' '
+            val color = when {
+                level == 'E' || l.contains("exception") || l.contains("FAULT") || l.contains("error", true) ->
+                    Color.argb(255, 255, 110, 110)
+                level == 'W' || l.contains("unavailable") || l.contains("skipped") -> Color.argb(255, 255, 200, 90)
+                l.contains("completed via") || l.contains("installed") || l.contains("Menu ready") || l.contains("FOUND") ->
+                    Color.argb(255, 120, 230, 140)
+                else -> Color.argb(255, 205, 210, 225)
+            }
+            sb.setSpan(ForegroundColorSpan(color), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        return sb
+    }
 
     fun init(application: Application?) {
         try {
@@ -134,11 +185,119 @@ object GameMenu {
         closeBtn.isAllCaps = false
         panel.addView(closeBtn)
 
+        val consoleBtn = Button(activity)
+        consoleBtn.text = "Console (logs)"
+        consoleBtn.isAllCaps = false
+        panel.addView(consoleBtn)
+
         val panelLp = FrameLayout.LayoutParams(dp(activity, 270), ViewGroup.LayoutParams.WRAP_CONTENT)
         panelLp.gravity = Gravity.TOP or Gravity.START
         panelLp.leftMargin = dp(activity, 16)
         panelLp.topMargin = dp(activity, 70)
         overlay.addView(panel, panelLp)
+
+        // ---- console box (hidden until "Console (logs)" is tapped)
+        val console = LinearLayout(activity)
+        console.orientation = LinearLayout.VERTICAL
+        console.visibility = View.GONE
+        val cbg = GradientDrawable()
+        cbg.setColor(Color.argb(240, 12, 14, 18))
+        cbg.cornerRadius = dp(activity, 10).toFloat()
+        cbg.setStroke(dp(activity, 1), Color.argb(255, 90, 94, 110))
+        console.background = cbg
+        console.setPadding(dp(activity, 8), dp(activity, 8), dp(activity, 8), dp(activity, 8))
+
+        val consoleTitle = TextView(activity)
+        consoleTitle.setTextColor(Color.WHITE)
+        consoleTitle.textSize = 13f
+        consoleTitle.text = "Console"
+        console.addView(consoleTitle)
+
+        val logView = TextView(activity)
+        logView.typeface = Typeface.MONOSPACE
+        logView.textSize = 9f
+        logView.setTextIsSelectable(false)
+        val scroll = ScrollView(activity)
+        scroll.addView(logView)
+        console.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        val btnRow = LinearLayout(activity)
+        btnRow.orientation = LinearLayout.HORIZONTAL
+        val copyBtn = Button(activity)
+        copyBtn.text = "Copy log"
+        copyBtn.isAllCaps = false
+        val clearBtn = Button(activity)
+        clearBtn.text = "Clear log"
+        clearBtn.isAllCaps = false
+        val hideBtn = Button(activity)
+        hideBtn.text = "Hide"
+        hideBtn.isAllCaps = false
+        val rowLp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        btnRow.addView(copyBtn, rowLp)
+        btnRow.addView(clearBtn, rowLp)
+        btnRow.addView(hideBtn, rowLp)
+        console.addView(btnRow)
+
+        val dm = activity.resources.displayMetrics
+        val consoleW = Math.min(dp(activity, 460), dm.widthPixels - dp(activity, 310))
+        val consoleLp = FrameLayout.LayoutParams(
+            Math.max(consoleW, dp(activity, 240)), Math.min(dp(activity, 300), dm.heightPixels - dp(activity, 40))
+        )
+        consoleLp.gravity = Gravity.TOP or Gravity.START
+        consoleLp.leftMargin = dp(activity, 296)
+        consoleLp.topMargin = dp(activity, 16)
+        overlay.addView(console, consoleLp)
+
+        fun refreshConsole() {
+            if (!logBusy.compareAndSet(false, true)) return
+            Thread {
+                val lines = readLogcat()
+                allLines = lines
+                val shown = if (lines.size > MAX_SHOWN) lines.takeLast(MAX_SHOWN) else lines
+                val text = colorize(shown)
+                ui.post {
+                    logBusy.set(false)
+                    if (console.visibility == View.VISIBLE) {
+                        consoleTitle.text = "Console - ${lines.size} lines (showing last ${shown.size})"
+                        logView.text = text
+                        scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+                    }
+                }
+            }.start()
+        }
+
+        consoleBtn.setOnClickListener {
+            console.visibility = View.VISIBLE
+            consoleTitle.text = "Console - loading..."
+            refreshConsole()
+        }
+        hideBtn.setOnClickListener { console.visibility = View.GONE }
+        clearBtn.setOnClickListener {
+            clearMarker = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
+            allLines = emptyList()
+            logView.text = ""
+            consoleTitle.text = "Console - cleared"
+        }
+        copyBtn.setOnClickListener {
+            try {
+                val text = allLines.joinToString("\n")
+                val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("menu log", text))
+                consoleTitle.text = "Console - copied ${allLines.size} lines"
+                Toast.makeText(activity, "Copied ${allLines.size} lines", Toast.LENGTH_SHORT).show()
+            } catch (t: Throwable) {
+                consoleTitle.text = "Console - copy failed: $t"
+            }
+        }
+        // the console refreshes itself every 1 s while it is visible
+        val consoleRefresher = object : Runnable {
+            override fun run() {
+                if (overlay.parent == null) return
+                if (console.visibility == View.VISIBLE) refreshConsole()
+                ui.postDelayed(this, 1000)
+            }
+        }
+        ui.postDelayed(consoleRefresher, 1000)
 
         // ---- draggable round button
         val size = dp(activity, 44)
@@ -199,7 +358,7 @@ object GameMenu {
                 else -> false
             }
         }
-        closeBtn.setOnClickListener { panel.visibility = View.GONE }
+        closeBtn.setOnClickListener { panel.visibility = View.GONE; console.visibility = View.GONE }
 
         // keep the status line fresh while the panel is open
         val refresher = object : Runnable {
