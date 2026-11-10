@@ -40,6 +40,10 @@ object NativeMenu {
     external fun statusText(): String
     external fun requestPlayers(): Int
     external fun playersText(): String
+    external fun setHostOptions(on: Int, roleIdx: Int)
+    external fun requestHostInfo(): Int
+    external fun requestSwapNow(): Int
+    external fun hostInfoText(): String
 }
 
 /**
@@ -54,6 +58,9 @@ object GameMenu {
     private val ui = Handler(Looper.getMainLooper())
 
     // ---- console: reads this app's own logcat lines tagged MENUTEST / GameMenu
+    private var alwaysImp = false
+    private var wantIdx = 0
+    private val wantNames = arrayOf("Random", "Impostor", "Shapeshifter", "Phantom", "Viper")
     private const val MAX_SHOWN = 150
     @Volatile private var clearMarker = ""            // logcat lines older than this are hidden ("Clear log")
     @Volatile private var allLines: List<String> = emptyList()  // everything visible (used by "Copy log")
@@ -185,22 +192,35 @@ object GameMenu {
         val closeBtn = Button(activity)
         closeBtn.text = "Close"
         closeBtn.isAllCaps = false
-        panel.addView(closeBtn)
 
         val playersBtn = Button(activity)
         playersBtn.text = "Player info"
         playersBtn.isAllCaps = false
         panel.addView(playersBtn)
 
+        val hostBtn = Button(activity)
+        hostBtn.text = "Host settings"
+        hostBtn.isAllCaps = false
+        panel.addView(hostBtn)
+
         val consoleBtn = Button(activity)
         consoleBtn.text = "Console (logs)"
         consoleBtn.isAllCaps = false
         panel.addView(consoleBtn)
+        panel.addView(closeBtn)
+
+        // compact buttons so the panel (now 5 buttons) fits on a landscape phone screen
+        for (b in listOf(completeBtn, playersBtn, hostBtn, consoleBtn, closeBtn)) {
+            b.minHeight = 0
+            b.minimumHeight = 0
+            b.textSize = 13f
+            b.setPadding(dp(activity, 8), dp(activity, 6), dp(activity, 8), dp(activity, 6))
+        }
 
         val panelLp = FrameLayout.LayoutParams(dp(activity, 270), ViewGroup.LayoutParams.WRAP_CONTENT)
         panelLp.gravity = Gravity.TOP or Gravity.START
         panelLp.leftMargin = dp(activity, 16)
-        panelLp.topMargin = dp(activity, 70)
+        panelLp.topMargin = dp(activity, 24)
         overlay.addView(panel, panelLp)
 
         // ---- console box (hidden until "Console (logs)" is tapped)
@@ -332,6 +352,94 @@ object GameMenu {
         playersLp.topMargin = dp(activity, 16)
         overlay.addView(players, playersLp)
 
+        // ---- host settings box (Always Imposter / role swap). Enabled only when the game says you are host.
+        val hostBox = LinearLayout(activity)
+        hostBox.orientation = LinearLayout.VERTICAL
+        hostBox.visibility = View.GONE
+        hostBox.background = cbg.constantState?.newDrawable()?.mutate() ?: cbg
+        hostBox.setPadding(dp(activity, 8), dp(activity, 8), dp(activity, 8), dp(activity, 8))
+        val hostTitle = TextView(activity)
+        hostTitle.setTextColor(Color.WHITE)
+        hostTitle.textSize = 13f
+        hostTitle.text = "Host settings"
+        hostBox.addView(hostTitle)
+        val hostInfoView = TextView(activity)
+        hostInfoView.typeface = Typeface.MONOSPACE
+        hostInfoView.textSize = 11f
+        hostInfoView.setTextColor(Color.argb(255, 205, 210, 225))
+        val hostScroll = ScrollView(activity)
+        hostScroll.addView(hostInfoView)
+        hostBox.addView(hostScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        val alwaysBtn = Button(activity)
+        alwaysBtn.isAllCaps = false
+        val roleBtn = Button(activity)
+        roleBtn.isAllCaps = false
+        val swapBtn = Button(activity)
+        swapBtn.text = "Swap now (this match)"
+        swapBtn.isAllCaps = false
+        val hostHideBtn = Button(activity)
+        hostHideBtn.text = "Hide"
+        hostHideBtn.isAllCaps = false
+        for (b in listOf(alwaysBtn, roleBtn, swapBtn, hostHideBtn)) {
+            b.minHeight = 0
+            b.minimumHeight = 0
+            b.textSize = 12f
+            b.setPadding(dp(activity, 6), dp(activity, 4), dp(activity, 6), dp(activity, 4))
+            hostBox.addView(b)
+        }
+        val hostLp = FrameLayout.LayoutParams(consoleLp.width, consoleLp.height)
+        hostLp.gravity = Gravity.TOP or Gravity.START
+        hostLp.leftMargin = dp(activity, 296)
+        hostLp.topMargin = dp(activity, 16)
+        overlay.addView(hostBox, hostLp)
+
+        fun updateHostButtons(isHost: Boolean) {
+            alwaysBtn.isEnabled = isHost
+            roleBtn.isEnabled = isHost
+            swapBtn.isEnabled = isHost
+            alwaysBtn.text = "Always Imposter: " + (if (alwaysImp) "ON" else "OFF")
+            roleBtn.text = "Imposter role: " + wantNames[wantIdx]
+            hostTitle.text = if (isHost) "Host settings" else "Host settings - host only (you are not host)"
+        }
+        fun refreshHost() {
+            try {
+                NativeMenu.requestHostInfo()
+                val t = NativeMenu.hostInfoText()
+                hostInfoView.text = t
+                updateHostButtons(t.contains("Host: YES"))
+            } catch (t: Throwable) {
+                hostInfoView.text = "Host tools: native library not loaded ($t)"
+                updateHostButtons(false)
+            }
+        }
+        fun applyHostOptions() {
+            try {
+                NativeMenu.setHostOptions(if (alwaysImp) 1 else 0, wantIdx)
+            } catch (t: Throwable) {
+                hostInfoView.text = "Host tools: native library not loaded ($t)"
+            }
+        }
+        alwaysBtn.setOnClickListener {
+            alwaysImp = !alwaysImp
+            applyHostOptions()
+            updateHostButtons(alwaysBtn.isEnabled)
+        }
+        roleBtn.setOnClickListener {
+            wantIdx = (wantIdx + 1) % wantNames.size
+            applyHostOptions()
+            updateHostButtons(roleBtn.isEnabled)
+        }
+        swapBtn.setOnClickListener {
+            try {
+                NativeMenu.requestSwapNow()
+            } catch (t: Throwable) {
+                hostInfoView.text = "Host tools: native library not loaded ($t)"
+            }
+            ui.postDelayed({ refreshHost() }, 700)
+        }
+        hostHideBtn.setOnClickListener { hostBox.visibility = View.GONE }
+        updateHostButtons(false)
+
         fun refreshPlayers() {
             try {
                 NativeMenu.requestPlayers()
@@ -342,11 +450,13 @@ object GameMenu {
         }
         playersBtn.setOnClickListener {
             console.visibility = View.GONE
+            hostBox.visibility = View.GONE
             players.visibility = View.VISIBLE
             refreshPlayers()
         }
         consoleBtn.setOnClickListener {
             players.visibility = View.GONE
+            hostBox.visibility = View.GONE
             console.visibility = View.VISIBLE
             consoleTitle.text = "Console - loading..."
             refreshConsole()
@@ -360,6 +470,21 @@ object GameMenu {
             }
         }
         ui.postDelayed(playersRefresher, 1000)
+
+        hostBtn.setOnClickListener {
+            console.visibility = View.GONE
+            players.visibility = View.GONE
+            hostBox.visibility = View.VISIBLE
+            refreshHost()
+        }
+        val hostRefresher = object : Runnable {
+            override fun run() {
+                if (overlay.parent == null) return
+                if (hostBox.visibility == View.VISIBLE) refreshHost()
+                ui.postDelayed(this, 1000)
+            }
+        }
+        ui.postDelayed(hostRefresher, 1000)
 
         // ---- draggable round button
         val size = dp(activity, 44)
@@ -420,7 +545,7 @@ object GameMenu {
                 else -> false
             }
         }
-        closeBtn.setOnClickListener { panel.visibility = View.GONE; console.visibility = View.GONE; players.visibility = View.GONE }
+        closeBtn.setOnClickListener { panel.visibility = View.GONE; console.visibility = View.GONE; players.visibility = View.GONE; hostBox.visibility = View.GONE }
 
         // keep the status line fresh while the panel is open
         val refresher = object : Runnable {
