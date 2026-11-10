@@ -1,4 +1,4 @@
-// MENUTEST v8 - first real feature: "Complete my tasks".
+// MENUTEST v9 - first real feature: "Complete my tasks".
 // Build for game 2026.11.3 (Unity 2022.3.62f3, il2cpp). NOT built / NOT tested when written.
 //
 // What it does:
@@ -183,6 +183,10 @@ typedef void *(*fn_object_unbox_t)(void *obj);
 typedef void *(*fn_object_get_class_t)(void *obj);
 typedef void *(*fn_thread_attach_t)(void *domain);
 typedef void (*fn_thread_detach_t)(void *thread);
+typedef void *(*fn_class_from_type_t)(void *type);
+typedef int (*fn_field_get_flags_t)(void *field);
+typedef uint16_t *(*fn_string_chars_t)(void *str);
+typedef int32_t (*fn_string_length_t)(void *str);
 
 static fn_domain_get_t p_domain_get;
 static fn_domain_get_assemblies_t p_domain_get_assemblies;
@@ -207,6 +211,10 @@ static fn_object_unbox_t p_object_unbox;
 static fn_object_get_class_t p_object_get_class;
 static fn_thread_attach_t p_thread_attach;
 static fn_thread_detach_t p_thread_detach;
+static fn_class_from_type_t p_class_from_type;
+static fn_field_get_flags_t p_field_get_flags;
+static fn_string_chars_t p_string_chars;
+static fn_string_length_t p_string_length;
 
 static bool resolveAll(void *h) {
     struct Entry { const char *name; void **slot; bool required; };
@@ -234,6 +242,10 @@ static bool resolveAll(void *h) {
         {"il2cpp_object_get_class", (void **)&p_object_get_class, true},
         {"il2cpp_thread_attach", (void **)&p_thread_attach, true},
         {"il2cpp_thread_detach", (void **)&p_thread_detach, false},
+        {"il2cpp_class_from_type", (void **)&p_class_from_type, false},
+        {"il2cpp_field_get_flags", (void **)&p_field_get_flags, false},
+        {"il2cpp_string_chars", (void **)&p_string_chars, false},
+        {"il2cpp_string_length", (void **)&p_string_length, false},
     };
     bool ok = true;
     for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
@@ -334,6 +346,192 @@ static void logClassNames(void *k, const char *label) {
     }
 }
 
+// ---------------------------------------------------------------- v9: extra lookups (players, roles) - all BY NAME
+static const int kMaxPlayers = 40;
+static void *k_NetInfo = nullptr;          // class NetworkedPlayerInfo
+static void *f_AllPlayers = nullptr;       // static field PlayerControl.AllPlayerControls (a List<PlayerControl>)
+static void *m_get_Data = nullptr;         // PlayerControl.get_Data()
+static void *m_get_PlayerName = nullptr;   // NetworkedPlayerInfo.get_PlayerName()
+static void *f_IsDead = nullptr, *f_Disconnected = nullptr, *f_RoleType = nullptr, *f_RoleWhenAlive = nullptr;
+struct EnumVal { char name[40]; unsigned val; };
+static EnumVal g_roleEnum[48];             // RoleType enum names/values read from the live game
+static int g_roleEnumCount = 0;
+static bool g_extraDone = false;
+
+static void resolveExtraFn(void *) {
+    if (g_extraDone) return;
+    g_extraDone = true;
+    f_AllPlayers = findField(k_PlayerControl, "AllPlayerControls");
+    m_get_Data = findMethod(k_PlayerControl, "get_Data", 0);
+    k_NetInfo = p_class_from_name(g_image, "", "NetworkedPlayerInfo");
+    if (k_NetInfo) {
+        m_get_PlayerName = findMethod(k_NetInfo, "get_PlayerName", 0);
+        f_IsDead = findField(k_NetInfo, "IsDead");
+        f_Disconnected = findField(k_NetInfo, "Disconnected");
+        f_RoleType = findField(k_NetInfo, "RoleType");
+        f_RoleWhenAlive = findField(k_NetInfo, "RoleWhenAlive");
+    }
+    if (f_RoleType && p_field_get_type && p_class_from_type && p_class_get_fields && p_field_get_name) {
+        void *ty = p_field_get_type(f_RoleType);
+        void *ek = ty ? p_class_from_type(ty) : nullptr;
+        if (ek) {
+            LOGI("MENUTEST role enum class: %s", p_class_get_name(ek));
+            void *iter = nullptr, *f;
+            while ((f = p_class_get_fields(ek, &iter)) != nullptr && g_roleEnumCount < 48) {
+                const char *fn = p_field_get_name(f);
+                if (!fn || !strcmp(fn, "value__")) continue;
+                if (p_field_get_flags && !(p_field_get_flags(f) & 0x10)) continue; // 0x10 = static
+                uint64_t buf = 0;
+                p_field_static_get_value(f, &buf);
+                EnumVal &e = g_roleEnum[g_roleEnumCount++];
+                strncpy(e.name, fn, sizeof(e.name) - 1);
+                e.name[sizeof(e.name) - 1] = 0;
+                e.val = (unsigned)(buf & 0xffff);
+                LOGI("MENUTEST   role enum %s = %u", e.name, e.val);
+            }
+        }
+    }
+    LOGI("MENUTEST extra: AllPlayerControls=%p get_Data=%p NetInfo=%p get_PlayerName=%p IsDead=%p Disconnected=%p RoleType=%p RoleWhenAlive=%p enumNames=%d",
+         f_AllPlayers, m_get_Data, k_NetInfo, m_get_PlayerName, f_IsDead, f_Disconnected, f_RoleType, f_RoleWhenAlive, g_roleEnumCount);
+}
+
+static const char *roleName(unsigned v) {
+    for (int i = 0; i < g_roleEnumCount; i++) if (g_roleEnum[i].val == v) return g_roleEnum[i].name;
+    return nullptr;
+}
+static bool readU16(void *obj, void *field, unsigned *out) {
+    if (!obj || !field) return false;
+    uint64_t b = 0;
+    p_field_get_value(obj, field, &b);
+    *out = (unsigned)(b & 0xffff);
+    return true;
+}
+static bool readBoolField(void *obj, void *field, bool *out) {
+    if (!obj || !field) return false;
+    uint64_t b = 0;
+    p_field_get_value(obj, field, &b);
+    *out = (b & 0xff) != 0;
+    return true;
+}
+static void *dataOf(void *pc) {
+    if (!pc || !m_get_Data) return nullptr;
+    bool ok = false;
+    void *r = invokeRaw(m_get_Data, pc, nullptr, "get_Data", &ok);
+    return ok ? r : nullptr;
+}
+// by NAME of the role (read from the game's own enum): impostor team = names containing "Impostor", Shapeshifter, Phantom, Viper
+// (a name-based assumption about the game, not a confirmed fact)
+static bool nameIsImpostorTeam(const char *n) {
+    return n && (strstr(n, "Impostor") || !strcmp(n, "Shapeshifter") || !strcmp(n, "Phantom") || !strcmp(n, "Viper"));
+}
+// known=false if the role could not be read (then the answer must not be trusted)
+static bool isImpostorData(void *data, bool *known) {
+    *known = false;
+    unsigned rt = 0, rw = 0;
+    if (!data || g_roleEnumCount == 0 || !readU16(data, f_RoleType, &rt)) return false;
+    *known = true;
+    if (nameIsImpostorTeam(roleName(rt))) return true;
+    if (f_RoleWhenAlive && readU16(data, f_RoleWhenAlive, &rw) && nameIsImpostorTeam(roleName(rw))) return true;
+    return false;
+}
+static void il2str(void *s, char *out, size_t cap) {
+    out[0] = 0;
+    if (!s || !p_string_chars || !p_string_length || cap < 8) return;
+    int n = p_string_length(s);
+    const uint16_t *c = p_string_chars(s);
+    if (!c || n <= 0) return;
+    if (n > 32) n = 32;
+    size_t o = 0;
+    for (int i = 0; i < n && o + 4 < cap; i++) {
+        unsigned ch = c[i];
+        if (ch < 0x80) out[o++] = (char)ch;
+        else if (ch >= 0xD800 && ch <= 0xDFFF) out[o++] = '?';
+        else if (ch < 0x800) { out[o++] = (char)(0xC0 | (ch >> 6)); out[o++] = (char)(0x80 | (ch & 0x3F)); }
+        else { out[o++] = (char)(0xE0 | (ch >> 12)); out[o++] = (char)(0x80 | ((ch >> 6) & 0x3F)); out[o++] = (char)(0x80 | (ch & 0x3F)); }
+    }
+    out[o] = 0;
+}
+
+// ---------------------------------------------------------------- v9: player info (name / role / alive-dead)
+static std::mutex g_playersMx;
+static char g_players[4096] = "Players: not requested yet.";
+static std::atomic<long> g_playersAt{0};
+static std::atomic<bool> g_reqPlayers{false};
+
+static void setPlayers(const char *txt) {
+    std::lock_guard<std::mutex> lk(g_playersMx);
+    strncpy(g_players, txt, sizeof(g_players) - 1);
+    g_players[sizeof(g_players) - 1] = 0;
+    g_playersAt.store(nowMs());
+}
+
+static void playersFn(void *) {
+    void *local = nullptr;
+    if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
+    void *list = nullptr;
+    if (f_AllPlayers) p_field_static_get_value(f_AllPlayers, &list);
+    if (!list) { setPlayers("No players yet (join a lobby or match)."); return; }
+    void *lk = p_object_get_class(list);
+    void *mCount = findMethod(lk, "get_Count", 0);
+    void *mItem = findMethod(lk, "get_Item", 1);
+    int count = 0;
+    if (!mCount || !mItem || !invokeInt(mCount, list, nullptr, "get_Count", &count)) { setPlayers("Could not read the player list."); return; }
+    if (count < 0 || count > kMaxPlayers) { setPlayers("Player count is outside the sane range, not reading."); return; }
+    if (count == 0) { setPlayers("Player list is empty."); return; }
+
+    char out[4096];
+    size_t o = 0;
+    int alive = 0, dead = 0;
+    char lines[3800];
+    size_t lo = 0;
+    lines[0] = 0;
+    for (int i = 0; i < count; i++) {
+        int idx = i;
+        void *args[1] = {&idx};
+        bool ok = false;
+        void *pc = invokeRaw(mItem, list, args, "get_Item", &ok);
+        void *data = ok ? dataOf(pc) : nullptr;
+        if (!data) { lo += snprintf(lines + lo, sizeof(lines) - lo, "#%d | (no data yet)\n", i); if (lo >= sizeof(lines)) break; continue; }
+        char name[120];
+        name[0] = 0;
+        if (m_get_PlayerName) {
+            bool okn = false;
+            void *s = invokeRaw(m_get_PlayerName, data, nullptr, "get_PlayerName", &okn);
+            if (okn) il2str(s, name, sizeof(name));
+        }
+        if (!name[0]) snprintf(name, sizeof(name), "player#%d", i);
+        bool isDead = false, disc = false;
+        bool haveDead = readBoolField(data, f_IsDead, &isDead);
+        readBoolField(data, f_Disconnected, &disc);
+        unsigned rt = 0, rw = 0;
+        bool haveRole = readU16(data, f_RoleType, &rt);
+        char role[80];
+        if (!haveRole) snprintf(role, sizeof(role), "role unknown");
+        else if (roleName(rt)) snprintf(role, sizeof(role), "%s", roleName(rt));
+        else snprintf(role, sizeof(role), "role#%u", rt);
+        if (haveRole && isDead && f_RoleWhenAlive && readU16(data, f_RoleWhenAlive, &rw) && rw != rt) {
+            size_t rl = strlen(role);
+            if (roleName(rw)) snprintf(role + rl, sizeof(role) - rl, " (was %s)", roleName(rw));
+        }
+        if (haveDead) { if (isDead) dead++; else alive++; }
+        lo += snprintf(lines + lo, sizeof(lines) - lo, "%s%s | %s | %s%s\n", name, (pc == local) ? " (you)" : "", role,
+                       haveDead ? (isDead ? "DEAD" : "Alive") : "?", disc ? " | Disconnected" : "");
+        if (lo >= sizeof(lines)) { lo = sizeof(lines) - 1; break; }
+    }
+    o += snprintf(out + o, sizeof(out) - o, "Players: %d (alive %d, dead %d)\n%s", count, alive, dead, lines);
+    if (o < sizeof(out) - 120)
+        snprintf(out + o, sizeof(out) - o, "Note: the server may hide other players' roles; this shows only what this client knows.");
+    setPlayers(out);
+}
+
+static void runPlayers() {
+    if (!guarded(resolveExtraFn, nullptr)) { setPlayers("Fault while resolving player classes (see logcat MENUTEST)."); return; }
+    if (!guarded(playersFn, nullptr)) {
+        setPlayers("Crash guard caught a fault while reading players (see logcat MENUTEST).");
+        LOGI("MENUTEST playersFn FAULT");
+    }
+}
+
 // ---------------------------------------------------------------- the feature: complete all my tasks
 static std::atomic<int> g_discoveryLogged{0};
 
@@ -345,6 +543,21 @@ static void workFn(void *) {
     if (!local) {
         setStatus("No local player yet. Join a lobby or start a match, then press again.");
         return;
+    }
+    // v9: an impostor's task list is fake. Sending RpcCompleteTask for it got the player kicked (v8 test), so do not send it.
+    {
+        guarded(resolveExtraFn, nullptr);
+        bool known = false;
+        bool imp = isImpostorData(dataOf(local), &known);
+        if (!known) {
+            setStatus("Cannot read your role (RoleType / get_Data / enum names missing, see logcat MENUTEST). Not sending anything.");
+            return;
+        }
+        if (imp) {
+            setStatus("You are on the Impostor team: your tasks are fake and are not sent to the host (sending them got you kicked). Nothing done.");
+            LOGI("MENUTEST local player is impostor-team; task completion blocked");
+            return;
+        }
     }
     void *list = nullptr;
     p_field_get_value(local, f_myTasks, &list);
@@ -419,6 +632,12 @@ static void workFn(void *) {
                     void *raw = (okg && boxed) ? p_object_unbox(boxed) : nullptr;
                     if (raw) { memcpy(idbuf, raw, 4); haveId = true; }
                 }
+                if (haveId && *(unsigned int *)idbuf == 255u) {
+                    // v9: Id 255 was seen on ReactorTask (a sabotage fix task) in the v8 log; treated as a system task (observation-based guess)
+                    skippedSystem++;
+                    LOGI("MENUTEST task[%d] %s skipped (Id 255 = system/sabotage task)", i, tname);
+                    continue;
+                }
                 if (haveId) {
                     LOGI("MENUTEST task[%d] %s Id=%u (via %s), calling RpcCompleteTask", i, tname, *(unsigned int *)idbuf, fId ? "field" : "get_Id");
                     void *a2[1] = {idbuf};
@@ -492,6 +711,7 @@ static fn_fixedupdate_t orig_fixed = nullptr;
 static void hk_fixed(void *self, const void *method) {
     if (orig_fixed) orig_fixed(self, method);
     if (g_req.load(std::memory_order_relaxed) && g_req.exchange(false)) runRequest();
+    if (g_reqPlayers.load(std::memory_order_relaxed) && g_reqPlayers.exchange(false)) runPlayers();
 }
 
 // ---------------------------------------------------------------- watcher thread: waits, resolves, hooks
@@ -641,13 +861,14 @@ static void *watcher(void *) {
     for (;;) {
         usleep(200 * 1000);
         if (g_req.exchange(false)) runRequest();
+        if (g_reqPlayers.exchange(false)) runPlayers();
     }
     return nullptr;
 }
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v8 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v9 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
@@ -685,6 +906,27 @@ Java_top_niunaijun_blackboxa_menu_NativeMenu_statusText(JNIEnv *env, jobject thi
         std::lock_guard<std::mutex> lk(g_statusMx);
         strncpy(buf, g_status, sizeof(buf) - 1);
         buf[sizeof(buf) - 1] = 0;
+    }
+    return env->NewStringUTF(buf);
+}
+
+// v9: player info. requestPlayers queues a read on the Unity thread; playersText returns the last result.
+extern "C" JNIEXPORT jint JNICALL
+Java_top_niunaijun_blackboxa_menu_NativeMenu_requestPlayers(JNIEnv *env, jobject thiz) {
+    if (g_state.load() != ST_READY) return 0;
+    g_reqPlayers.store(true);
+    return 1;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_top_niunaijun_blackboxa_menu_NativeMenu_playersText(JNIEnv *env, jobject thiz) {
+    if (g_state.load() != ST_READY) return env->NewStringUTF("Menu not ready yet (wait for 'Menu ready').");
+    char buf[4200];
+    long at = g_playersAt.load();
+    {
+        std::lock_guard<std::mutex> lk(g_playersMx);
+        const char *pre = (at == 0 || nowMs() - at > 3000) ? "(no fresh update: no player object is active, join a lobby or match)\n" : "";
+        snprintf(buf, sizeof(buf), "%s%s", pre, g_players);
     }
     return env->NewStringUTF(buf);
 }
