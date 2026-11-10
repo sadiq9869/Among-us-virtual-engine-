@@ -179,6 +179,13 @@ class BlackBoxLoader {
                                                 "afterApplicationOnCreate: pkg $packageName, processName $processName"
                                         )
                                         RockerManager.init(application, userId)
+                                        if (packageName == "com.innersloth.spacemafia") {
+                                            try {
+                                                top.niunaijun.blackboxa.menu.GameMenu.init(application)
+                                            } catch (t: Throwable) {
+                                                Log.e(TAG, "GameMenu init failed: ${t}")
+                                            }
+                                        }
                                     } catch (e: Exception) {
                                         Log.e(
                                                 TAG,
