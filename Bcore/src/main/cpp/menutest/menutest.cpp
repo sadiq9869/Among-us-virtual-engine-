@@ -1,4 +1,4 @@
-// MENUTEST v7 - first real feature: "Complete my tasks".
+// MENUTEST v8 - first real feature: "Complete my tasks".
 // Build for game 2026.11.3 (Unity 2022.3.62f3, il2cpp). NOT built / NOT tested when written.
 //
 // What it does:
@@ -398,23 +398,41 @@ static void workFn(void *) {
 
         bool completed = false;
         // route 1: LocalPlayer.RpcCompleteTask(task.Id)  (the game's own networked completion path)
-        void *fId = findField(tk, "Id");
-        if (m_RpcCompleteTask && fId) {
+        // v8: the Id field is an auto-property, so its real name is "<Id>k__BackingField" (seen in the v7 log);
+        // try that, then "Id", then the getter get_Id().
+        void *fId = findField(tk, "<Id>k__BackingField");
+        if (!fId) fId = findField(tk, "Id");
+        void *mGetId = fId ? nullptr : findMethod(tk, "get_Id", 0);
+        if (m_RpcCompleteTask && (fId || mGetId)) {
             void *pt = p_method_get_param(m_RpcCompleteTask, 0);
             int ptype = pt ? p_type_get_type(pt) : -1;
             if (isIntegerType(ptype)) {
                 unsigned char idbuf[16];
                 memset(idbuf, 0, sizeof(idbuf));
-                p_field_get_value(task, fId, idbuf);
-                void *a2[1] = {idbuf};
-                bool ok2 = false;
-                invokeRaw(m_RpcCompleteTask, local, a2, "RpcCompleteTask", &ok2);
-                if (ok2) { completed = true; viaRpc++; LOGI("MENUTEST task[%d] %s completed via RpcCompleteTask(Id)", i, tname); }
+                bool haveId = false;
+                if (fId) {
+                    p_field_get_value(task, fId, idbuf);
+                    haveId = true;
+                } else {
+                    bool okg = false;
+                    void *boxed = invokeRaw(mGetId, task, nullptr, "get_Id", &okg);
+                    void *raw = (okg && boxed) ? p_object_unbox(boxed) : nullptr;
+                    if (raw) { memcpy(idbuf, raw, 4); haveId = true; }
+                }
+                if (haveId) {
+                    LOGI("MENUTEST task[%d] %s Id=%u (via %s), calling RpcCompleteTask", i, tname, *(unsigned int *)idbuf, fId ? "field" : "get_Id");
+                    void *a2[1] = {idbuf};
+                    bool ok2 = false;
+                    invokeRaw(m_RpcCompleteTask, local, a2, "RpcCompleteTask", &ok2);
+                    if (ok2) { completed = true; viaRpc++; LOGI("MENUTEST task[%d] %s completed via RpcCompleteTask(Id)", i, tname); }
+                } else {
+                    LOGI("MENUTEST task[%d] %s could not read Id; route 1 skipped", i, tname);
+                }
             } else {
                 LOGI("MENUTEST task[%d] RpcCompleteTask param type=0x%x is not an integer; route 1 skipped", i, ptype);
             }
         } else {
-            LOGI("MENUTEST task[%d] %s route 1 unavailable (RpcCompleteTask=%p Id=%p)", i, tname, m_RpcCompleteTask, fId);
+            LOGI("MENUTEST task[%d] %s route 1 unavailable (RpcCompleteTask=%p IdField=%p get_Id=%p)", i, tname, m_RpcCompleteTask, fId, mGetId);
         }
         // route 2: the task's own Complete()
         if (!completed) {
@@ -629,7 +647,7 @@ static void *watcher(void *) {
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v7 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v8 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
