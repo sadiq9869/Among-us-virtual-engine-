@@ -61,6 +61,6 @@ LOCAL_SRC_FILES := menutest/menutest.cpp
 LOCAL_C_INCLUDES += $(LOCAL_PATH)
 LOCAL_CPPFLAGS += -std=c++17 -w
 LOCAL_LDFLAGS += -Wl,-z,max-page-size=16384
-LOCAL_STATIC_LIBRARIES := xdl
+LOCAL_STATIC_LIBRARIES := xdl libdobby
 LOCAL_LDLIBS := -llog -ldl
 include $(BUILD_SHARED_LIBRARY)
