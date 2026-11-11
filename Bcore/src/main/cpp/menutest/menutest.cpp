@@ -1,4 +1,4 @@
-// MENUTEST v13 (v12 + ROLES logger) - first real feature: "Complete my tasks".
+// MENUTEST v14 (v13 + RpcSetRole/SelectRoles LOG-ONLY hooks) - first real feature: "Complete my tasks".
 // Build for game 2026.11.3 (Unity 2022.3.62f3, il2cpp). NOT built / NOT tested when written.
 //
 // What it does:
@@ -728,6 +728,7 @@ static void *k_AmongUsClient = nullptr, *k_ShipStatus = nullptr;
 static void *f_ACInst = nullptr, *m_ACInst = nullptr, *m_AmHost = nullptr;     // AmongUsClient.Instance / get_AmHost
 static void *f_ShipInst = nullptr, *m_ShipInst = nullptr;                      // ShipStatus.Instance (exists only in a match)
 static void *f_roleAssigned = nullptr;                                         // PlayerControl.roleAssigned
+static void *m_RMSelectRoles = nullptr;                                          // v14: RoleManager.SelectRoles/0 (log-only hook)
 static void *m_RpcSetRole = nullptr, *m_CoSetRole = nullptr;                   // looked up in resolveGameFn
 static void *k_RoleManager = nullptr, *f_RMInst = nullptr, *m_RMInst = nullptr, *m_RMSetRole = nullptr;   // RoleManager.Instance.SetRole(player, role)
 static bool g_hostDone = false;
@@ -789,6 +790,7 @@ static void resolveHostFn(void *) {
         if (!f_RMInst) f_RMInst = findField(k_RoleManager, "_instance");
         m_RMInst = findMethod(k_RoleManager, "get_Instance", 0);
         m_RMSetRole = findMethod(k_RoleManager, "SetRole", 2);
+        m_RMSelectRoles = findMethod(k_RoleManager, "SelectRoles", 0);
         if (p_class_get_methods && p_method_get_name) {
             void *iter = nullptr, *m;
             int cnt = 0;
@@ -893,11 +895,15 @@ static bool rpcSetRoleOk(char *why, size_t cap) {
     }
     return true;
 }
+static std::atomic<int> g_ourRpc{0};   // v14: 1 while OUR swap code calls RpcSetRole (so the hook can label it)
+static std::atomic<long> g_assignLogAt{0};   // v14: after SelectRoles returns, log all roles with pointers once
 static bool setRoleOn(void *pc, unsigned role) {
     uint64_t rb = role, bb = 1;     // canOverride = true (a role that is already assigned must be overridden)
     void *args[2] = {&rb, &bb};
     bool ok = false;
+    g_ourRpc.store(1);
     invokeRaw(m_RpcSetRole, pc, args, "RpcSetRole", &ok);
+    g_ourRpc.store(0);
     return ok;
 }
 
@@ -933,8 +939,8 @@ static void logRoles(const char *tag) {
     char buf[900];
     int lo = 0;
     for (int i = 0; i < n && lo < (int)sizeof(buf) - 80; i++) {
-        lo += snprintf(buf + lo, sizeof(buf) - lo, "%s%s=%s%s%s", i ? " | " : "",
-                       ps[i].pc == local ? "me" : ps[i].name, ps[i].haveRole ? rn(ps[i].role) : "?",
+        lo += snprintf(buf + lo, sizeof(buf) - lo, "%s%s@%p=%s%s%s", i ? " | " : "",
+                       ps[i].pc == local ? "me" : ps[i].name, ps[i].pc, ps[i].haveRole ? rn(ps[i].role) : "?",
                        ps[i].dead ? "(dead)" : "", ps[i].disc ? "(left)" : "");
     }
     LOGI("MENUTEST ROLES[%s]: %s", tag, buf);
@@ -1084,10 +1090,17 @@ static void verifyFn(void *) {
     g_verify.active = false;
 }
 static void rolesLateFn(void *) { logRoles("after-6s"); }
+static void assignLogFn(void *) { logRoles("after-SelectRoles"); }
 static void verifyTick() {
     if (g_rolesLateAt && nowMs() >= g_rolesLateAt) {
         g_rolesLateAt = 0;
         if (!guarded(rolesLateFn, nullptr)) LOGI("MENUTEST rolesLateFn FAULT");
+    }
+    {
+        long al = g_assignLogAt.load();
+        if (al && nowMs() >= al && g_assignLogAt.exchange(0) == al) {
+            if (!guarded(assignLogFn, nullptr)) LOGI("MENUTEST assignLogFn FAULT");
+        }
     }
     if (!g_verify.active || nowMs() < g_verify.at) return;
     if (!guarded(verifyFn, nullptr)) {
@@ -1209,6 +1222,34 @@ static void hk_cosetrole(void *self, uint64_t role, uint64_t canOverride, const 
     }
 }
 
+// v14: LOG-ONLY hooks (they never change an argument or a result). They answer: does the game call RpcSetRole while it assigns
+// roles, in which order (impostors first?), with which canOverride, and when does RoleManager.SelectRoles start/end.
+// No il2cpp calls inside the hooks (only pointers/numbers are logged); names come from the "ROLES[after-SelectRoles]" line.
+typedef void (*fn_rpcsetrole_t)(void *self, uint64_t role, uint64_t canOverride, const void *method);
+static fn_rpcsetrole_t orig_rpcsetrole = nullptr;
+static std::atomic<int> g_rpcLogged{0};
+static void hk_rpcsetrole(void *self, uint64_t role, uint64_t canOverride, const void *method) {
+    int seq = g_rpcLogged.fetch_add(1);
+    if (seq < 400) {
+        void *local = nullptr;
+        if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
+        unsigned rv = (unsigned)(role & 0xffff);
+        const char *nm = roleName(rv);
+        LOGI("MENUTEST RPCSETROLE #%d t=%ld self=%p isLocal=%d role=%u (%s) canOverride=%d by=%s", seq, nowMs() % 1000000, self,
+             self == local ? 1 : 0, rv, nm ? nm : "?", (int)(canOverride & 0xff), g_ourRpc.load() ? "OUR-SWAP" : "GAME");
+    }
+    if (orig_rpcsetrole) orig_rpcsetrole(self, role, canOverride, method);
+}
+typedef void (*fn_selectroles_t)(void *self, const void *method);
+static fn_selectroles_t orig_selectroles = nullptr;
+static void hk_selectroles(void *self, const void *method) {
+    LOGI("MENUTEST SELECTROLES ENTER t=%ld", nowMs() % 1000000);
+    if (orig_selectroles) orig_selectroles(self, method);
+    LOGI("MENUTEST SELECTROLES EXIT t=%ld", nowMs() % 1000000);
+    g_assignLogAt.store(nowMs() + 2500);
+    g_rpcLogged.store(0);
+}
+
 // ---------------------------------------------------------------- watcher thread: waits, resolves, hooks
 struct DomainArg { void *domain; };
 static void domainFn(void *a) { ((DomainArg *)a)->domain = p_domain_get(); }
@@ -1239,6 +1280,10 @@ static void resolveGameFn(void *a) {
     m_FixedUpdate = findMethod(k_PlayerControl, "FixedUpdate", 0);
     m_RpcSetRole = findMethod(k_PlayerControl, "RpcSetRole", 2);
     m_CoSetRole = findMethod(k_PlayerControl, "CoSetRole", 2);
+    {   // v14: RoleManager.SelectRoles must be known at hook-install time (resolveHostFn only runs later)
+        void *krm = p_class_from_name(g_image, "", "RoleManager");
+        if (krm) m_RMSelectRoles = findMethod(krm, "SelectRoles", 0);
+    }
     LOGI("MENUTEST field LocalPlayer=%p myTasks=%p, method RpcCompleteTask=%p FixedUpdate=%p",
          f_LocalPlayer, f_myTasks, m_RpcCompleteTask, m_FixedUpdate);
     r->ok = (f_LocalPlayer != nullptr && f_myTasks != nullptr);
@@ -1360,6 +1405,32 @@ static void *watcher(void *) {
         LOGI("MENUTEST CoSetRole observer hook skipped (method or return-type API missing)");
     }
 
+    // v14: log-only hooks on RpcSetRole and RoleManager.SelectRoles (both must be void methods with code inside libil2cpp)
+    if (m_RpcSetRole && p_method_get_return_type) {
+        void *rt = p_method_get_return_type(m_RpcSetRole);
+        void *tgt = *(void **)m_RpcSetRole;
+        if (rt && p_type_get_type(rt) == 0x01 && tgt && inIl2cppText((unsigned long)tgt)) {
+            int r = DobbyHook(tgt, (void *)hk_rpcsetrole, (void **)&orig_rpcsetrole);
+            LOGI("MENUTEST RpcSetRole log hook %s (r=%d target=%p)", (r == 0 && orig_rpcsetrole) ? "installed" : "NOT installed", r, tgt);
+            if (r != 0) orig_rpcsetrole = nullptr;
+        } else {
+            LOGI("MENUTEST RpcSetRole log hook skipped: return type=0x%x, target=%p", rt ? p_type_get_type(rt) : -1, tgt);
+        }
+    }
+    if (m_RMSelectRoles && p_method_get_return_type) {
+        void *rt = p_method_get_return_type(m_RMSelectRoles);
+        void *tgt = *(void **)m_RMSelectRoles;
+        if (rt && p_type_get_type(rt) == 0x01 && tgt && inIl2cppText((unsigned long)tgt)) {
+            int r = DobbyHook(tgt, (void *)hk_selectroles, (void **)&orig_selectroles);
+            LOGI("MENUTEST SelectRoles log hook %s (r=%d target=%p)", (r == 0 && orig_selectroles) ? "installed" : "NOT installed", r, tgt);
+            if (r != 0) orig_selectroles = nullptr;
+        } else {
+            LOGI("MENUTEST SelectRoles log hook skipped: return type=0x%x, target=%p", rt ? p_type_get_type(rt) : -1, tgt);
+        }
+    } else {
+        LOGI("MENUTEST SelectRoles log hook skipped (method not found)");
+    }
+
     g_state.store(ST_READY);
     setStatus("Menu ready (%s). Join a match and press 'Complete my tasks'.",
               g_hooked.load() ? "main-thread mode" : "helper-thread mode, less safe");
@@ -1385,7 +1456,7 @@ static void *watcher(void *) {
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v13 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v14 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
