@@ -1,4 +1,4 @@
-// MENUTEST v12 - first real feature: "Complete my tasks".
+// MENUTEST v13 (v12 + ROLES logger) - first real feature: "Complete my tasks".
 // Build for game 2026.11.3 (Unity 2022.3.62f3, il2cpp). NOT built / NOT tested when written.
 //
 // What it does:
@@ -923,6 +923,24 @@ struct VerifyState { bool active; int stage; long at; int n; void *pcs[2]; unsig
 static VerifyState g_verify;
 
 // the swap itself. runs on the Unity thread. does NOT call guarded() (already inside one when called from the tick).
+// v13: one log line with every player's role as THIS (host) phone sees it. Compare with what the other phone's screen shows.
+// Log tag example: "MENUTEST ROLES[after-1.5s]: me=Viper | JC=Scientist | Bob=Phantom(dead)"
+static void logRoles(const char *tag) {
+    PInfo ps[kMaxPlayers];
+    void *local = nullptr;
+    int n = collectPlayers(ps, kMaxPlayers, &local);
+    if (n <= 0) { LOGI("MENUTEST ROLES[%s]: could not read players", tag); return; }
+    char buf[900];
+    int lo = 0;
+    for (int i = 0; i < n && lo < (int)sizeof(buf) - 80; i++) {
+        lo += snprintf(buf + lo, sizeof(buf) - lo, "%s%s=%s%s%s", i ? " | " : "",
+                       ps[i].pc == local ? "me" : ps[i].name, ps[i].haveRole ? rn(ps[i].role) : "?",
+                       ps[i].dead ? "(dead)" : "", ps[i].disc ? "(left)" : "");
+    }
+    LOGI("MENUTEST ROLES[%s]: %s", tag, buf);
+}
+static long g_rolesLateAt = 0;   // v13: one more ROLES line a few seconds after the swap
+
 static void swapFn(void *arg) {
     const bool manual = (arg != nullptr);
     (void)manual;
@@ -994,6 +1012,7 @@ static void swapFn(void *arg) {
     void *xpc = (X >= 0) ? ps[X].pc : nullptr;
     LOGI("MENUTEST swap plan: you %s -> %s; other=%s %s -> %s", rn(oldMe), rn(newMe), X >= 0 ? xname : "(nobody)", X >= 0 ? rn(oldX) : "-", X >= 0 ? rn(newX) : "-");
 
+    logRoles("before-swap");
     if (xpc && !setRoleOn(xpc, newX)) {
         setSwapMsg("RpcSetRole on %s threw an exception. Nothing else was changed.", xname);
         g_swapResult = 1;
@@ -1014,6 +1033,8 @@ static void swapFn(void *arg) {
     g_verify.stage = 1;
     g_verify.at = nowMs() + 1500;
     g_verify.active = true;
+    g_rolesLateAt = nowMs() + 6000;
+    logRoles("right-after-send");
 
     // re-read what THIS phone now says (the other players' phones may update a moment later; unverified)
     PInfo p2[kMaxPlayers];
@@ -1046,6 +1067,7 @@ static void verifyFn(void *) {
     int lo = 0;
     for (int t = 0; t < g_verify.n; t++)
         lo += snprintf(line + lo, sizeof(line) - lo, "%s=%s (wanted %s)%s", g_verify.names[t], found[t] ? rn(cur[t]) : "?", rn(g_verify.want[t]), t + 1 < g_verify.n ? ", " : "");
+    logRoles(g_verify.stage == 1 ? "after-1.5s" : "after-SetRole");
     if (allOk) { setSwapMsg("Checked after 1.5 s: roles CHANGED on this phone: %s.", line); g_verify.active = false; return; }
     if (g_verify.stage == 1 && rmSetRoleOk()) {
         bool any = false;
@@ -1061,7 +1083,12 @@ static void verifyFn(void *) {
     setSwapMsg("Checked: roles did NOT change on this phone: %s. %s", line, g_verify.stage == 1 ? "RpcSetRole had no effect and RoleManager.SetRole is not usable." : "RoleManager.SetRole did not help either.");
     g_verify.active = false;
 }
+static void rolesLateFn(void *) { logRoles("after-6s"); }
 static void verifyTick() {
+    if (g_rolesLateAt && nowMs() >= g_rolesLateAt) {
+        g_rolesLateAt = 0;
+        if (!guarded(rolesLateFn, nullptr)) LOGI("MENUTEST rolesLateFn FAULT");
+    }
     if (!g_verify.active || nowMs() < g_verify.at) return;
     if (!guarded(verifyFn, nullptr)) {
         g_verify.active = false;
@@ -1358,7 +1385,7 @@ static void *watcher(void *) {
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v12 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v13 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
