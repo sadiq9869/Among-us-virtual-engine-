@@ -1,4 +1,4 @@
-// MENUTEST v11 - first real feature: "Complete my tasks".
+// MENUTEST v12 - first real feature: "Complete my tasks".
 // Build for game 2026.11.3 (Unity 2022.3.62f3, il2cpp). NOT built / NOT tested when written.
 //
 // What it does:
@@ -356,6 +356,7 @@ static void *k_NetInfo = nullptr;          // class NetworkedPlayerInfo
 static void *f_AllPlayers = nullptr;       // static field PlayerControl.AllPlayerControls (a List<PlayerControl>)
 static void *m_get_Data = nullptr;         // PlayerControl.get_Data()
 static void *m_get_PlayerName = nullptr;   // NetworkedPlayerInfo.get_PlayerName()
+static void *m_get_ColorName = nullptr;    // NetworkedPlayerInfo.get_ColorName() (colour name text, e.g. "Cyan")
 static void *f_IsDead = nullptr, *f_Disconnected = nullptr, *f_RoleType = nullptr, *f_RoleWhenAlive = nullptr;
 struct EnumVal { char name[40]; unsigned val; };
 static EnumVal g_roleEnum[48];             // RoleType enum names/values read from the live game
@@ -370,6 +371,7 @@ static void resolveExtraFn(void *) {
     k_NetInfo = p_class_from_name(g_image, "", "NetworkedPlayerInfo");
     if (k_NetInfo) {
         m_get_PlayerName = findMethod(k_NetInfo, "get_PlayerName", 0);
+        m_get_ColorName = findMethod(k_NetInfo, "get_ColorName", 0);
         f_IsDead = findField(k_NetInfo, "IsDead");
         f_Disconnected = findField(k_NetInfo, "Disconnected");
         f_RoleType = findField(k_NetInfo, "RoleType");
@@ -431,12 +433,12 @@ static bool nameIsImpostorTeam(const char *n) {
 // known=false if the role could not be read (then the answer must not be trusted)
 static bool isImpostorData(void *data, bool *known) {
     *known = false;
-    unsigned rt = 0, rw = 0;
+    unsigned rt = 0;
     if (!data || g_roleEnumCount == 0 || !readU16(data, f_RoleType, &rt)) return false;
     *known = true;
-    if (nameIsImpostorTeam(roleName(rt))) return true;
-    if (f_RoleWhenAlive && readU16(data, f_RoleWhenAlive, &rw) && nameIsImpostorTeam(roleName(rw))) return true;
-    return false;
+    // v12: only RoleType is used. RoleWhenAlive is not a plain enum value (v11 misread it and blocked crew players as "impostor").
+    // A dead impostor shows RoleType=ImpostorGhost, which also contains "Impostor".
+    return nameIsImpostorTeam(roleName(rt));
 }
 static void il2str(void *s, char *out, size_t cap) {
     out[0] = 0;
@@ -507,18 +509,24 @@ static void playersFn(void *) {
         bool isDead = false, disc = false;
         bool haveDead = readBoolField(data, f_IsDead, &isDead);
         readBoolField(data, f_Disconnected, &disc);
-        unsigned rt = 0, rw = 0;
+        unsigned rt = 0;
         bool haveRole = readU16(data, f_RoleType, &rt);
         char role[80];
         if (!haveRole) snprintf(role, sizeof(role), "role unknown");
         else if (roleName(rt)) snprintf(role, sizeof(role), "%s", roleName(rt));
         else snprintf(role, sizeof(role), "role#%u", rt);
-        if (haveRole && isDead && f_RoleWhenAlive && readU16(data, f_RoleWhenAlive, &rw) && rw != rt) {
-            size_t rl = strlen(role);
-            if (roleName(rw)) snprintf(role + rl, sizeof(role) - rl, " (was %s)", roleName(rw));
+        char col[56];
+        col[0] = 0;
+        if (m_get_ColorName) {
+            bool okc = false;
+            void *cs = invokeRaw(m_get_ColorName, data, nullptr, "get_ColorName", &okc);
+            char tmp[40];
+            tmp[0] = 0;
+            if (okc) il2str(cs, tmp, sizeof(tmp));
+            if (tmp[0]) snprintf(col, sizeof(col), " (%s)", tmp);
         }
         if (haveDead) { if (isDead) dead++; else alive++; }
-        lo += snprintf(lines + lo, sizeof(lines) - lo, "%s%s | %s | %s%s\n", name, (pc == local) ? " (you)" : "", role,
+        lo += snprintf(lines + lo, sizeof(lines) - lo, "%s%s%s | %s | %s%s\n", name, col, (pc == local) ? " (you)" : "", role,
                        haveDead ? (isDead ? "DEAD" : "Alive") : "?", disc ? " | Disconnected" : "");
         if (lo >= sizeof(lines)) { lo = sizeof(lines) - 1; break; }
     }
@@ -721,6 +729,7 @@ static void *f_ACInst = nullptr, *m_ACInst = nullptr, *m_AmHost = nullptr;     /
 static void *f_ShipInst = nullptr, *m_ShipInst = nullptr;                      // ShipStatus.Instance (exists only in a match)
 static void *f_roleAssigned = nullptr;                                         // PlayerControl.roleAssigned
 static void *m_RpcSetRole = nullptr, *m_CoSetRole = nullptr;                   // looked up in resolveGameFn
+static void *k_RoleManager = nullptr, *f_RMInst = nullptr, *m_RMInst = nullptr, *m_RMSetRole = nullptr;   // RoleManager.Instance.SetRole(player, role)
 static bool g_hostDone = false;
 static std::atomic<int> g_alwaysImp{0};
 static std::atomic<int> g_wantIdx{0};                 // 0 = random impostor role (take the swapped impostor's role)
@@ -774,6 +783,20 @@ static void resolveHostFn(void *) {
         if (!f_ShipInst) f_ShipInst = findField(k_ShipStatus, "_instance");
         m_ShipInst = findMethod(k_ShipStatus, "get_Instance", 0);
     }
+    k_RoleManager = p_class_from_name(g_image, "", "RoleManager");
+    if (k_RoleManager) {
+        f_RMInst = findField(k_RoleManager, "Instance");
+        if (!f_RMInst) f_RMInst = findField(k_RoleManager, "_instance");
+        m_RMInst = findMethod(k_RoleManager, "get_Instance", 0);
+        m_RMSetRole = findMethod(k_RoleManager, "SetRole", 2);
+        if (p_class_get_methods && p_method_get_name) {
+            void *iter = nullptr, *m;
+            int cnt = 0;
+            while ((m = p_class_get_methods(k_RoleManager, &iter)) != nullptr && cnt++ < 60)
+                LOGI("MENUTEST   RoleManager method %s", p_method_get_name(m));
+        }
+    }
+    LOGI("MENUTEST RoleManager=%p inst(field=%p,getter=%p) SetRole/2=%p", k_RoleManager, f_RMInst, m_RMInst, m_RMSetRole);
     f_roleAssigned = findField(k_PlayerControl, "roleAssigned");
     LOGI("MENUTEST host: AmongUsClient=%p inst(field=%p,getter=%p) get_AmHost=%p | ShipStatus=%p inst(field=%p,getter=%p) | roleAssigned=%p | RpcSetRole=%p CoSetRole=%p",
          k_AmongUsClient, f_ACInst, m_ACInst, m_AmHost, k_ShipStatus, f_ShipInst, m_ShipInst, f_roleAssigned, m_RpcSetRole, m_CoSetRole);
@@ -878,6 +901,27 @@ static bool setRoleOn(void *pc, unsigned role) {
     return ok;
 }
 
+// RoleManager.SetRole(PlayerControl, RoleTypes): used only as a fallback when RpcSetRole alone did not change the role
+static bool rmSetRoleOk() {
+    if (!m_RMSetRole || !p_class_from_type) return false;
+    void *p1 = p_method_get_param(m_RMSetRole, 0), *p2 = p_method_get_param(m_RMSetRole, 1);
+    if (!p1 || !p2) return false;
+    void *c1 = p_class_from_type(p1), *c2 = p_class_from_type(p2);
+    const char *n1 = c1 ? p_class_get_name(c1) : nullptr, *n2 = c2 ? p_class_get_name(c2) : nullptr;
+    return n1 && n2 && !strcmp(n1, "PlayerControl") && !strcmp(n2, "RoleTypes");
+}
+static bool callRMSetRole(void *pc, unsigned role) {
+    void *rm = staticObj(f_RMInst, m_RMInst);
+    if (!rm) return false;
+    uint64_t rb = role;
+    void *args[2] = {pc, &rb};
+    bool ok = false;
+    invokeRaw(m_RMSetRole, rm, args, "RoleManager.SetRole", &ok);
+    return ok;
+}
+struct VerifyState { bool active; int stage; long at; int n; void *pcs[2]; unsigned want[2]; char names[2][48]; };
+static VerifyState g_verify;
+
 // the swap itself. runs on the Unity thread. does NOT call guarded() (already inside one when called from the tick).
 static void swapFn(void *arg) {
     const bool manual = (arg != nullptr);
@@ -962,6 +1006,15 @@ static void swapFn(void *arg) {
         return;
     }
 
+    // v12: check again after 1.5 s (the role is applied by a coroutine, so the immediate re-read below proves nothing)
+    memset(&g_verify, 0, sizeof(g_verify));
+    g_verify.n = 0;
+    g_verify.pcs[g_verify.n] = local; g_verify.want[g_verify.n] = newMe; snprintf(g_verify.names[g_verify.n], 48, "you"); g_verify.n++;
+    if (xpc) { g_verify.pcs[g_verify.n] = xpc; g_verify.want[g_verify.n] = newX; snprintf(g_verify.names[g_verify.n], 48, "%s", xname); g_verify.n++; }
+    g_verify.stage = 1;
+    g_verify.at = nowMs() + 1500;
+    g_verify.active = true;
+
     // re-read what THIS phone now says (the other players' phones may update a moment later; unverified)
     PInfo p2[kMaxPlayers];
     void *l2 = nullptr;
@@ -976,6 +1029,45 @@ static void swapFn(void *arg) {
     else
         setSwapMsg("Role change sent: you %s -> %s (nobody else touched). Game now says: you=%s.", rn(oldMe), rn(newMe), meNow);
     g_swapResult = 1;
+}
+
+static void verifyFn(void *) {
+    PInfo ps[kMaxPlayers];
+    void *local = nullptr;
+    int n = collectPlayers(ps, kMaxPlayers, &local);
+    unsigned cur[2] = {0, 0};
+    bool found[2] = {false, false};
+    for (int t = 0; t < g_verify.n; t++)
+        for (int i = 0; i < n; i++)
+            if (ps[i].pc == g_verify.pcs[t] && ps[i].haveRole) { cur[t] = ps[i].role; found[t] = true; }
+    bool allOk = true;
+    for (int t = 0; t < g_verify.n; t++) if (!found[t] || cur[t] != g_verify.want[t]) allOk = false;
+    char line[400];
+    int lo = 0;
+    for (int t = 0; t < g_verify.n; t++)
+        lo += snprintf(line + lo, sizeof(line) - lo, "%s=%s (wanted %s)%s", g_verify.names[t], found[t] ? rn(cur[t]) : "?", rn(g_verify.want[t]), t + 1 < g_verify.n ? ", " : "");
+    if (allOk) { setSwapMsg("Checked after 1.5 s: roles CHANGED on this phone: %s.", line); g_verify.active = false; return; }
+    if (g_verify.stage == 1 && rmSetRoleOk()) {
+        bool any = false;
+        for (int t = 0; t < g_verify.n; t++)
+            if (!found[t] || cur[t] != g_verify.want[t]) if (callRMSetRole(g_verify.pcs[t], g_verify.want[t])) any = true;
+        if (any) {
+            setSwapMsg("RpcSetRole alone did NOT change the role (%s). Applied RoleManager.SetRole as well, checking again.", line);
+            g_verify.stage = 2;
+            g_verify.at = nowMs() + 1500;
+            return;
+        }
+    }
+    setSwapMsg("Checked: roles did NOT change on this phone: %s. %s", line, g_verify.stage == 1 ? "RpcSetRole had no effect and RoleManager.SetRole is not usable." : "RoleManager.SetRole did not help either.");
+    g_verify.active = false;
+}
+static void verifyTick() {
+    if (!g_verify.active || nowMs() < g_verify.at) return;
+    if (!guarded(verifyFn, nullptr)) {
+        g_verify.active = false;
+        setSwapMsg("Crash guard caught a fault while checking the roles (see logcat MENUTEST).");
+        LOGI("MENUTEST verifyFn FAULT");
+    }
 }
 
 // called every ~300 ms from the Unity thread while "Always Imposter" is on
@@ -1071,6 +1163,7 @@ static void hk_fixed(void *self, const void *method) {
     if (g_reqHostInfo.load(std::memory_order_relaxed) && g_reqHostInfo.exchange(false)) runHostInfo();
     if (g_reqSwapNow.load(std::memory_order_relaxed) && g_reqSwapNow.exchange(false)) runSwapNow();
     autoTick();
+    verifyTick();
 }
 
 // v11: observer hook on PlayerControl::CoSetRole(role, canOverride). It only LOGS (no il2cpp calls, no guarded()), so it cannot
@@ -1233,7 +1326,8 @@ static void *watcher(void *) {
             LOGI("MENUTEST CoSetRole observer hook %s (r=%d target=%p)", (r == 0 && orig_cosetrole) ? "installed" : "NOT installed", r, tgt);
             if (r != 0) orig_cosetrole = nullptr;
         } else {
-            LOGI("MENUTEST CoSetRole observer hook skipped (not a void method or pointer outside libil2cpp)");
+            LOGI("MENUTEST CoSetRole observer hook skipped: return type=0x%x (void is 0x1), target=%p, inside libil2cpp=%d",
+                 rt ? p_type_get_type(rt) : -1, tgt, (tgt && inIl2cppText((unsigned long)tgt)) ? 1 : 0);
         }
     } else {
         LOGI("MENUTEST CoSetRole observer hook skipped (method or return-type API missing)");
@@ -1257,13 +1351,14 @@ static void *watcher(void *) {
         if (g_reqHostInfo.exchange(false)) runHostInfo();
         if (g_reqSwapNow.exchange(false)) runSwapNow();
         autoTick();
+        verifyTick();
     }
     return nullptr;
 }
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v11 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v12 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
