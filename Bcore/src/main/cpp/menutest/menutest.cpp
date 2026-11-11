@@ -1,4 +1,4 @@
-// MENUTEST v14 (v13 + RpcSetRole/SelectRoles LOG-ONLY hooks) - first real feature: "Complete my tasks".
+// MENUTEST v15 (v14 + Always Imposter swapped DURING SelectRoles via RpcSetRole hook) - first real feature: "Complete my tasks".
 // Build for game 2026.11.3 (Unity 2022.3.62f3, il2cpp). NOT built / NOT tested when written.
 //
 // What it does:
@@ -895,6 +895,18 @@ static bool rpcSetRoleOk(char *why, size_t cap) {
     }
     return true;
 }
+typedef void (*fn_rpcsetrole_t)(void *self, uint64_t role, uint64_t canOverride, const void *method);
+static fn_rpcsetrole_t orig_rpcsetrole = nullptr;
+typedef void (*fn_selectroles_t)(void *self, const void *method);
+static fn_selectroles_t orig_selectroles = nullptr;
+// v15 state of the swap-while-assigning (touched only by the Unity thread inside SelectRoles)
+static std::atomic<int> g_inSelect{0};
+static void *g_displaced = nullptr;            // the impostor who lost his role to me
+static bool g_localImpDone = false, g_haveLocalCrew = false, g_crewGiven = false;
+static unsigned g_localCrewRole = 0;
+static const void *g_lastMethod = nullptr;
+static const unsigned kWantVals[] = {0, 1, 5, 9, 18};   // Random, Impostor, Shapeshifter, Phantom, Viper (values from the game dump)
+static inline bool isImpRoleVal(unsigned v) { return v == 1 || v == 5 || v == 9 || v == 18; }
 static std::atomic<int> g_ourRpc{0};   // v14: 1 while OUR swap code calls RpcSetRole (so the hook can label it)
 static std::atomic<long> g_assignLogAt{0};   // v14: after SelectRoles returns, log all roles with pointers once
 static bool setRoleOn(void *pc, unsigned role) {
@@ -1143,6 +1155,7 @@ static void tickFn(void *) {
 
 static void autoTick() {
     if (!g_alwaysImp.load(std::memory_order_relaxed)) return;
+    if (orig_rpcsetrole && orig_selectroles) return;   // v15: swap happens inside SelectRoles; the old after-match swap only changed THIS phone
     long now = nowMs();
     if (now - g_lastTick < 300) return;
     g_lastTick = now;
@@ -1225,27 +1238,63 @@ static void hk_cosetrole(void *self, uint64_t role, uint64_t canOverride, const 
 // v14: LOG-ONLY hooks (they never change an argument or a result). They answer: does the game call RpcSetRole while it assigns
 // roles, in which order (impostors first?), with which canOverride, and when does RoleManager.SelectRoles start/end.
 // No il2cpp calls inside the hooks (only pointers/numbers are logged); names come from the "ROLES[after-SelectRoles]" line.
-typedef void (*fn_rpcsetrole_t)(void *self, uint64_t role, uint64_t canOverride, const void *method);
-static fn_rpcsetrole_t orig_rpcsetrole = nullptr;
 static std::atomic<int> g_rpcLogged{0};
 static void hk_rpcsetrole(void *self, uint64_t role, uint64_t canOverride, const void *method) {
     int seq = g_rpcLogged.fetch_add(1);
+    void *local = nullptr;
+    if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
+    unsigned rv = (unsigned)(role & 0xffff);
+    const bool ours = g_ourRpc.load() != 0;
+    const bool inSel = g_inSelect.load() != 0;
     if (seq < 400) {
-        void *local = nullptr;
-        if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
-        unsigned rv = (unsigned)(role & 0xffff);
         const char *nm = roleName(rv);
-        LOGI("MENUTEST RPCSETROLE #%d t=%ld self=%p isLocal=%d role=%u (%s) canOverride=%d by=%s", seq, nowMs() % 1000000, self,
-             self == local ? 1 : 0, rv, nm ? nm : "?", (int)(canOverride & 0xff), g_ourRpc.load() ? "OUR-SWAP" : "GAME");
+        LOGI("MENUTEST RPCSETROLE #%d t=%ld self=%p isLocal=%d role=%u (%s) canOverride=%d by=%s%s", seq, nowMs() % 1000000, self,
+             self == local ? 1 : 0, rv, nm ? nm : "?", (int)(canOverride & 0xff), ours ? "OUR-SWAP" : "GAME", inSel ? " [in SelectRoles]" : "");
+    }
+    g_lastMethod = method;
+    // ---- v15: swap while the game assigns roles (host only: SelectRoles runs only on the host)
+    if (!ours && inSel && local && orig_rpcsetrole && g_alwaysImp.load()) {
+        if (self == local) {
+            if (isImpRoleVal(rv)) {
+                g_localImpDone = true;                       // the game itself made me an impostor: nothing to swap
+            } else if (g_displaced) {
+                LOGI("MENUTEST V15 REDIRECT: my crew role %u goes to the displaced impostor %p", rv, g_displaced);
+                orig_rpcsetrole(g_displaced, role, canOverride, method);
+                g_crewGiven = true;
+                setSwapMsg("Always Imposter: the impostor %p got your crew role (%u), you took his impostor role.", g_displaced, rv);
+                return;
+            } else {
+                g_haveLocalCrew = true; g_localCrewRole = rv; // crew role arrived before any impostor role (unexpected order); remembered
+            }
+        } else if (isImpRoleVal(rv) && !g_localImpDone && !g_displaced) {
+            int wi = g_wantIdx.load();
+            unsigned give = (wi > 0 && wi < kWantCount) ? kWantVals[wi] : rv;
+            LOGI("MENUTEST V15 REDIRECT: impostor role %u of %p goes to ME as %u", rv, self, give);
+            g_displaced = self;
+            g_localImpDone = true;
+            if (g_haveLocalCrew) {                           // I already got a crew role: override it, and hand that role to the displaced one
+                orig_rpcsetrole(local, (uint64_t)give, 1, method);
+                orig_rpcsetrole(self, (uint64_t)g_localCrewRole, 1, method);
+                g_crewGiven = true;
+            } else {
+                orig_rpcsetrole(local, (uint64_t)give, canOverride, method);
+            }
+            return;
+        }
     }
     if (orig_rpcsetrole) orig_rpcsetrole(self, role, canOverride, method);
 }
-typedef void (*fn_selectroles_t)(void *self, const void *method);
-static fn_selectroles_t orig_selectroles = nullptr;
 static void hk_selectroles(void *self, const void *method) {
-    LOGI("MENUTEST SELECTROLES ENTER t=%ld", nowMs() % 1000000);
+    LOGI("MENUTEST SELECTROLES ENTER t=%ld alwaysImp=%d", nowMs() % 1000000, g_alwaysImp.load() ? 1 : 0);
+    g_displaced = nullptr; g_localImpDone = false; g_haveLocalCrew = false; g_crewGiven = false; g_localCrewRole = 0;
+    g_inSelect.store(1);
     if (orig_selectroles) orig_selectroles(self, method);
-    LOGI("MENUTEST SELECTROLES EXIT t=%ld", nowMs() % 1000000);
+    g_inSelect.store(0);
+    if (g_displaced && !g_crewGiven && orig_rpcsetrole) {   // safety net: the displaced impostor must never stay without a role
+        LOGI("MENUTEST V15 SAFETY: displaced %p got no crew role, giving Crewmate", g_displaced);
+        orig_rpcsetrole(g_displaced, 0, 1, g_lastMethod);
+    }
+    LOGI("MENUTEST SELECTROLES EXIT t=%ld swapped=%d", nowMs() % 1000000, g_displaced ? 1 : 0);
     g_assignLogAt.store(nowMs() + 2500);
     g_rpcLogged.store(0);
 }
@@ -1456,7 +1505,7 @@ static void *watcher(void *) {
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v14 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v15 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
