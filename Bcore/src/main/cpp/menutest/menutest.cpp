@@ -1,5 +1,10 @@
-// MENUTEST v15 (v14 + Always Imposter swapped DURING SelectRoles via RpcSetRole hook) - first real feature: "Complete my tasks".
+// MENUTEST v16 = v15 (Always Imposter swapped DURING SelectRoles via RpcSetRole hook) +
+//   * "Swap now" removed completely (button, JNI function, old after-match swap code)
+//   * player text is "Name(Colour)" with exactly ONE bracket pair (the game's colour text is stripped of its own brackets first)
+//   * RPCSETROLE / V15 REDIRECT / SAFETY / ROLES log lines show player names (pointer->name table filled outside the hooks)
+//   * 4 visual tasks: Submit Scan, Clear Asteroids, Empty Trash, Prime Shields (works for crew AND impostor)
 // Build for game 2026.11.3 (Unity 2022.3.62f3, il2cpp). NOT built / NOT tested when written.
+// First feature (still here): "Complete my tasks".
 //
 // What it does:
 //  * waits for libil2cpp.so, resolves il2cpp API BY NAME (xdl), then waits kStartDelayMs before
@@ -458,6 +463,25 @@ static void il2str(void *s, char *out, size_t cap) {
     out[o] = 0;
 }
 
+// v16: the game's colour text may already come wrapped in brackets (seen by the user as "Name ((Cyan))").
+// Strip any brackets/spaces around it, so the result has NO brackets, then fmtNameColour adds exactly ONE pair.
+static void stripBrackets(const char *in, char *out, size_t cap) {
+    out[0] = 0;
+    if (!in || cap < 2) return;
+    size_t s = 0, e = strlen(in);
+    while (s < e && (in[s] == '(' || in[s] == '[' || in[s] == ' ' || in[s] == '\t')) s++;
+    while (e > s && (in[e - 1] == ')' || in[e - 1] == ']' || in[e - 1] == ' ' || in[e - 1] == '\t')) e--;
+    size_t n = e - s;
+    if (n > cap - 1) n = cap - 1;
+    memcpy(out, in + s, n);
+    out[n] = 0;
+}
+// "Name(Colour)" with exactly one bracket pair; just "Name" if the colour is empty
+static void fmtNameColour(char *out, size_t cap, const char *name, const char *colourPlain) {
+    if (colourPlain && colourPlain[0]) snprintf(out, cap, "%s(%s)", name, colourPlain);
+    else snprintf(out, cap, "%s", name);
+}
+
 // ---------------------------------------------------------------- v9: player info (name / role / alive-dead)
 static std::mutex g_playersMx;
 static char g_players[4096] = "Players: not requested yet.";
@@ -515,7 +539,7 @@ static void playersFn(void *) {
         if (!haveRole) snprintf(role, sizeof(role), "role unknown");
         else if (roleName(rt)) snprintf(role, sizeof(role), "%s", roleName(rt));
         else snprintf(role, sizeof(role), "role#%u", rt);
-        char col[56];
+        char col[48];
         col[0] = 0;
         if (m_get_ColorName) {
             bool okc = false;
@@ -523,10 +547,12 @@ static void playersFn(void *) {
             char tmp[40];
             tmp[0] = 0;
             if (okc) il2str(cs, tmp, sizeof(tmp));
-            if (tmp[0]) snprintf(col, sizeof(col), " (%s)", tmp);
+            stripBrackets(tmp, col, sizeof(col));      // v16: no double brackets
         }
+        char shown[170];
+        fmtNameColour(shown, sizeof(shown), name, col);
         if (haveDead) { if (isDead) dead++; else alive++; }
-        lo += snprintf(lines + lo, sizeof(lines) - lo, "%s%s%s | %s | %s%s\n", name, col, (pc == local) ? " (you)" : "", role,
+        lo += snprintf(lines + lo, sizeof(lines) - lo, "%s%s | %s | %s%s\n", shown, (pc == local) ? " (you)" : "", role,
                        haveDead ? (isDead ? "DEAD" : "Alive") : "?", disc ? " | Disconnected" : "");
         if (lo >= sizeof(lines)) { lo = sizeof(lines) - 1; break; }
     }
@@ -734,18 +760,13 @@ static void *k_RoleManager = nullptr, *f_RMInst = nullptr, *m_RMInst = nullptr, 
 static bool g_hostDone = false;
 static std::atomic<int> g_alwaysImp{0};
 static std::atomic<int> g_wantIdx{0};                 // 0 = random impostor role (take the swapped impostor's role)
-static std::atomic<bool> g_resetSeen{false};
-static std::atomic<bool> g_reqHostInfo{false}, g_reqSwapNow{false};
+static std::atomic<bool> g_reqHostInfo{false};
 static const char *kWantNames[] = {"Random", "Impostor", "Shapeshifter", "Phantom", "Viper"};
 static const int kWantCount = 5;
 static std::mutex g_hostMx;
 static char g_hostInfo[1400] = "Host tools: not read yet.";
 static char g_swapMsg[500] = "No swap done yet.";
 static std::atomic<long> g_hostInfoAt{0};
-static bool g_swapDone = false, g_sawLobby = false;   // Unity thread only
-static long g_stableSince = 0, g_lastTick = 0;
-static int g_swapResult = 0;                           // 1 = final (done or definitely nothing to do), 0 = retry later
-
 static void setSwapMsg(const char *fmt, ...) {
     char buf[500];
     va_list ap;
@@ -824,16 +845,7 @@ static int inMatchState() {
     return staticObj(f_ShipInst, m_ShipInst) ? 1 : 0;
 }
 static const char *rn(unsigned v) { const char *n = roleName(v); return n ? n : "?"; }
-static bool roleValueByName(const char *n, unsigned *v) {
-    for (int i = 0; i < g_roleEnumCount; i++) if (!strcmp(g_roleEnum[i].name, n)) { *v = g_roleEnum[i].val; return true; }
-    return false;
-}
-static unsigned rndN(unsigned n) {
-    static std::mt19937 g((unsigned)nowMs());
-    return (unsigned)(g() % n);
-}
-
-struct PInfo { void *pc; void *data; unsigned role; bool haveRole, dead, disc, assigned; char name[48]; };
+struct PInfo { void *pc; void *data; unsigned role; bool haveRole, dead, disc, assigned; char name[96]; };   // name = "Name(Colour)"
 
 // reads every player (host sees everyone's role). returns count or -1
 static int collectPlayers(PInfo *out, int cap, void **localOut) {
@@ -866,35 +878,30 @@ static int collectPlayers(PInfo *out, int cap, void **localOut) {
         readBoolField(data, f_Disconnected, &p.disc);
         p.assigned = true;
         if (f_roleAssigned) readBoolField(pc, f_roleAssigned, &p.assigned);
+        char nm[48];
+        nm[0] = 0;
         if (m_get_PlayerName) {
             bool okn = false;
             void *s = invokeRaw(m_get_PlayerName, data, nullptr, "get_PlayerName", &okn);
-            if (okn) il2str(s, p.name, sizeof(p.name));
+            if (okn) il2str(s, nm, sizeof(nm));
         }
-        if (!p.name[0]) snprintf(p.name, sizeof(p.name), "player#%d", i);
+        if (!nm[0]) snprintf(nm, sizeof(nm), "player#%d", i);
+        char col[40];
+        col[0] = 0;
+        if (m_get_ColorName) {
+            bool okc = false;
+            void *cs = invokeRaw(m_get_ColorName, data, nullptr, "get_ColorName", &okc);
+            char tmp[40];
+            tmp[0] = 0;
+            if (okc) il2str(cs, tmp, sizeof(tmp));
+            stripBrackets(tmp, col, sizeof(col));
+        }
+        fmtNameColour(p.name, sizeof(p.name), nm, col);   // v16: "Name(Colour)", one bracket pair
         n++;
     }
     return n;
 }
 
-// RpcSetRole(RoleTypes role, bool canOverride): check the real parameter types before ever calling it
-static bool rpcSetRoleOk(char *why, size_t cap) {
-    if (!m_RpcSetRole) { snprintf(why, cap, "RpcSetRole(2 params) not found"); return false; }
-    void *p1 = p_method_get_param(m_RpcSetRole, 0);
-    void *p2 = p_method_get_param(m_RpcSetRole, 1);
-    if (!p1 || !p2) { snprintf(why, cap, "RpcSetRole parameter types unreadable"); return false; }
-    int t2 = p_type_get_type(p2);
-    if (t2 != 0x02) { snprintf(why, cap, "RpcSetRole 2nd parameter is not a bool (type 0x%x)", t2); return false; }
-    if (p_class_from_type) {
-        void *ck = p_class_from_type(p1);
-        const char *cn = ck ? p_class_get_name(ck) : nullptr;
-        if (!cn || strcmp(cn, "RoleTypes")) { snprintf(why, cap, "RpcSetRole 1st parameter is %s, not RoleTypes", cn ? cn : "?"); return false; }
-    } else {
-        int t1 = p_type_get_type(p1);
-        if (t1 != 0x11 && !isIntegerType(t1)) { snprintf(why, cap, "RpcSetRole 1st parameter has unexpected type 0x%x", t1); return false; }
-    }
-    return true;
-}
 typedef void (*fn_rpcsetrole_t)(void *self, uint64_t role, uint64_t canOverride, const void *method);
 static fn_rpcsetrole_t orig_rpcsetrole = nullptr;
 typedef void (*fn_selectroles_t)(void *self, const void *method);
@@ -907,40 +914,7 @@ static unsigned g_localCrewRole = 0;
 static const void *g_lastMethod = nullptr;
 static const unsigned kWantVals[] = {0, 1, 5, 9, 18};   // Random, Impostor, Shapeshifter, Phantom, Viper (values from the game dump)
 static inline bool isImpRoleVal(unsigned v) { return v == 1 || v == 5 || v == 9 || v == 18; }
-static std::atomic<int> g_ourRpc{0};   // v14: 1 while OUR swap code calls RpcSetRole (so the hook can label it)
 static std::atomic<long> g_assignLogAt{0};   // v14: after SelectRoles returns, log all roles with pointers once
-static bool setRoleOn(void *pc, unsigned role) {
-    uint64_t rb = role, bb = 1;     // canOverride = true (a role that is already assigned must be overridden)
-    void *args[2] = {&rb, &bb};
-    bool ok = false;
-    g_ourRpc.store(1);
-    invokeRaw(m_RpcSetRole, pc, args, "RpcSetRole", &ok);
-    g_ourRpc.store(0);
-    return ok;
-}
-
-// RoleManager.SetRole(PlayerControl, RoleTypes): used only as a fallback when RpcSetRole alone did not change the role
-static bool rmSetRoleOk() {
-    if (!m_RMSetRole || !p_class_from_type) return false;
-    void *p1 = p_method_get_param(m_RMSetRole, 0), *p2 = p_method_get_param(m_RMSetRole, 1);
-    if (!p1 || !p2) return false;
-    void *c1 = p_class_from_type(p1), *c2 = p_class_from_type(p2);
-    const char *n1 = c1 ? p_class_get_name(c1) : nullptr, *n2 = c2 ? p_class_get_name(c2) : nullptr;
-    return n1 && n2 && !strcmp(n1, "PlayerControl") && !strcmp(n2, "RoleTypes");
-}
-static bool callRMSetRole(void *pc, unsigned role) {
-    void *rm = staticObj(f_RMInst, m_RMInst);
-    if (!rm) return false;
-    uint64_t rb = role;
-    void *args[2] = {pc, &rb};
-    bool ok = false;
-    invokeRaw(m_RMSetRole, rm, args, "RoleManager.SetRole", &ok);
-    return ok;
-}
-struct VerifyState { bool active; int stage; long at; int n; void *pcs[2]; unsigned want[2]; char names[2][48]; };
-static VerifyState g_verify;
-
-// the swap itself. runs on the Unity thread. does NOT call guarded() (already inside one when called from the tick).
 // v13: one log line with every player's role as THIS (host) phone sees it. Compare with what the other phone's screen shows.
 // Log tag example: "MENUTEST ROLES[after-1.5s]: me=Viper | JC=Scientist | Bob=Phantom(dead)"
 static void logRoles(const char *tag) {
@@ -948,225 +922,16 @@ static void logRoles(const char *tag) {
     void *local = nullptr;
     int n = collectPlayers(ps, kMaxPlayers, &local);
     if (n <= 0) { LOGI("MENUTEST ROLES[%s]: could not read players", tag); return; }
-    char buf[900];
+    char buf[1800];
     int lo = 0;
-    for (int i = 0; i < n && lo < (int)sizeof(buf) - 80; i++) {
-        lo += snprintf(buf + lo, sizeof(buf) - lo, "%s%s@%p=%s%s%s", i ? " | " : "",
-                       ps[i].pc == local ? "me" : ps[i].name, ps[i].pc, ps[i].haveRole ? rn(ps[i].role) : "?",
+    for (int i = 0; i < n && lo < (int)sizeof(buf) - 160; i++) {
+        lo += snprintf(buf + lo, sizeof(buf) - lo, "%s%s%s@%p=%s%s%s", i ? " | " : "",
+                       ps[i].name, ps[i].pc == local ? "[me]" : "", ps[i].pc, ps[i].haveRole ? rn(ps[i].role) : "?",
                        ps[i].dead ? "(dead)" : "", ps[i].disc ? "(left)" : "");
     }
     LOGI("MENUTEST ROLES[%s]: %s", tag, buf);
 }
-static long g_rolesLateAt = 0;   // v13: one more ROLES line a few seconds after the swap
-
-static void swapFn(void *arg) {
-    const bool manual = (arg != nullptr);
-    (void)manual;
-    g_swapResult = 0;
-    int h = hostState();
-    if (h != 1) {
-        setSwapMsg(h == 0 ? "Not host: role swap is host-only. Nothing done." : "Cannot verify that you are host. Nothing done.");
-        return;
-    }
-    if (inMatchState() != 1) { setSwapMsg("Not in a match yet. Nothing done."); return; }
-    char why[160];
-    if (!rpcSetRoleOk(why, sizeof(why))) { setSwapMsg("%s. Nothing done.", why); g_swapResult = 1; return; }
-    if (g_roleEnumCount == 0) { setSwapMsg("Role names could not be read from the game. Nothing done."); g_swapResult = 1; return; }
-
-    PInfo ps[kMaxPlayers];
-    void *local = nullptr;
-    int n = collectPlayers(ps, kMaxPlayers, &local);
-    if (n <= 0 || !local) { setSwapMsg("Could not read the player list yet. Nothing done."); return; }
-    int me = -1;
-    bool allAssigned = true;
-    for (int i = 0; i < n; i++) {
-        if (ps[i].pc == local) me = i;
-        if (!ps[i].assigned && !ps[i].disc) allAssigned = false;
-    }
-    if (me < 0 || !ps[me].haveRole) { setSwapMsg("Could not read your own role yet. Nothing done."); return; }
-    if (!allAssigned) { setSwapMsg("Roles are not assigned to everyone yet. Nothing done (retrying)."); return; }
-
-    unsigned want = 0;
-    int wi = g_wantIdx.load();
-    bool hasWant = wi > 0 && wi < kWantCount;
-    if (hasWant && !roleValueByName(kWantNames[wi], &want)) {
-        setSwapMsg("Role %s does not exist in this game version. Nothing done.", kWantNames[wi]);
-        g_swapResult = 1;
-        return;
-    }
-    bool meImp = nameIsImpostorTeam(roleName(ps[me].role));
-    int imps[kMaxPlayers], ni = 0;
-    for (int i = 0; i < n; i++) {
-        if (i == me || !ps[i].haveRole || ps[i].dead || ps[i].disc) continue;
-        if (nameIsImpostorTeam(roleName(ps[i].role))) imps[ni++] = i;
-    }
-
-    int X = -1;                 // the player who gives up an impostor role (or swaps with me), -1 = nobody else is touched
-    unsigned newMe = ps[me].role, newX = 0;
-    if (!hasWant) {
-        if (meImp) { setSwapMsg("You are already on the impostor team (%s). Nothing to swap.", rn(ps[me].role)); g_swapResult = 1; return; }
-        if (ni == 0) { setSwapMsg("No impostor found yet. Nothing done (retrying)."); return; }
-        X = imps[rndN((unsigned)ni)];
-        newMe = ps[X].role;
-        newX = ps[me].role;
-    } else {
-        if (meImp && ps[me].role == want) { setSwapMsg("You already are %s. Nothing to do.", rn(want)); g_swapResult = 1; return; }
-        int Y = -1;
-        for (int k = 0; k < ni; k++) if (ps[imps[k]].role == want) { Y = imps[k]; break; }
-        if (Y >= 0) { X = Y; newMe = want; newX = ps[me].role; }
-        else if (meImp) { X = -1; newMe = want; }
-        else {
-            if (ni == 0) { setSwapMsg("No impostor found yet. Nothing done (retrying)."); return; }
-            X = imps[rndN((unsigned)ni)];
-            newMe = want;
-            newX = ps[me].role;
-        }
-    }
-
-    unsigned oldMe = ps[me].role, oldX = (X >= 0) ? ps[X].role : 0;
-    char xname[48];
-    xname[0] = 0;
-    if (X >= 0) snprintf(xname, sizeof(xname), "%s", ps[X].name);
-    void *xpc = (X >= 0) ? ps[X].pc : nullptr;
-    LOGI("MENUTEST swap plan: you %s -> %s; other=%s %s -> %s", rn(oldMe), rn(newMe), X >= 0 ? xname : "(nobody)", X >= 0 ? rn(oldX) : "-", X >= 0 ? rn(newX) : "-");
-
-    logRoles("before-swap");
-    if (xpc && !setRoleOn(xpc, newX)) {
-        setSwapMsg("RpcSetRole on %s threw an exception. Nothing else was changed.", xname);
-        g_swapResult = 1;
-        return;
-    }
-    if (!setRoleOn(local, newMe)) {
-        if (xpc) setRoleOn(xpc, oldX);   // best effort: put the other player back
-        setSwapMsg("RpcSetRole on you threw an exception. Tried to restore %s.", xpc ? xname : "nobody");
-        g_swapResult = 1;
-        return;
-    }
-
-    // v12: check again after 1.5 s (the role is applied by a coroutine, so the immediate re-read below proves nothing)
-    memset(&g_verify, 0, sizeof(g_verify));
-    g_verify.n = 0;
-    g_verify.pcs[g_verify.n] = local; g_verify.want[g_verify.n] = newMe; snprintf(g_verify.names[g_verify.n], 48, "you"); g_verify.n++;
-    if (xpc) { g_verify.pcs[g_verify.n] = xpc; g_verify.want[g_verify.n] = newX; snprintf(g_verify.names[g_verify.n], 48, "%s", xname); g_verify.n++; }
-    g_verify.stage = 1;
-    g_verify.at = nowMs() + 1500;
-    g_verify.active = true;
-    g_rolesLateAt = nowMs() + 6000;
-    logRoles("right-after-send");
-
-    // re-read what THIS phone now says (the other players' phones may update a moment later; unverified)
-    PInfo p2[kMaxPlayers];
-    void *l2 = nullptr;
-    int n2 = collectPlayers(p2, kMaxPlayers, &l2);
-    const char *meNow = "?", *xNow = "?";
-    for (int i = 0; i < n2; i++) {
-        if (p2[i].pc == local && p2[i].haveRole) meNow = rn(p2[i].role);
-        if (xpc && p2[i].pc == xpc && p2[i].haveRole) xNow = rn(p2[i].role);
-    }
-    if (xpc)
-        setSwapMsg("Swap sent: you %s -> %s, %s %s -> %s. Game now says: you=%s, %s=%s.", rn(oldMe), rn(newMe), xname, rn(oldX), rn(newX), meNow, xname, xNow);
-    else
-        setSwapMsg("Role change sent: you %s -> %s (nobody else touched). Game now says: you=%s.", rn(oldMe), rn(newMe), meNow);
-    g_swapResult = 1;
-}
-
-static void verifyFn(void *) {
-    PInfo ps[kMaxPlayers];
-    void *local = nullptr;
-    int n = collectPlayers(ps, kMaxPlayers, &local);
-    unsigned cur[2] = {0, 0};
-    bool found[2] = {false, false};
-    for (int t = 0; t < g_verify.n; t++)
-        for (int i = 0; i < n; i++)
-            if (ps[i].pc == g_verify.pcs[t] && ps[i].haveRole) { cur[t] = ps[i].role; found[t] = true; }
-    bool allOk = true;
-    for (int t = 0; t < g_verify.n; t++) if (!found[t] || cur[t] != g_verify.want[t]) allOk = false;
-    char line[400];
-    int lo = 0;
-    for (int t = 0; t < g_verify.n; t++)
-        lo += snprintf(line + lo, sizeof(line) - lo, "%s=%s (wanted %s)%s", g_verify.names[t], found[t] ? rn(cur[t]) : "?", rn(g_verify.want[t]), t + 1 < g_verify.n ? ", " : "");
-    logRoles(g_verify.stage == 1 ? "after-1.5s" : "after-SetRole");
-    if (allOk) { setSwapMsg("Checked after 1.5 s: roles CHANGED on this phone: %s.", line); g_verify.active = false; return; }
-    if (g_verify.stage == 1 && rmSetRoleOk()) {
-        bool any = false;
-        for (int t = 0; t < g_verify.n; t++)
-            if (!found[t] || cur[t] != g_verify.want[t]) if (callRMSetRole(g_verify.pcs[t], g_verify.want[t])) any = true;
-        if (any) {
-            setSwapMsg("RpcSetRole alone did NOT change the role (%s). Applied RoleManager.SetRole as well, checking again.", line);
-            g_verify.stage = 2;
-            g_verify.at = nowMs() + 1500;
-            return;
-        }
-    }
-    setSwapMsg("Checked: roles did NOT change on this phone: %s. %s", line, g_verify.stage == 1 ? "RpcSetRole had no effect and RoleManager.SetRole is not usable." : "RoleManager.SetRole did not help either.");
-    g_verify.active = false;
-}
-static void rolesLateFn(void *) { logRoles("after-6s"); }
 static void assignLogFn(void *) { logRoles("after-SelectRoles"); }
-static void verifyTick() {
-    if (g_rolesLateAt && nowMs() >= g_rolesLateAt) {
-        g_rolesLateAt = 0;
-        if (!guarded(rolesLateFn, nullptr)) LOGI("MENUTEST rolesLateFn FAULT");
-    }
-    {
-        long al = g_assignLogAt.load();
-        if (al && nowMs() >= al && g_assignLogAt.exchange(0) == al) {
-            if (!guarded(assignLogFn, nullptr)) LOGI("MENUTEST assignLogFn FAULT");
-        }
-    }
-    if (!g_verify.active || nowMs() < g_verify.at) return;
-    if (!guarded(verifyFn, nullptr)) {
-        g_verify.active = false;
-        setSwapMsg("Crash guard caught a fault while checking the roles (see logcat MENUTEST).");
-        LOGI("MENUTEST verifyFn FAULT");
-    }
-}
-
-// called every ~300 ms from the Unity thread while "Always Imposter" is on
-static void tickFn(void *) {
-    int m = inMatchState();
-    if (g_resetSeen.exchange(false)) { g_sawLobby = false; g_swapDone = false; g_stableSince = 0; }
-    if (m == 0) { g_sawLobby = true; g_swapDone = false; g_stableSince = 0; return; }
-    if (m != 1) return;
-    if (g_swapDone) return;
-    if (!g_sawLobby) {
-        // switched on while a match was already running: do not swap in the middle of a game ("Swap now" can force it)
-        g_swapDone = true;
-        setSwapMsg("Always Imposter was turned on during a match. It will act at the start of the next match (or press 'Swap now').");
-        return;
-    }
-    int h = hostState();
-    if (h != 1) {
-        setSwapMsg(h == 0 ? "Always Imposter is ON but you are not host: host only, nothing is sent." : "Always Imposter is ON but host status could not be read: nothing is sent.");
-        return;
-    }
-    PInfo ps[kMaxPlayers];
-    void *local = nullptr;
-    int n = collectPlayers(ps, kMaxPlayers, &local);
-    bool all = n > 0 && local;
-    for (int i = 0; i < n; i++) if (!ps[i].assigned && !ps[i].disc) all = false;
-    if (!all) { g_stableSince = 0; return; }
-    if (g_stableSince == 0) { g_stableSince = nowMs(); return; }
-    if (nowMs() - g_stableSince < 800) return;
-    swapFn(nullptr);
-    if (g_swapResult == 1) g_swapDone = true;
-    else if (nowMs() - g_stableSince > 15000) { g_swapDone = true; setSwapMsg("Gave up after 15 s (see the line above). Press 'Swap now' to try again."); }
-}
-
-static void autoTick() {
-    if (!g_alwaysImp.load(std::memory_order_relaxed)) return;
-    if (orig_rpcsetrole && orig_selectroles) return;   // v15: swap happens inside SelectRoles; the old after-match swap only changed THIS phone
-    long now = nowMs();
-    if (now - g_lastTick < 300) return;
-    g_lastTick = now;
-    if (!guarded(resolveExtraFn, nullptr) || !guarded(resolveHostFn, nullptr)) return;
-    if (!guarded(tickFn, nullptr)) {
-        g_swapDone = true;
-        setSwapMsg("Crash guard caught a fault in Always Imposter; it stopped for this match (see logcat MENUTEST).");
-        LOGI("MENUTEST tickFn FAULT");
-    }
-}
-
 static void hostInfoFn(void *) {
     int h = hostState(), m = inMatchState();
     char mine[80] = "unknown";
@@ -1197,11 +962,256 @@ static void runHostInfo() {
     if (!guarded(hostInfoFn, nullptr)) setHostInfo("Host: unknown\nCrash guard caught a fault while reading host info (see logcat MENUTEST).");
 }
 
-static void runSwapNow() {
-    if (!guarded(resolveExtraFn, nullptr) || !guarded(resolveHostFn, nullptr)) { setSwapMsg("Fault while resolving host classes. Nothing done."); return; }
-    if (!guarded(swapFn, (void *)1)) {
-        setSwapMsg("Crash guard caught a fault during the swap (see logcat MENUTEST).");
-        LOGI("MENUTEST swapFn FAULT");
+// after SelectRoles returns, one ROLES line is logged ~2.5 s later (names + roles of everybody)
+static void logTick() {
+    long al = g_assignLogAt.load();
+    if (al && nowMs() >= al && g_assignLogAt.exchange(0) == al) {
+        if (!guarded(assignLogFn, nullptr)) LOGI("MENUTEST assignLogFn FAULT");
+    }
+}
+
+// ---------------------------------------------------------------- v16: pointer -> "Name(Colour)" table (for the log lines)
+// The RpcSetRole / SelectRoles hooks must NOT call il2cpp (names are not always ready inside SelectRoles), so the table is
+// filled earlier, on the Unity thread, every ~1.5 s while players exist (lobby!) and once more right before SelectRoles.
+// The hooks only read plain memory from this table. A pointer that is not in the table is printed as "name-unknown".
+struct NameEnt { void *pc; char name[100]; };
+static NameEnt g_names[kMaxPlayers];
+static int g_nameCount = 0;
+static std::atomic<int> g_namesBusy{0};
+static long g_namesAt = 0;
+
+static void refreshNamesFn(void *) {
+    PInfo ps[kMaxPlayers];
+    void *local = nullptr;
+    int n = collectPlayers(ps, kMaxPlayers, &local);
+    if (n <= 0) return;
+    g_namesBusy.store(1);
+    if (n > kMaxPlayers) n = kMaxPlayers;
+    for (int i = 0; i < n; i++) {
+        g_names[i].pc = ps[i].pc;
+        snprintf(g_names[i].name, sizeof(g_names[i].name), "%s%s", ps[i].name, ps[i].pc == local ? "[me]" : "");
+    }
+    g_nameCount = n;
+    g_namesBusy.store(0);
+}
+static const char *nameOf(void *pc) {
+    if (!pc || g_namesBusy.load()) return nullptr;
+    for (int i = 0; i < g_nameCount; i++) if (g_names[i].pc == pc) return g_names[i].name;
+    return nullptr;
+}
+static const char *pname(void *pc) { const char *n = nameOf(pc); return n ? n : "name-unknown"; }
+// refresh the table if it is older than maxAgeMs (Unity thread only)
+static void nameTick(long maxAgeMs) {
+    long now = nowMs();
+    if (now - g_namesAt < maxAgeMs) return;
+    g_namesAt = now;
+    if (!f_AllPlayers) {
+        if (!guarded(resolveExtraFn, nullptr)) return;
+        if (!f_AllPlayers) return;
+    }
+    if (!f_roleAssigned && !guarded(resolveHostFn, nullptr)) return;
+    if (!guarded(refreshNamesFn, nullptr)) LOGI("MENUTEST refreshNamesFn FAULT");
+}
+
+// ---------------------------------------------------------------- v16: visual tasks (Submit Scan, Clear Asteroids, Empty Trash, Prime Shields)
+// Source: dump.cs of 2026.11.3. NOT tested when written. No role check on purpose (works as crew and as impostor).
+//  * Asteroids / Trash / Shields: PlayerControl.RpcPlayAnimation(byte animType) with animType = TaskTypes value
+//    (ClearAsteroids=6, EmptyGarbage=10, PrimeShields=1). [GUESS: the game uses the TaskTypes number as animType]
+//  * Submit Scan: the hologram is driven by MedScanSystem (SystemTypes.MedBay=10): ShipStatus.RpcUpdateSystem(MedBay, 128|playerId)
+//    = "I use the scanner", and 64|playerId = "I am done" (Request=128, Release=64, NumMask=31 are constants in dump.cs).
+//  * Whether the lobby setting "Visual Tasks: OFF" blocks the animation on the OTHER phones is [UNKNOWN]; the test shows it.
+static const unsigned kAnimShields = 1, kAnimAsteroids = 6, kAnimGarbage = 10;
+static const unsigned kSysMedBay = 10;
+enum { VIS_SCAN = 1, VIS_ASTEROIDS = 2, VIS_TRASH = 3, VIS_SHIELDS = 4 };
+static const int  kAsteroidShots = 20;     // the real task needs 20 destroyed asteroids; one laser per shot
+static const long kAsteroidGapMs = 450;    // + random 0..349 ms between shots (a guess at a human rhythm)
+static const long kScanMs = 10000;         // the real scan takes about 10 s
+
+static std::atomic<int> g_reqVisual{0};
+static std::atomic<long> g_reqVisualAt{0};
+static std::mutex g_visMx;
+static char g_visMsg[500] = "Visual tasks: not used yet.";
+static void setVisMsg(const char *fmt, ...) {
+    char buf[500];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    {
+        std::lock_guard<std::mutex> lk(g_visMx);
+        strncpy(g_visMsg, buf, sizeof(g_visMsg) - 1);
+        g_visMsg[sizeof(g_visMsg) - 1] = 0;
+    }
+    LOGI("MENUTEST VISUAL: %s", buf);
+}
+static unsigned visRnd(unsigned n) {
+    static std::mt19937 g((unsigned)nowMs());
+    return n ? (unsigned)(g() % n) : 0;
+}
+
+static void *m_RpcPlayAnim = nullptr, *m_RpcUpdateSysByte = nullptr;
+static void *f_ShipWeapons = nullptr, *f_ShipShields = nullptr, *f_ShipHatch = nullptr, *f_ShipMedScanner = nullptr, *f_PlayerId = nullptr;
+static bool g_visResolved = false;
+
+static void resolveVisualFn(void *) {
+    if (g_visResolved) return;
+    g_visResolved = true;
+    m_RpcPlayAnim = findMethod(k_PlayerControl, "RpcPlayAnimation", 1);
+    if (m_RpcPlayAnim) {
+        void *pt = p_method_get_param(m_RpcPlayAnim, 0);
+        if (!pt || !isIntegerType(p_type_get_type(pt))) {
+            LOGI("MENUTEST VISUAL: RpcPlayAnimation parameter is not an integer type, disabled");
+            m_RpcPlayAnim = nullptr;
+        }
+    }
+    f_PlayerId = findField(k_PlayerControl, "PlayerId");
+    if (k_ShipStatus) {
+        f_ShipWeapons = findField(k_ShipStatus, "WeaponsImage");
+        f_ShipShields = findField(k_ShipStatus, "ShieldsImages");
+        f_ShipHatch = findField(k_ShipStatus, "Hatch");
+        f_ShipMedScanner = findField(k_ShipStatus, "MedScanner");
+        // ShipStatus has two RpcUpdateSystem overloads with 2 parameters: (SystemTypes, byte) and (SystemTypes, MessageWriter).
+        // Take the one whose 2nd parameter is an integer type (the byte one).
+        if (p_class_get_methods && p_method_get_name) {
+            void *iter = nullptr, *m;
+            int guardN = 0;
+            while ((m = p_class_get_methods(k_ShipStatus, &iter)) != nullptr && guardN++ < 600) {
+                const char *mn = p_method_get_name(m);
+                if (!mn || strcmp(mn, "RpcUpdateSystem") != 0) continue;
+                void *p0 = p_method_get_param(m, 0), *p1 = p_method_get_param(m, 1);
+                if (p0 && p1 && isIntegerType(p_type_get_type(p1))) { m_RpcUpdateSysByte = m; break; }
+            }
+        }
+    }
+    LOGI("MENUTEST VISUAL resolve: RpcPlayAnimation=%p RpcUpdateSystem(byte)=%p PlayerId=%p | ShipStatus fields: WeaponsImage=%p ShieldsImages=%p Hatch=%p MedScanner=%p",
+         m_RpcPlayAnim, m_RpcUpdateSysByte, f_PlayerId, f_ShipWeapons, f_ShipShields, f_ShipHatch, f_ShipMedScanner);
+}
+
+// a ShipStatus object field that is null on this map means "this map has no such visual" (heuristic, logged)
+static bool shipHas(void *ship, void *field) {
+    if (!field) return true;                     // field name unknown in this build: do not block
+    void *v = nullptr;
+    p_field_get_value(ship, field, &v);
+    return v != nullptr;
+}
+static bool sendAnim(void *local, unsigned anim) {
+    if (!m_RpcPlayAnim) return false;
+    uint64_t a = anim & 0xff;
+    void *args[1] = {&a};
+    bool ok = false;
+    invokeRaw(m_RpcPlayAnim, local, args, "RpcPlayAnimation", &ok);
+    return ok;
+}
+static bool sendScan(void *ship, unsigned pid, bool request) {
+    if (!m_RpcUpdateSysByte) return false;
+    uint64_t st = kSysMedBay;
+    uint64_t amt = (request ? 128u : 64u) | (pid & 31u);
+    void *args[2] = {&st, &amt};
+    bool ok = false;
+    invokeRaw(m_RpcUpdateSysByte, ship, args, "RpcUpdateSystem(MedBay)", &ok);
+    return ok;
+}
+
+struct VisSeq { bool active; int kind; int left; long nextAt; unsigned pid; };
+static VisSeq g_vs = {false, 0, 0, 0, 0};     // Unity thread only
+static int g_visWhich = 0;
+
+static void visualReqFn(void *) {
+    const int which = g_visWhich;
+    void *local = nullptr;
+    if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
+    if (!local) { setVisMsg("No local player yet. Join a lobby or match first."); return; }
+    void *ship = staticObj(f_ShipInst, m_ShipInst);
+    if (!ship) { setVisMsg("No map is loaded (ShipStatus missing). Start a match or Freeplay first; the lobby has no tasks."); return; }
+
+    // pressing the button of a running task stops it
+    if (g_vs.active && g_vs.kind == which) {
+        g_vs.active = false;
+        if (which == VIS_SCAN) { sendScan(ship, g_vs.pid, false); setVisMsg("Submit Scan stopped (release sent)."); }
+        else setVisMsg("Stopped.");
+        return;
+    }
+    if (g_vs.active) { setVisMsg("Another visual task is still running. Press its button again to stop it first."); return; }
+
+    long now = nowMs();
+    if (which == VIS_SCAN) {
+        if (!m_RpcUpdateSysByte) { setVisMsg("Submit Scan: ShipStatus.RpcUpdateSystem(byte) not found in this game build. Nothing sent."); return; }
+        if (!shipHas(ship, f_ShipMedScanner)) { setVisMsg("Submit Scan: this map has no scanner (MedScanner is empty). Nothing sent."); return; }
+        unsigned pid = 255;
+        if (f_PlayerId) { uint64_t b = 0; p_field_get_value(local, f_PlayerId, &b); pid = (unsigned)(b & 0xff); }
+        if (pid > 31) { setVisMsg("Submit Scan: your player id (%u) cannot be sent (scanner uses 0..31). Nothing sent.", pid); return; }
+        if (!sendScan(ship, pid, true)) { setVisMsg("Submit Scan: the request threw an exception. Nothing else sent."); return; }
+        g_vs.active = true; g_vs.kind = VIS_SCAN; g_vs.pid = pid; g_vs.left = 1; g_vs.nextAt = now + kScanMs;
+        setVisMsg("Submit Scan: request sent (player id %u). Stand on the MedBay scanner pad. It ends by itself after %ld s; press again to stop.", pid, kScanMs / 1000);
+        return;
+    }
+    if (!m_RpcPlayAnim) { setVisMsg("RpcPlayAnimation not found in this game build (or its parameter is not a byte). Nothing sent."); return; }
+    if (which == VIS_ASTEROIDS) {
+        if (!shipHas(ship, f_ShipWeapons)) { setVisMsg("Clear Asteroids: this map has no weapon turret (WeaponsImage is empty). Nothing sent."); return; }
+        if (!sendAnim(local, kAnimAsteroids)) { setVisMsg("Clear Asteroids: RpcPlayAnimation threw an exception. Nothing else sent."); return; }
+        g_vs.active = true; g_vs.kind = VIS_ASTEROIDS; g_vs.left = kAsteroidShots - 1;
+        g_vs.nextAt = now + kAsteroidGapMs + (long)visRnd(350);
+        setVisMsg("Clear Asteroids: shot 1/%d sent. Press again to stop.", kAsteroidShots);
+        return;
+    }
+    if (which == VIS_TRASH) {
+        if (!shipHas(ship, f_ShipHatch)) { setVisMsg("Empty Trash: this map has no garbage hatch (Hatch is empty). Nothing sent."); return; }
+        if (!sendAnim(local, kAnimGarbage)) { setVisMsg("Empty Trash: RpcPlayAnimation threw an exception."); return; }
+        setVisMsg("Empty Trash: animation sent (TaskTypes.EmptyGarbage=%u).", kAnimGarbage);
+        return;
+    }
+    if (which == VIS_SHIELDS) {
+        if (!shipHas(ship, f_ShipShields)) { setVisMsg("Prime Shields: this map has no shield lights (ShieldsImages is empty). Nothing sent."); return; }
+        if (!sendAnim(local, kAnimShields)) { setVisMsg("Prime Shields: RpcPlayAnimation threw an exception."); return; }
+        setVisMsg("Prime Shields: animation sent (TaskTypes.PrimeShields=%u).", kAnimShields);
+        return;
+    }
+    setVisMsg("Unknown visual task %d.", which);
+}
+
+static void visualStepFn(void *) {
+    if (!g_vs.active) return;
+    void *local = nullptr;
+    if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
+    void *ship = staticObj(f_ShipInst, m_ShipInst);
+    if (!local || !ship) { g_vs.active = false; setVisMsg("Visual task stopped: the match/map is gone."); return; }
+    long now = nowMs();
+    if (now < g_vs.nextAt) return;
+    if (g_vs.kind == VIS_ASTEROIDS) {
+        if (!sendAnim(local, kAnimAsteroids)) { g_vs.active = false; setVisMsg("Clear Asteroids: RpcPlayAnimation threw an exception. Stopped."); return; }
+        g_vs.left--;
+        if (g_vs.left <= 0) { g_vs.active = false; setVisMsg("Clear Asteroids: all %d shots sent.", kAsteroidShots); return; }
+        g_vs.nextAt = now + kAsteroidGapMs + (long)visRnd(350);
+        setVisMsg("Clear Asteroids: shot %d/%d sent.", kAsteroidShots - g_vs.left, kAsteroidShots);
+    } else if (g_vs.kind == VIS_SCAN) {
+        bool ok = sendScan(ship, g_vs.pid, false);
+        g_vs.active = false;
+        setVisMsg(ok ? "Submit Scan: finished (release sent)." : "Submit Scan: the release threw an exception.");
+    } else {
+        g_vs.active = false;
+    }
+}
+static void visualTick() {
+    if (!g_vs.active || nowMs() < g_vs.nextAt) return;
+    if (!guarded(visualStepFn, nullptr)) {
+        g_vs.active = false;
+        setVisMsg("Crash guard caught a fault in the visual task; stopped (see logcat MENUTEST).");
+        LOGI("MENUTEST visualStepFn FAULT");
+    }
+}
+static void runVisual() {
+    int w = g_reqVisual.exchange(0);
+    if (w <= 0) return;
+    if (nowMs() - g_reqVisualAt.load() > kReqTtlMs) { setVisMsg("Press expired: no player object was active within %ld s. Join a match and press again.", kReqTtlMs / 1000); return; }
+    if (!guarded(resolveExtraFn, nullptr) || !guarded(resolveHostFn, nullptr) || !guarded(resolveVisualFn, nullptr)) {
+        setVisMsg("Fault while resolving the visual task functions (see logcat MENUTEST).");
+        return;
+    }
+    g_visWhich = w;
+    if (!guarded(visualReqFn, nullptr)) {
+        g_vs.active = false;
+        setVisMsg("Crash guard caught a fault while starting the visual task (see logcat MENUTEST).");
+        LOGI("MENUTEST visualReqFn FAULT");
     }
 }
 
@@ -1214,9 +1224,10 @@ static void hk_fixed(void *self, const void *method) {
     if (g_req.load(std::memory_order_relaxed) && g_req.exchange(false)) runRequest();
     if (g_reqPlayers.load(std::memory_order_relaxed) && g_reqPlayers.exchange(false)) runPlayers();
     if (g_reqHostInfo.load(std::memory_order_relaxed) && g_reqHostInfo.exchange(false)) runHostInfo();
-    if (g_reqSwapNow.load(std::memory_order_relaxed) && g_reqSwapNow.exchange(false)) runSwapNow();
-    autoTick();
-    verifyTick();
+    if (g_reqVisual.load(std::memory_order_relaxed) != 0) runVisual();
+    visualTick();
+    nameTick(1500);
+    logTick();
 }
 
 // v11: observer hook on PlayerControl::CoSetRole(role, canOverride). It only LOGS (no il2cpp calls, no guarded()), so it cannot
@@ -1244,24 +1255,24 @@ static void hk_rpcsetrole(void *self, uint64_t role, uint64_t canOverride, const
     void *local = nullptr;
     if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
     unsigned rv = (unsigned)(role & 0xffff);
-    const bool ours = g_ourRpc.load() != 0;
     const bool inSel = g_inSelect.load() != 0;
     if (seq < 400) {
         const char *nm = roleName(rv);
-        LOGI("MENUTEST RPCSETROLE #%d t=%ld self=%p isLocal=%d role=%u (%s) canOverride=%d by=%s%s", seq, nowMs() % 1000000, self,
-             self == local ? 1 : 0, rv, nm ? nm : "?", (int)(canOverride & 0xff), ours ? "OUR-SWAP" : "GAME", inSel ? " [in SelectRoles]" : "");
+        // v16: player=Name(Colour) comes from the table filled before SelectRoles (no il2cpp call in here)
+        LOGI("MENUTEST RPCSETROLE #%d t=%ld self=%p player=%s isLocal=%d role=%u (%s) canOverride=%d by=GAME%s", seq, nowMs() % 1000000, self,
+             pname(self), self == local ? 1 : 0, rv, nm ? nm : "?", (int)(canOverride & 0xff), inSel ? " [in SelectRoles]" : "");
     }
     g_lastMethod = method;
     // ---- v15: swap while the game assigns roles (host only: SelectRoles runs only on the host)
-    if (!ours && inSel && local && orig_rpcsetrole && g_alwaysImp.load()) {
+    if (inSel && local && orig_rpcsetrole && g_alwaysImp.load()) {
         if (self == local) {
             if (isImpRoleVal(rv)) {
                 g_localImpDone = true;                       // the game itself made me an impostor: nothing to swap
             } else if (g_displaced) {
-                LOGI("MENUTEST V15 REDIRECT: my crew role %u goes to the displaced impostor %p", rv, g_displaced);
+                LOGI("MENUTEST V15 REDIRECT: my crew role %u goes to the displaced impostor %p (%s)", rv, g_displaced, pname(g_displaced));
                 orig_rpcsetrole(g_displaced, role, canOverride, method);
                 g_crewGiven = true;
-                setSwapMsg("Always Imposter: the impostor %p got your crew role (%u), you took his impostor role.", g_displaced, rv);
+                setSwapMsg("Always Imposter: the impostor %s got your crew role (%u), you took his impostor role.", pname(g_displaced), rv);
                 return;
             } else {
                 g_haveLocalCrew = true; g_localCrewRole = rv; // crew role arrived before any impostor role (unexpected order); remembered
@@ -1269,7 +1280,7 @@ static void hk_rpcsetrole(void *self, uint64_t role, uint64_t canOverride, const
         } else if (isImpRoleVal(rv) && !g_localImpDone && !g_displaced) {
             int wi = g_wantIdx.load();
             unsigned give = (wi > 0 && wi < kWantCount) ? kWantVals[wi] : rv;
-            LOGI("MENUTEST V15 REDIRECT: impostor role %u of %p goes to ME as %u", rv, self, give);
+            LOGI("MENUTEST V15 REDIRECT: impostor role %u of %p (%s) goes to ME as %u", rv, self, pname(self), give);
             g_displaced = self;
             g_localImpDone = true;
             if (g_haveLocalCrew) {                           // I already got a crew role: override it, and hand that role to the displaced one
@@ -1285,13 +1296,14 @@ static void hk_rpcsetrole(void *self, uint64_t role, uint64_t canOverride, const
     if (orig_rpcsetrole) orig_rpcsetrole(self, role, canOverride, method);
 }
 static void hk_selectroles(void *self, const void *method) {
-    LOGI("MENUTEST SELECTROLES ENTER t=%ld alwaysImp=%d", nowMs() % 1000000, g_alwaysImp.load() ? 1 : 0);
+    nameTick(800);   // v16: make sure the pointer->name table is fresh BEFORE the roles are assigned (names are read here, not in the hooks)
+    LOGI("MENUTEST SELECTROLES ENTER t=%ld alwaysImp=%d names=%d", nowMs() % 1000000, g_alwaysImp.load() ? 1 : 0, g_nameCount);
     g_displaced = nullptr; g_localImpDone = false; g_haveLocalCrew = false; g_crewGiven = false; g_localCrewRole = 0;
     g_inSelect.store(1);
     if (orig_selectroles) orig_selectroles(self, method);
     g_inSelect.store(0);
     if (g_displaced && !g_crewGiven && orig_rpcsetrole) {   // safety net: the displaced impostor must never stay without a role
-        LOGI("MENUTEST V15 SAFETY: displaced %p got no crew role, giving Crewmate", g_displaced);
+        LOGI("MENUTEST V15 SAFETY: displaced %p (%s) got no crew role, giving Crewmate", g_displaced, pname(g_displaced));
         orig_rpcsetrole(g_displaced, 0, 1, g_lastMethod);
     }
     LOGI("MENUTEST SELECTROLES EXIT t=%ld swapped=%d", nowMs() % 1000000, g_displaced ? 1 : 0);
@@ -1496,16 +1508,17 @@ static void *watcher(void *) {
         if (g_req.exchange(false)) runRequest();
         if (g_reqPlayers.exchange(false)) runPlayers();
         if (g_reqHostInfo.exchange(false)) runHostInfo();
-        if (g_reqSwapNow.exchange(false)) runSwapNow();
-        autoTick();
-        verifyTick();
+        if (g_reqVisual.load() != 0) runVisual();
+        visualTick();
+        nameTick(1500);
+        logTick();
     }
     return nullptr;
 }
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v15 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v16 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
@@ -1571,8 +1584,7 @@ Java_top_niunaijun_blackboxa_menu_NativeMenu_playersText(JNIEnv *env, jobject th
 // v11: host tools. Options are plain atomics; the work happens on the Unity thread.
 extern "C" JNIEXPORT void JNICALL
 Java_top_niunaijun_blackboxa_menu_NativeMenu_setHostOptions(JNIEnv *env, jobject thiz, jint on, jint roleIdx) {
-    int prev = g_alwaysImp.exchange(on ? 1 : 0);
-    if (!prev && on) g_resetSeen.store(true);
+    g_alwaysImp.store(on ? 1 : 0);
     g_wantIdx.store((roleIdx >= 0 && roleIdx < kWantCount) ? roleIdx : 0);
     LOGI("MENUTEST host options: alwaysImpostor=%d wantedRole=%s", on ? 1 : 0, kWantNames[(roleIdx >= 0 && roleIdx < kWantCount) ? roleIdx : 0]);
 }
@@ -1584,11 +1596,26 @@ Java_top_niunaijun_blackboxa_menu_NativeMenu_requestHostInfo(JNIEnv *env, jobjec
     return 1;
 }
 
+// v16: visual tasks. which: 1 = Submit Scan, 2 = Clear Asteroids, 3 = Empty Trash, 4 = Prime Shields. The work runs on the Unity thread.
 extern "C" JNIEXPORT jint JNICALL
-Java_top_niunaijun_blackboxa_menu_NativeMenu_requestSwapNow(JNIEnv *env, jobject thiz) {
+Java_top_niunaijun_blackboxa_menu_NativeMenu_requestVisual(JNIEnv *env, jobject thiz, jint which) {
     if (g_state.load() != ST_READY) return 0;
-    g_reqSwapNow.store(true);
+    if (which < VIS_SCAN || which > VIS_SHIELDS) return 0;
+    g_reqVisualAt.store(nowMs());
+    g_reqVisual.store((int)which);
     return 1;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_top_niunaijun_blackboxa_menu_NativeMenu_visualText(JNIEnv *env, jobject thiz) {
+    if (g_state.load() != ST_READY) return env->NewStringUTF("Menu not ready yet (wait for 'Menu ready').");
+    char buf[520];
+    {
+        std::lock_guard<std::mutex> lk(g_visMx);
+        strncpy(buf, g_visMsg, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = 0;
+    }
+    return env->NewStringUTF(buf);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
