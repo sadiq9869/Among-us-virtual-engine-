@@ -1,4 +1,6 @@
-// MENUTEST v17 = v16 + new Submit Scan (RpcSetScanner hologram, pulled to the pad with RpcSnapTo, auto stop after kScanMs, millisecond log)
+// MENUTEST v17 = v16 + new Submit Scan (RpcSetScanner hologram, auto stop after kScanMs, millisecond log)
+//   v17b: the player WALKS to the pad (RpcSnapTo steps, like WalkToPad), then to Position+Offset (like WalkToOffset); the scan starts when he is there.
+//         nameTick is NOT run automatically any more (kNameTickAuto=false; names are still refreshed before SelectRoles); SLOW-hook timing log.
 // MENUTEST v16 = v15 (Always Imposter swapped DURING SelectRoles via RpcSetRole hook) +
 //   * "Swap now" removed completely (button, JNI function, old after-match swap code)
 //   * player text is "Name(Colour)" with exactly ONE bracket pair (the game's colour text is stripped of its own brackets first)
@@ -74,6 +76,11 @@ static void setStatus(const char *fmt, ...) {
     __android_log_print(ANDROID_LOG_INFO, TAG, "STATUS: %s", buf);
 }
 
+static long nowUs() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
+}
 static long nowMs() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1012,7 +1019,9 @@ static void nameTick(long maxAgeMs) {
         if (!f_AllPlayers) return;
     }
     if (!f_roleAssigned && !guarded(resolveHostFn, nullptr)) return;
+    long tu = nowUs();
     if (!guarded(refreshNamesFn, nullptr)) LOGI("MENUTEST refreshNamesFn FAULT");
+    LOGI("MENUTEST NAMETICK took %ld us (players %d)", nowUs() - tu, g_nameCount);
 }
 
 // ---------------------------------------------------------------- v16: visual tasks (Submit Scan, Clear Asteroids, Empty Trash, Prime Shields)
@@ -1029,7 +1038,11 @@ static const int  kAsteroidShots = 20;     // the real task needs 20 destroyed a
 static const long kAsteroidGapMs = 450;    // + random 0..349 ms between shots (a guess at a human rhythm)
 static const long kScanMs = 10000;         // the real scan takes about 10 s (wiki: "about ten seconds"; the exact ScanDuration is an inspector value, NOT in dump.cs)
 static const long  kScanWatchMs = 100;     // v17: how often the running scan is checked (position, death, time)
-static const long  kScanGraceMs = 700;     // v17: no "left the pad" check right after the snap
+static const long  kScanGraceMs = 400;     // v17: no "left the pad" check right after the arrival
+static const float kWalkSpeed = 2.5f;      // v17b: walking speed in map units per second [GUESS: Among Us base speed 2.5]
+static const long  kWalkStepMs = 30;       // v17b: one RpcSnapTo step every 30 ms while walking
+static const long  kWalkMaxMs = 2500;      // v17b: a long walk is sped up so it never takes longer than this
+static const bool  kNameTickAuto = false;  // v17b: false = the pointer->name table is NOT refreshed every 1.5 s (lag suspect); it is still refreshed right before SelectRoles
 static const float kScanStopDist = 0.75f;  // v17: farther than this from the scan spot = scan is stopped
 static const float kScanExtraX = 0.0f, kScanExtraY = 0.0f;   // v17 calibration added to MedScanner.Position (0 = use Position as it is)
 
@@ -1137,8 +1150,15 @@ static bool sendScan(void *ship, unsigned pid, bool request) {
     return ok;
 }
 
-struct VisSeq { bool active; int kind; int left; long nextAt; unsigned pid; long startAt, endAt; float refX, refY; };
-static VisSeq g_vs = {false, 0, 0, 0, 0, 0, 0, 0.f, 0.f};     // Unity thread only
+struct VisSeq {
+    bool active = false; int kind = 0; int left = 0; long nextAt = 0; unsigned pid = 0;
+    long startAt = 0, endAt = 0; float refX = 0, refY = 0;
+    // v17b Submit Scan: phase 0 = walking (seg 0: to MedScanner.Position, seg 1: to Position+Offset), phase 1 = hologram running
+    int phase = 0, seg = 0; long t0 = 0, segStart = 0, segMs = 0;
+    float sx = 0, sy = 0, tx = 0, ty = 0, finX = 0, finY = 0;
+    bool reqSent = false, scanOn = false;
+};
+static VisSeq g_vs;     // Unity thread only
 
 // ---- v17: Submit Scan helpers (Unity thread, inside guarded())
 static bool readVec(void *boxed, float *out, int n) {
@@ -1155,7 +1175,7 @@ static bool getPos2(void *local, float *xy) {
     return ok && readVec(r, xy, 2);
 }
 // the spot where the scanning player stands: MedScanner.Position (+ calibration constants). Logs Position and Offset.
-static bool scanSpot(void *ship, float *xy) {
+static bool scanSpot(void *ship, float *pad, float *fin) {
     if (!f_ShipMedScanner || !m_ScanPos) return false;
     void *sc = nullptr;
     p_field_get_value(ship, f_ShipMedScanner, &sc);
@@ -1167,8 +1187,8 @@ static bool scanSpot(void *ship, float *xy) {
     float off[3] = {0, 0, 0};
     if (f_ScanOffset) p_field_get_value(sc, f_ScanOffset, off);
     LOGI("MENUTEST SCAN spot: MedScanner.Position=(%.3f, %.3f, %.3f) Offset=(%.3f, %.3f, %.3f) extra=(%.2f, %.2f)", v[0], v[1], v[2], off[0], off[1], off[2], kScanExtraX, kScanExtraY);
-    xy[0] = v[0] + kScanExtraX;
-    xy[1] = v[1] + kScanExtraY;
+    pad[0] = v[0]; pad[1] = v[1];                                   // MedScanMinigame.WalkToPad goes here first
+    fin[0] = v[0] + off[0] + kScanExtraX; fin[1] = v[1] + off[1] + kScanExtraY;   // then WalkToOffset: Position + Offset [GUESS from the state names]
     return true;
 }
 static bool sendScanner(void *local, bool on) {
@@ -1199,14 +1219,23 @@ static bool localDead(void *local) {
 // ends a running Submit Scan: scanner OFF first, then the MedBay release. why = short reason for the log. Always logs the exact run time.
 static void endScan(const char *why, void *local, void *ship) {
     long now = nowMs();
-    long dur = now - g_vs.startAt;
+    long total = now - g_vs.t0;
+    long scan = g_vs.scanOn ? now - g_vs.startAt : 0;
     bool offOk = false, relOk = false;
-    if (local) offOk = sendScanner(local, false);
-    if (ship) relOk = sendScan(ship, g_vs.pid, false);
+    if (g_vs.scanOn && local) offOk = sendScanner(local, false);
+    if (g_vs.reqSent && ship) relOk = sendScan(ship, g_vs.pid, false);
     g_vs.active = false;
-    LOGI("MENUTEST SCAN t+%ldms: STOP (%s) scannerOff=%d release=%d", dur, why, offOk ? 1 : 0, relOk ? 1 : 0);
-    setVisMsg("Submit Scan stopped: %s. It ran %ld.%03ld s (planned %ld.%03ld s). Scanner off=%d, release=%d.", why, dur / 1000, dur % 1000, kScanMs / 1000, kScanMs % 1000, offOk ? 1 : 0, relOk ? 1 : 0);
+    LOGI("MENUTEST SCAN t+%ldms: STOP (%s) phase=%d scannerOff=%d release=%d scanRan=%ldms", total, why, g_vs.phase, offOk ? 1 : 0, relOk ? 1 : 0, scan);
+    setVisMsg("Submit Scan stopped: %s. Scan ran %ld.%03ld s (planned %ld.%03ld s), whole action %ld.%03ld s.", why, scan / 1000, scan % 1000, kScanMs / 1000, kScanMs % 1000, total / 1000, total % 1000);
 }
+
+static long walkMs(float x0, float y0, float x1, float y1) {
+    float d = sqrtf((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
+    if (d < 0.02f) return 0;
+    long ms = (long)(d / kWalkSpeed * 1000.f);
+    return ms > kWalkMaxMs ? kWalkMaxMs : ms;
+}
+
 static int g_visWhich = 0;
 
 static void visualReqFn(void *) {
@@ -1240,26 +1269,18 @@ static void visualReqFn(void *) {
         unsigned pid = 255;
         if (f_PlayerId) { uint64_t b = 0; p_field_get_value(local, f_PlayerId, &b); pid = (unsigned)(b & 0xff); }
         if (pid > 31) { setVisMsg("Submit Scan: your player id (%u) cannot be sent (scanner uses 0..31). Nothing sent.", pid); return; }
-        float spot[2] = {0, 0}, cur[2] = {0, 0};
-        if (!scanSpot(ship, spot)) { setVisMsg("Submit Scan: could not read the scanner position. Nothing sent."); return; }
-        bool haveCur = getPos2(local, cur);
-        float dist = haveCur ? sqrtf((cur[0] - spot[0]) * (cur[0] - spot[0]) + (cur[1] - spot[1]) * (cur[1] - spot[1])) : -1.f;
-        LOGI("MENUTEST SCAN t+0ms: START you=(%.3f, %.3f) spot=(%.3f, %.3f) distance=%.2f pid=%u", cur[0], cur[1], spot[0], spot[1], dist, pid);
-        if (!snapTo(local, spot[0], spot[1])) { setVisMsg("Submit Scan: RpcSnapTo threw an exception. Nothing else sent."); return; }
-        LOGI("MENUTEST SCAN t+%ldms: pulled to the pad (RpcSnapTo)", nowMs() - t0);
-        if (!sendScan(ship, pid, true)) { setVisMsg("Submit Scan: the MedBay request threw an exception. Nothing else sent."); return; }
-        LOGI("MENUTEST SCAN t+%ldms: MedBay request sent", nowMs() - t0);
-        if (!sendScanner(local, true)) {
-            sendScan(ship, pid, false);
-            setVisMsg("Submit Scan: RpcSetScanner(true) threw an exception. Request was released again.");
-            return;
-        }
-        const long t1 = nowMs();
-        LOGI("MENUTEST SCAN t+%ldms: hologram ON (RpcSetScanner true); auto stop at t+%ldms", t1 - t0, t1 - t0 + kScanMs);
-        g_vs.active = true; g_vs.kind = VIS_SCAN; g_vs.pid = pid;
-        g_vs.startAt = t1; g_vs.endAt = t1 + kScanMs; g_vs.refX = spot[0]; g_vs.refY = spot[1];
-        g_vs.nextAt = t1 + kScanWatchMs;
-        setVisMsg("Submit Scan: you were %.1f away, pulled to the pad. Hologram ON; it stops by itself after %ld.%03ld s (or if you move away, die or press again).", dist < 0 ? 0.f : dist, kScanMs / 1000, kScanMs % 1000);
+        float pad[2] = {0, 0}, fin[2] = {0, 0}, cur[2] = {0, 0};
+        if (!scanSpot(ship, pad, fin)) { setVisMsg("Submit Scan: could not read the scanner position. Nothing sent."); return; }
+        if (!getPos2(local, cur)) { setVisMsg("Submit Scan: could not read your position. Nothing sent."); return; }
+        long m0 = walkMs(cur[0], cur[1], pad[0], pad[1]);
+        LOGI("MENUTEST SCAN t+0ms: START you=(%.3f, %.3f) pad=(%.3f, %.3f) final=(%.3f, %.3f) pid=%u walk to pad %ld ms", cur[0], cur[1], pad[0], pad[1], fin[0], fin[1], pid, m0);
+        g_vs = VisSeq();
+        g_vs.active = true; g_vs.kind = VIS_SCAN; g_vs.pid = pid; g_vs.phase = 0; g_vs.seg = 0;
+        g_vs.t0 = t0; g_vs.segStart = t0; g_vs.segMs = m0;
+        g_vs.sx = cur[0]; g_vs.sy = cur[1]; g_vs.tx = pad[0]; g_vs.ty = pad[1];
+        g_vs.finX = fin[0]; g_vs.finY = fin[1];
+        g_vs.nextAt = t0;   // first step on the next tick
+        setVisMsg("Submit Scan: walking to the pad (%ld ms), then to the scan spot. Hologram starts when you are there; it stops by itself after %ld.%03ld s.", m0, kScanMs / 1000, kScanMs % 1000);
         return;
     }
     if (!m_RpcPlayAnim) { setVisMsg("RpcPlayAnimation not found in this game build (or its parameter is not a byte). Nothing sent."); return; }
@@ -1301,8 +1322,35 @@ static void visualStepFn(void *) {
         g_vs.nextAt = now + kAsteroidGapMs + (long)visRnd(350);
         setVisMsg("Clear Asteroids: shot %d/%d sent.", kAsteroidShots - g_vs.left, kAsteroidShots);
     } else if (g_vs.kind == VIS_SCAN) {
-        if (now >= g_vs.endAt) { endScan("time is up", local, ship); return; }
         if (localDead(local)) { endScan("you died", local, ship); return; }
+        if (g_vs.phase == 0) {   // ---- walking (RpcSnapTo steps)
+            long el = now - g_vs.segStart;
+            float f = g_vs.segMs > 0 ? (float)el / (float)g_vs.segMs : 1.f;
+            bool arrived = f >= 1.f;
+            if (arrived) f = 1.f;
+            if (!snapTo(local, g_vs.sx + (g_vs.tx - g_vs.sx) * f, g_vs.sy + (g_vs.ty - g_vs.sy) * f)) { endScan("walking failed (RpcSnapTo threw)", local, ship); return; }
+            if (!arrived) { g_vs.nextAt = now + kWalkStepMs; return; }
+            if (g_vs.seg == 0) {   // reached MedScanner.Position -> short walk to Position+Offset
+                long m1 = walkMs(g_vs.tx, g_vs.ty, g_vs.finX, g_vs.finY);
+                LOGI("MENUTEST SCAN t+%ldms: reached the pad, walking to the scan spot (%ld ms)", now - g_vs.t0, m1);
+                g_vs.seg = 1; g_vs.sx = g_vs.tx; g_vs.sy = g_vs.ty; g_vs.tx = g_vs.finX; g_vs.ty = g_vs.finY;
+                g_vs.segStart = now; g_vs.segMs = m1; g_vs.nextAt = now + kWalkStepMs;
+                return;
+            }
+            LOGI("MENUTEST SCAN t+%ldms: reached the scan spot (%.3f, %.3f)", now - g_vs.t0, g_vs.finX, g_vs.finY);
+            if (!sendScan(ship, g_vs.pid, true)) { endScan("MedBay request threw", local, ship); return; }
+            g_vs.reqSent = true;
+            LOGI("MENUTEST SCAN t+%ldms: MedBay request sent", nowMs() - g_vs.t0);
+            if (!sendScanner(local, true)) { endScan("RpcSetScanner(true) threw", local, ship); return; }
+            g_vs.scanOn = true; g_vs.phase = 1;
+            g_vs.startAt = nowMs(); g_vs.endAt = g_vs.startAt + kScanMs; g_vs.refX = g_vs.finX; g_vs.refY = g_vs.finY;
+            g_vs.nextAt = g_vs.startAt + kScanWatchMs;
+            LOGI("MENUTEST SCAN t+%ldms: hologram ON (RpcSetScanner true); auto stop at t+%ldms", g_vs.startAt - g_vs.t0, g_vs.endAt - g_vs.t0);
+            setVisMsg("Submit Scan: hologram ON. It stops by itself after %ld.%03ld s (or if you move away, die or press again).", kScanMs / 1000, kScanMs % 1000);
+            return;
+        }
+        // ---- phase 1: hologram running
+        if (now >= g_vs.endAt) { endScan("time is up", local, ship); return; }
         if (now - g_vs.startAt >= kScanGraceMs) {
             float c[2];
             if (getPos2(local, c)) {
@@ -1345,15 +1393,19 @@ static void runVisual() {
 typedef void (*fn_fixedupdate_t)(void *self, const void *method);
 static fn_fixedupdate_t orig_fixed = nullptr;
 
+static std::atomic<int> g_slowLogged{0};
 static void hk_fixed(void *self, const void *method) {
     if (orig_fixed) orig_fixed(self, method);
+    const long tu0 = nowUs();
     if (g_req.load(std::memory_order_relaxed) && g_req.exchange(false)) runRequest();
     if (g_reqPlayers.load(std::memory_order_relaxed) && g_reqPlayers.exchange(false)) runPlayers();
     if (g_reqHostInfo.load(std::memory_order_relaxed) && g_reqHostInfo.exchange(false)) runHostInfo();
     if (g_reqVisual.load(std::memory_order_relaxed) != 0) runVisual();
     visualTick();
-    nameTick(1500);
+    if (kNameTickAuto) nameTick(1500);
     logTick();
+    const long dtu = nowUs() - tu0;   // v17b: how long the menu's own work took inside this FixedUpdate call (lag diagnosis)
+    if (dtu > 4000 && g_slowLogged.fetch_add(1) < 60) LOGI("MENUTEST SLOW menu work in FixedUpdate hook: %ld us", dtu);
 }
 
 // v11: observer hook on PlayerControl::CoSetRole(role, canOverride). It only LOGS (no il2cpp calls, no guarded()), so it cannot
@@ -1636,7 +1688,7 @@ static void *watcher(void *) {
         if (g_reqHostInfo.exchange(false)) runHostInfo();
         if (g_reqVisual.load() != 0) runVisual();
         visualTick();
-        nameTick(1500);
+        if (kNameTickAuto) nameTick(1500);
         logTick();
     }
     return nullptr;
