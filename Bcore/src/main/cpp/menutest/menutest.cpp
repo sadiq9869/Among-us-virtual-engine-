@@ -1,3 +1,4 @@
+// MENUTEST v20 = v19 + LAG PROBE (PROBE-HOOK / PROBE-CPU lines every 5 s: lobby/match, per-thread CPU, FixedUpdate gaps, menu cost) + nameTick no longer runs every 1.5 s. Java side: NativeCore PROBE-JAVA line.
 // MENUTEST v19 = v17 + REALSCAN logger REMOVED + Submit Scan like the REAL task (numbers from the user's REALSCAN log, build 2026.11.3):
 //   request first, WALK (game physics: PlayerPhysics.SetNormalizedVelocity, leg animation, ~2.5 units/s, slows near the pad) to
 //   MedScannerBehaviour.Position (the real task stood 0.021 from Position, NOT at Position+Offset), then hologram ON 10 s, OFF, release.
@@ -38,6 +39,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/syscall.h>
 #include <atomic>
 #include <mutex>
@@ -1431,15 +1433,148 @@ static void runVisual() {
 typedef void (*fn_fixedupdate_t)(void *self, const void *method);
 static fn_fixedupdate_t orig_fixed = nullptr;
 
+// ---------------------------------------------------------------- v20 LAG PROBE (measures only; set kProbeOn=false to disable)
+// hk_fixed runs on the Unity main thread only. It records: gap between two hook calls (a long gap = the main thread was busy
+// elsewhere), time inside the game's own FixedUpdate (orig), time of the menu's own part. A separate thread prints one
+// "PROBE-HOOK" and one "PROBE-CPU" line every 5 s (tag MENUTEST, so the in-game Console shows them).
+static const bool kProbeOn = true;
+static std::atomic<long> g_pCalls{0}, g_pGapMaxUs{0}, g_pGap100{0}, g_pOrigUs{0}, g_pOrigMaxUs{0}, g_pMenuUs{0}, g_pMenuMaxUs{0};
+static std::atomic<int> g_phase{-1};          // -1 unknown, 0 lobby/menu, 1 match (ShipStatus exists)
+static long g_lastCallUs = 0;                 // Unity thread only
+static long g_phaseAtMs = 0;                  // Unity thread only
+static inline long nowUs() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L; }
+static inline void atomicMax(std::atomic<long> &a, long v) {
+    long c = a.load(std::memory_order_relaxed);
+    while (v > c && !a.compare_exchange_weak(c, v, std::memory_order_relaxed)) {}
+}
+static void phaseFn(void *) { g_phase.store(inMatchState()); }
+static void probePhaseTick() {   // every 5 s, Unity thread: resolve once (one-time burst), then read lobby/match
+    long now = nowMs();
+    if (now - g_phaseAtMs < 5000) return;
+    g_phaseAtMs = now;
+    if (!f_AllPlayers && !guarded(resolveExtraFn, nullptr)) return;
+    if (!g_hostDone && !guarded(resolveHostFn, nullptr)) return;
+    guarded(phaseFn, nullptr);
+}
+
 static void hk_fixed(void *self, const void *method) {
+    const long t0 = kProbeOn ? nowUs() : 0;
+    if (kProbeOn && g_lastCallUs) {
+        long gap = t0 - g_lastCallUs;
+        atomicMax(g_pGapMaxUs, gap);
+        if (gap > 100000) g_pGap100.fetch_add(1, std::memory_order_relaxed);
+    }
     if (orig_fixed) orig_fixed(self, method);
+    const long t1 = kProbeOn ? nowUs() : 0;
     if (g_req.load(std::memory_order_relaxed) && g_req.exchange(false)) runRequest();
     if (g_reqPlayers.load(std::memory_order_relaxed) && g_reqPlayers.exchange(false)) runPlayers();
     if (g_reqHostInfo.load(std::memory_order_relaxed) && g_reqHostInfo.exchange(false)) runHostInfo();
     if (g_reqVisual.load(std::memory_order_relaxed) != 0) runVisual();
     visualTick();
-    nameTick(1500);
+    // v20: nameTick(1500) is NOT called every 1.5 s any more (names are still refreshed right before SelectRoles in hk_selectroles)
     logTick();
+    if (kProbeOn) {
+        probePhaseTick();
+        const long t2 = nowUs();
+        g_lastCallUs = t2;
+        g_pCalls.fetch_add(1, std::memory_order_relaxed);
+        g_pOrigUs.fetch_add(t1 - t0, std::memory_order_relaxed);
+        atomicMax(g_pOrigMaxUs, t1 - t0);
+        g_pMenuUs.fetch_add(t2 - t1, std::memory_order_relaxed);
+        atomicMax(g_pMenuMaxUs, t2 - t1);
+    }
+}
+
+struct ProbeThr { int tid; unsigned long ticks; char name[20]; double pct; };
+static ProbeThr g_prevThr[512];
+static int g_prevThrN = 0;
+static ProbeThr g_curThr[512];
+
+static void *probeThreadMain(void *) {
+    pthread_setname_np(pthread_self(), "menuprobe");
+    const long hz = sysconf(_SC_CLK_TCK) > 0 ? sysconf(_SC_CLK_TCK) : 100;
+    long lastMs = nowMs();
+    for (;;) {
+        usleep(5000 * 1000);
+        long now = nowMs();
+        long dt = now - lastMs;
+        if (dt <= 0) dt = 1;
+        lastMs = now;
+        // ---- per-thread CPU from /proc/self/task/<tid>/stat (utime + stime, in clock ticks)
+        int n = 0;
+        DIR *d = opendir("/proc/self/task");
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != nullptr && n < 512) {
+                int tid = atoi(e->d_name);
+                if (tid <= 0) continue;
+                char path[64];
+                snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+                FILE *f = fopen(path, "r");
+                if (!f) continue;
+                char buf[600];
+                size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+                fclose(f);
+                buf[got] = 0;
+                char *lp = strchr(buf, '(');
+                char *rp = strrchr(buf, ')');
+                if (!lp || !rp || rp < lp) continue;
+                ProbeThr &t = g_curThr[n];
+                t.tid = tid;
+                size_t nl = (size_t)(rp - lp - 1);
+                if (nl > sizeof(t.name) - 1) nl = sizeof(t.name) - 1;
+                memcpy(t.name, lp + 1, nl);
+                t.name[nl] = 0;
+                unsigned long ut = 0, st = 0;
+                if (sscanf(rp + 2, "%*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %lu %lu", &ut, &st) != 2) continue;
+                t.ticks = ut + st;
+                t.pct = 0;
+                for (int i = 0; i < g_prevThrN; i++) {
+                    if (g_prevThr[i].tid == tid) {
+                        unsigned long dtk = t.ticks >= g_prevThr[i].ticks ? t.ticks - g_prevThr[i].ticks : 0;
+                        t.pct = (double)dtk * (1000.0 / (double)hz) / (double)dt * 100.0;
+                        break;
+                    }
+                }
+                n++;
+            }
+            closedir(d);
+        }
+        double total = 0;
+        for (int i = 0; i < n; i++) total += g_curThr[i].pct;
+        char top[400];
+        top[0] = 0;
+        for (int k = 0; k < 6; k++) {   // top 6 by pct (selection)
+            int best = -1;
+            for (int i = 0; i < n; i++) if (g_curThr[i].pct >= 0 && (best < 0 || g_curThr[i].pct > g_curThr[best].pct)) best = i;
+            if (best < 0 || g_curThr[best].pct < 0.5) break;
+            size_t len = strlen(top);
+            snprintf(top + len, sizeof(top) - len, "%s%s %.0f%%", len ? " | " : "", g_curThr[best].name, g_curThr[best].pct);
+            g_curThr[best].pct = -1;
+        }
+        // ---- memory / thread count
+        long rssKb = -1, thr = -1;
+        FILE *fs = fopen("/proc/self/status", "r");
+        if (fs) {
+            char line[200];
+            while (fgets(line, sizeof(line), fs)) {
+                if (!strncmp(line, "VmRSS:", 6)) rssKb = atol(line + 6);
+                else if (!strncmp(line, "Threads:", 8)) thr = atol(line + 8);
+            }
+            fclose(fs);
+        }
+        for (int i = 0; i < n; i++) { g_prevThr[i] = g_curThr[i]; }
+        g_prevThrN = n;
+        // ---- hook numbers (read + reset)
+        long calls = g_pCalls.exchange(0), gapMax = g_pGapMaxUs.exchange(0), gap100 = g_pGap100.exchange(0);
+        long origUs = g_pOrigUs.exchange(0), origMax = g_pOrigMaxUs.exchange(0), menuUs = g_pMenuUs.exchange(0), menuMax = g_pMenuMaxUs.exchange(0);
+        int ph = g_phase.load();
+        const char *phs = ph == 1 ? "MATCH" : (ph == 0 ? "LOBBY" : "?");
+        LOGQ("MENUTEST PROBE-HOOK phase=%s dt=%ldms | FixedUpdate calls=%ld gapMax=%ldms gap>100ms=%ld | game(orig) avg=%ldus max=%ldus | MENU part avg=%ldus max=%ldus total=%ldms",
+             phs, dt, calls, gapMax / 1000, gap100, calls ? origUs / calls : 0, origMax, calls ? menuUs / calls : 0, menuMax, menuUs / 1000);
+        LOGQ("MENUTEST PROBE-CPU phase=%s process=%.0f%% (100%% = one core) threads=%ld rss=%ldMB | top: %s", phs, total, thr, rssKb > 0 ? rssKb / 1024 : -1, top);
+    }
+    return nullptr;
 }
 
 // v11: observer hook on PlayerControl::CoSetRole(role, canOverride). It only LOGS (no il2cpp calls, no guarded()), so it cannot
@@ -1704,6 +1839,11 @@ static void *watcher(void *) {
         LOGI("MENUTEST SelectRoles log hook skipped (method not found)");
     }
 
+    if (kProbeOn) {   // v20: lag probe thread (reads /proc only; prints PROBE-HOOK / PROBE-CPU every 5 s)
+        pthread_t pt;
+        if (pthread_create(&pt, nullptr, probeThreadMain, nullptr) == 0) { pthread_detach(pt); LOGI("MENUTEST v20 lag probe started (every 5 s)"); }
+        else LOGI("MENUTEST v20 lag probe: pthread_create failed");
+    }
     g_state.store(ST_READY);
     setStatus("Menu ready (%s). Join a match and press 'Complete my tasks'.",
               g_hooked.load() ? "main-thread mode" : "helper-thread mode, less safe");
@@ -1722,15 +1862,14 @@ static void *watcher(void *) {
         if (g_reqHostInfo.exchange(false)) runHostInfo();
         if (g_reqVisual.load() != 0) runVisual();
         visualTick();
-            nameTick(1500);
-        logTick();
+        logTick();   // v20: nameTick(1500) removed here too
     }
     return nullptr;
 }
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v19 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v20 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
