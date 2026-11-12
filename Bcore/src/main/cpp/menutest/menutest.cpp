@@ -1,3 +1,4 @@
+// MENUTEST v17 = v16 + new Submit Scan (RpcSetScanner hologram, pulled to the pad with RpcSnapTo, auto stop after kScanMs, millisecond log)
 // MENUTEST v16 = v15 (Always Imposter swapped DURING SelectRoles via RpcSetRole hook) +
 //   * "Swap now" removed completely (button, JNI function, old after-match swap code)
 //   * player text is "Name(Colour)" with exactly ONE bracket pair (the game's colour text is stripped of its own brackets first)
@@ -29,6 +30,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -1025,7 +1027,11 @@ static const unsigned kSysMedBay = 10;
 enum { VIS_SCAN = 1, VIS_ASTEROIDS = 2, VIS_TRASH = 3, VIS_SHIELDS = 4 };
 static const int  kAsteroidShots = 20;     // the real task needs 20 destroyed asteroids; one laser per shot
 static const long kAsteroidGapMs = 450;    // + random 0..349 ms between shots (a guess at a human rhythm)
-static const long kScanMs = 10000;         // the real scan takes about 10 s
+static const long kScanMs = 10000;         // the real scan takes about 10 s (wiki: "about ten seconds"; the exact ScanDuration is an inspector value, NOT in dump.cs)
+static const long  kScanWatchMs = 100;     // v17: how often the running scan is checked (position, death, time)
+static const long  kScanGraceMs = 700;     // v17: no "left the pad" check right after the snap
+static const float kScanStopDist = 0.75f;  // v17: farther than this from the scan spot = scan is stopped
+static const float kScanExtraX = 0.0f, kScanExtraY = 0.0f;   // v17 calibration added to MedScanner.Position (0 = use Position as it is)
 
 static std::atomic<int> g_reqVisual{0};
 static std::atomic<long> g_reqVisualAt{0};
@@ -1052,6 +1058,7 @@ static unsigned visRnd(unsigned n) {
 static void *m_RpcPlayAnim = nullptr, *m_RpcUpdateSysByte = nullptr;
 static void *f_ShipWeapons = nullptr, *f_ShipShields = nullptr, *f_ShipHatch = nullptr, *f_ShipMedScanner = nullptr, *f_PlayerId = nullptr;
 static bool g_visResolved = false;
+static void *m_RpcSetScanner = nullptr, *f_NetTransform = nullptr, *m_RpcSnapTo = nullptr, *m_GetTruePos = nullptr, *m_ScanPos = nullptr, *f_ScanOffset = nullptr;   // v17
 
 static void resolveVisualFn(void *) {
     if (g_visResolved) return;
@@ -1083,6 +1090,24 @@ static void resolveVisualFn(void *) {
             }
         }
     }
+    // v17: Submit Scan = PlayerControl.RpcSetScanner(bool) (hologram) + CustomNetworkTransform.RpcSnapTo(Vector2) (pull to the pad)
+    m_RpcSetScanner = findMethod(k_PlayerControl, "RpcSetScanner", 1);
+    if (m_RpcSetScanner) {
+        void *pt = p_method_get_param(m_RpcSetScanner, 0);
+        if (!pt || p_type_get_type(pt) != 0x02) {   // 0x02 = boolean
+            LOGI("MENUTEST VISUAL: RpcSetScanner parameter is not a bool, disabled");
+            m_RpcSetScanner = nullptr;
+        }
+    }
+    f_NetTransform = findField(k_PlayerControl, "NetTransform");
+    m_GetTruePos = findMethod(k_PlayerControl, "GetTruePosition", 0);
+    void *kNT = p_class_from_name(g_image, "", "CustomNetworkTransform");
+    m_RpcSnapTo = kNT ? findMethod(kNT, "RpcSnapTo", 1) : nullptr;
+    void *kMS = p_class_from_name(g_image, "", "MedScannerBehaviour");
+    m_ScanPos = kMS ? findMethod(kMS, "get_Position", 0) : nullptr;
+    f_ScanOffset = kMS ? findField(kMS, "Offset") : nullptr;
+    LOGI("MENUTEST VISUAL resolve v17: RpcSetScanner=%p NetTransform=%p RpcSnapTo=%p GetTruePosition=%p MedScanner.get_Position=%p Offset=%p",
+         m_RpcSetScanner, f_NetTransform, m_RpcSnapTo, m_GetTruePos, m_ScanPos, f_ScanOffset);
     LOGI("MENUTEST VISUAL resolve: RpcPlayAnimation=%p RpcUpdateSystem(byte)=%p PlayerId=%p | ShipStatus fields: WeaponsImage=%p ShieldsImages=%p Hatch=%p MedScanner=%p",
          m_RpcPlayAnim, m_RpcUpdateSysByte, f_PlayerId, f_ShipWeapons, f_ShipShields, f_ShipHatch, f_ShipMedScanner);
 }
@@ -1112,8 +1137,76 @@ static bool sendScan(void *ship, unsigned pid, bool request) {
     return ok;
 }
 
-struct VisSeq { bool active; int kind; int left; long nextAt; unsigned pid; };
-static VisSeq g_vs = {false, 0, 0, 0, 0};     // Unity thread only
+struct VisSeq { bool active; int kind; int left; long nextAt; unsigned pid; long startAt, endAt; float refX, refY; };
+static VisSeq g_vs = {false, 0, 0, 0, 0, 0, 0, 0.f, 0.f};     // Unity thread only
+
+// ---- v17: Submit Scan helpers (Unity thread, inside guarded())
+static bool readVec(void *boxed, float *out, int n) {
+    if (!boxed) return false;
+    void *p = p_object_unbox(boxed);
+    if (!p) return false;
+    memcpy(out, p, (size_t)n * sizeof(float));
+    return true;
+}
+static bool getPos2(void *local, float *xy) {
+    if (!m_GetTruePos) return false;
+    bool ok = false;
+    void *r = invokeRaw(m_GetTruePos, local, nullptr, "GetTruePosition", &ok);
+    return ok && readVec(r, xy, 2);
+}
+// the spot where the scanning player stands: MedScanner.Position (+ calibration constants). Logs Position and Offset.
+static bool scanSpot(void *ship, float *xy) {
+    if (!f_ShipMedScanner || !m_ScanPos) return false;
+    void *sc = nullptr;
+    p_field_get_value(ship, f_ShipMedScanner, &sc);
+    if (!sc) return false;
+    bool ok = false;
+    void *r = invokeRaw(m_ScanPos, sc, nullptr, "MedScanner.get_Position", &ok);
+    float v[3] = {0, 0, 0};
+    if (!ok || !readVec(r, v, 3)) return false;
+    float off[3] = {0, 0, 0};
+    if (f_ScanOffset) p_field_get_value(sc, f_ScanOffset, off);
+    LOGI("MENUTEST SCAN spot: MedScanner.Position=(%.3f, %.3f, %.3f) Offset=(%.3f, %.3f, %.3f) extra=(%.2f, %.2f)", v[0], v[1], v[2], off[0], off[1], off[2], kScanExtraX, kScanExtraY);
+    xy[0] = v[0] + kScanExtraX;
+    xy[1] = v[1] + kScanExtraY;
+    return true;
+}
+static bool sendScanner(void *local, bool on) {
+    if (!m_RpcSetScanner) return false;
+    uint64_t b = on ? 1 : 0;
+    void *args[1] = {&b};
+    bool ok = false;
+    invokeRaw(m_RpcSetScanner, local, args, "RpcSetScanner", &ok);
+    return ok;
+}
+static bool snapTo(void *local, float x, float y) {
+    if (!f_NetTransform || !m_RpcSnapTo) return false;
+    void *nt = nullptr;
+    p_field_get_value(local, f_NetTransform, &nt);
+    if (!nt) return false;
+    float v[2] = {x, y};
+    void *args[1] = {v};
+    bool ok = false;
+    invokeRaw(m_RpcSnapTo, nt, args, "RpcSnapTo", &ok);
+    return ok;
+}
+static bool localDead(void *local) {
+    void *d = dataOf(local);
+    bool dead = false;
+    if (d) readBoolField(d, f_IsDead, &dead);
+    return dead;
+}
+// ends a running Submit Scan: scanner OFF first, then the MedBay release. why = short reason for the log. Always logs the exact run time.
+static void endScan(const char *why, void *local, void *ship) {
+    long now = nowMs();
+    long dur = now - g_vs.startAt;
+    bool offOk = false, relOk = false;
+    if (local) offOk = sendScanner(local, false);
+    if (ship) relOk = sendScan(ship, g_vs.pid, false);
+    g_vs.active = false;
+    LOGI("MENUTEST SCAN t+%ldms: STOP (%s) scannerOff=%d release=%d", dur, why, offOk ? 1 : 0, relOk ? 1 : 0);
+    setVisMsg("Submit Scan stopped: %s. It ran %ld.%03ld s (planned %ld.%03ld s). Scanner off=%d, release=%d.", why, dur / 1000, dur % 1000, kScanMs / 1000, kScanMs % 1000, offOk ? 1 : 0, relOk ? 1 : 0);
+}
 static int g_visWhich = 0;
 
 static void visualReqFn(void *) {
@@ -1127,7 +1220,7 @@ static void visualReqFn(void *) {
     // pressing the button of a running task stops it
     if (g_vs.active && g_vs.kind == which) {
         g_vs.active = false;
-        if (which == VIS_SCAN) { sendScan(ship, g_vs.pid, false); setVisMsg("Submit Scan stopped (release sent)."); }
+        if (which == VIS_SCAN) { endScan("button pressed again", local, ship); }
         else setVisMsg("Stopped.");
         return;
     }
@@ -1135,14 +1228,38 @@ static void visualReqFn(void *) {
 
     long now = nowMs();
     if (which == VIS_SCAN) {
-        if (!m_RpcUpdateSysByte) { setVisMsg("Submit Scan: ShipStatus.RpcUpdateSystem(byte) not found in this game build. Nothing sent."); return; }
+        const long t0 = nowMs();
+        if (!m_RpcUpdateSysByte || !m_RpcSetScanner || !m_RpcSnapTo || !f_NetTransform || !m_GetTruePos || !m_ScanPos) {
+            LOGI("MENUTEST SCAN: missing: RpcUpdateSystem=%p RpcSetScanner=%p RpcSnapTo=%p NetTransform=%p GetTruePosition=%p MedScanner.get_Position=%p",
+                 m_RpcUpdateSysByte, m_RpcSetScanner, m_RpcSnapTo, f_NetTransform, m_GetTruePos, m_ScanPos);
+            setVisMsg("Submit Scan: a needed game function was not found in this build (see logcat MENUTEST SCAN: missing). Nothing sent.");
+            return;
+        }
         if (!shipHas(ship, f_ShipMedScanner)) { setVisMsg("Submit Scan: this map has no scanner (MedScanner is empty). Nothing sent."); return; }
+        if (localDead(local)) { setVisMsg("Submit Scan: you are dead (ghosts get no scan animation). Nothing sent."); return; }
         unsigned pid = 255;
         if (f_PlayerId) { uint64_t b = 0; p_field_get_value(local, f_PlayerId, &b); pid = (unsigned)(b & 0xff); }
         if (pid > 31) { setVisMsg("Submit Scan: your player id (%u) cannot be sent (scanner uses 0..31). Nothing sent.", pid); return; }
-        if (!sendScan(ship, pid, true)) { setVisMsg("Submit Scan: the request threw an exception. Nothing else sent."); return; }
-        g_vs.active = true; g_vs.kind = VIS_SCAN; g_vs.pid = pid; g_vs.left = 1; g_vs.nextAt = now + kScanMs;
-        setVisMsg("Submit Scan: request sent (player id %u). Stand on the MedBay scanner pad. It ends by itself after %ld s; press again to stop.", pid, kScanMs / 1000);
+        float spot[2] = {0, 0}, cur[2] = {0, 0};
+        if (!scanSpot(ship, spot)) { setVisMsg("Submit Scan: could not read the scanner position. Nothing sent."); return; }
+        bool haveCur = getPos2(local, cur);
+        float dist = haveCur ? sqrtf((cur[0] - spot[0]) * (cur[0] - spot[0]) + (cur[1] - spot[1]) * (cur[1] - spot[1])) : -1.f;
+        LOGI("MENUTEST SCAN t+0ms: START you=(%.3f, %.3f) spot=(%.3f, %.3f) distance=%.2f pid=%u", cur[0], cur[1], spot[0], spot[1], dist, pid);
+        if (!snapTo(local, spot[0], spot[1])) { setVisMsg("Submit Scan: RpcSnapTo threw an exception. Nothing else sent."); return; }
+        LOGI("MENUTEST SCAN t+%ldms: pulled to the pad (RpcSnapTo)", nowMs() - t0);
+        if (!sendScan(ship, pid, true)) { setVisMsg("Submit Scan: the MedBay request threw an exception. Nothing else sent."); return; }
+        LOGI("MENUTEST SCAN t+%ldms: MedBay request sent", nowMs() - t0);
+        if (!sendScanner(local, true)) {
+            sendScan(ship, pid, false);
+            setVisMsg("Submit Scan: RpcSetScanner(true) threw an exception. Request was released again.");
+            return;
+        }
+        const long t1 = nowMs();
+        LOGI("MENUTEST SCAN t+%ldms: hologram ON (RpcSetScanner true); auto stop at t+%ldms", t1 - t0, t1 - t0 + kScanMs);
+        g_vs.active = true; g_vs.kind = VIS_SCAN; g_vs.pid = pid;
+        g_vs.startAt = t1; g_vs.endAt = t1 + kScanMs; g_vs.refX = spot[0]; g_vs.refY = spot[1];
+        g_vs.nextAt = t1 + kScanWatchMs;
+        setVisMsg("Submit Scan: you were %.1f away, pulled to the pad. Hologram ON; it stops by itself after %ld.%03ld s (or if you move away, die or press again).", dist < 0 ? 0.f : dist, kScanMs / 1000, kScanMs % 1000);
         return;
     }
     if (!m_RpcPlayAnim) { setVisMsg("RpcPlayAnimation not found in this game build (or its parameter is not a byte). Nothing sent."); return; }
@@ -1184,9 +1301,18 @@ static void visualStepFn(void *) {
         g_vs.nextAt = now + kAsteroidGapMs + (long)visRnd(350);
         setVisMsg("Clear Asteroids: shot %d/%d sent.", kAsteroidShots - g_vs.left, kAsteroidShots);
     } else if (g_vs.kind == VIS_SCAN) {
-        bool ok = sendScan(ship, g_vs.pid, false);
-        g_vs.active = false;
-        setVisMsg(ok ? "Submit Scan: finished (release sent)." : "Submit Scan: the release threw an exception.");
+        if (now >= g_vs.endAt) { endScan("time is up", local, ship); return; }
+        if (localDead(local)) { endScan("you died", local, ship); return; }
+        if (now - g_vs.startAt >= kScanGraceMs) {
+            float c[2];
+            if (getPos2(local, c)) {
+                float dx = c[0] - g_vs.refX, dy = c[1] - g_vs.refY;
+                float d = sqrtf(dx * dx + dy * dy);
+                if (d > kScanStopDist) { LOGI("MENUTEST SCAN: left the pad, distance %.2f", d); endScan("you left the pad (or a meeting started)", local, ship); return; }
+            }
+        }
+        long nx = now + kScanWatchMs;
+        g_vs.nextAt = nx < g_vs.endAt ? nx : g_vs.endAt;   // wake up exactly at the end time, not up to 100 ms late
     } else {
         g_vs.active = false;
     }
@@ -1518,7 +1644,7 @@ static void *watcher(void *) {
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v16 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v17 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
