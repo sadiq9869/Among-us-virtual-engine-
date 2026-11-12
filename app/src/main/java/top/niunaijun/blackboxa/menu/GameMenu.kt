@@ -42,8 +42,10 @@ object NativeMenu {
     external fun playersText(): String
     external fun setHostOptions(on: Int, roleIdx: Int)
     external fun requestHostInfo(): Int
-    external fun requestSwapNow(): Int
     external fun hostInfoText(): String
+    // v16 visual tasks: which = 1 Submit Scan, 2 Clear Asteroids, 3 Empty Trash, 4 Prime Shields
+    external fun requestVisual(which: Int): Int
+    external fun visualText(): String
 }
 
 /**
@@ -189,6 +191,11 @@ object GameMenu {
         }
         panel.addView(completeBtn)
 
+        val visualBtn = Button(activity)
+        visualBtn.text = "Visual tasks"
+        visualBtn.isAllCaps = false
+        panel.addView(visualBtn)
+
         val closeBtn = Button(activity)
         closeBtn.text = "Close"
         closeBtn.isAllCaps = false
@@ -209,8 +216,8 @@ object GameMenu {
         panel.addView(consoleBtn)
         panel.addView(closeBtn)
 
-        // compact buttons so the panel (now 5 buttons) fits on a landscape phone screen
-        for (b in listOf(completeBtn, playersBtn, hostBtn, consoleBtn, closeBtn)) {
+        // compact buttons so the panel (now 6 buttons) fits on a landscape phone screen
+        for (b in listOf(completeBtn, visualBtn, playersBtn, hostBtn, consoleBtn, closeBtn)) {
             b.minHeight = 0
             b.minimumHeight = 0
             b.textSize = 13f
@@ -352,7 +359,7 @@ object GameMenu {
         playersLp.topMargin = dp(activity, 16)
         overlay.addView(players, playersLp)
 
-        // ---- host settings box (Always Imposter / role swap). Enabled only when the game says you are host.
+        // ---- host settings box (Always Imposter). Enabled only when the game says you are host.
         val hostBox = LinearLayout(activity)
         hostBox.orientation = LinearLayout.VERTICAL
         hostBox.visibility = View.GONE
@@ -374,13 +381,10 @@ object GameMenu {
         alwaysBtn.isAllCaps = false
         val roleBtn = Button(activity)
         roleBtn.isAllCaps = false
-        val swapBtn = Button(activity)
-        swapBtn.text = "Swap now (this match)"
-        swapBtn.isAllCaps = false
         val hostHideBtn = Button(activity)
         hostHideBtn.text = "Hide"
         hostHideBtn.isAllCaps = false
-        for (b in listOf(alwaysBtn, roleBtn, swapBtn, hostHideBtn)) {
+        for (b in listOf(alwaysBtn, roleBtn, hostHideBtn)) {
             b.minHeight = 0
             b.minimumHeight = 0
             b.textSize = 12f
@@ -396,7 +400,6 @@ object GameMenu {
         fun updateHostButtons(isHost: Boolean) {
             alwaysBtn.isEnabled = isHost
             roleBtn.isEnabled = isHost
-            swapBtn.isEnabled = isHost
             alwaysBtn.text = "Always Imposter: " + (if (alwaysImp) "ON" else "OFF")
             roleBtn.text = "Imposter role: " + wantNames[wantIdx]
             hostTitle.text = if (isHost) "Host settings" else "Host settings - host only (you are not host)"
@@ -429,16 +432,98 @@ object GameMenu {
             applyHostOptions()
             updateHostButtons(roleBtn.isEnabled)
         }
-        swapBtn.setOnClickListener {
-            try {
-                NativeMenu.requestSwapNow()
-            } catch (t: Throwable) {
-                hostInfoView.text = "Host tools: native library not loaded ($t)"
-            }
-            ui.postDelayed({ refreshHost() }, 700)
-        }
         hostHideBtn.setOnClickListener { hostBox.visibility = View.GONE }
         updateHostButtons(false)
+
+        // ---- visual tasks box: Submit Scan / Clear Asteroids / Empty Trash / Prime Shields (works as crew and as impostor)
+        val visBox = LinearLayout(activity)
+        visBox.orientation = LinearLayout.VERTICAL
+        visBox.visibility = View.GONE
+        visBox.background = cbg.constantState?.newDrawable()?.mutate() ?: cbg
+        visBox.setPadding(dp(activity, 8), dp(activity, 8), dp(activity, 8), dp(activity, 8))
+        val visTitle = TextView(activity)
+        visTitle.setTextColor(Color.WHITE)
+        visTitle.textSize = 13f
+        visTitle.text = "Visual tasks (other players see the animation)"
+        visBox.addView(visTitle)
+        val visInfoView = TextView(activity)
+        visInfoView.typeface = Typeface.MONOSPACE
+        visInfoView.textSize = 11f
+        visInfoView.setTextColor(Color.argb(255, 205, 210, 225))
+        val visScroll = ScrollView(activity)
+        visScroll.addView(visInfoView)
+        visBox.addView(visScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        val scanBtn = Button(activity)
+        scanBtn.text = "Submit Scan"
+        val astBtn = Button(activity)
+        astBtn.text = "Clear Asteroids"
+        val trashBtn = Button(activity)
+        trashBtn.text = "Empty Trash"
+        val shieldBtn = Button(activity)
+        shieldBtn.text = "Prime Shields"
+        val visHideBtn = Button(activity)
+        visHideBtn.text = "Hide"
+        for (b in listOf(scanBtn, astBtn, trashBtn, shieldBtn, visHideBtn)) {
+            b.isAllCaps = false
+            b.minHeight = 0
+            b.minimumHeight = 0
+            b.textSize = 12f
+            b.setPadding(dp(activity, 6), dp(activity, 4), dp(activity, 6), dp(activity, 4))
+        }
+        val visRow1 = LinearLayout(activity)
+        visRow1.orientation = LinearLayout.HORIZONTAL
+        val visRow2 = LinearLayout(activity)
+        visRow2.orientation = LinearLayout.HORIZONTAL
+        val visBtnLp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        visRow1.addView(scanBtn, visBtnLp)
+        visRow1.addView(astBtn, visBtnLp)
+        visRow2.addView(trashBtn, visBtnLp)
+        visRow2.addView(shieldBtn, visBtnLp)
+        visBox.addView(visRow1)
+        visBox.addView(visRow2)
+        visBox.addView(visHideBtn)
+        val visLp = FrameLayout.LayoutParams(consoleLp.width, consoleLp.height)
+        visLp.gravity = Gravity.TOP or Gravity.START
+        visLp.leftMargin = dp(activity, 296)
+        visLp.topMargin = dp(activity, 16)
+        overlay.addView(visBox, visLp)
+
+        fun refreshVisual() {
+            try {
+                visInfoView.text = NativeMenu.visualText()
+            } catch (t: Throwable) {
+                visInfoView.text = "Visual tasks: native library not loaded ($t)"
+            }
+        }
+        fun pressVisual(which: Int) {
+            try {
+                val r = NativeMenu.requestVisual(which)
+                if (r == 0) visInfoView.text = "Menu not ready yet (wait for 'Menu ready')."
+            } catch (t: Throwable) {
+                visInfoView.text = "Visual tasks: native library not loaded ($t)"
+            }
+            ui.postDelayed({ refreshVisual() }, 400)
+        }
+        scanBtn.setOnClickListener { pressVisual(1) }
+        astBtn.setOnClickListener { pressVisual(2) }
+        trashBtn.setOnClickListener { pressVisual(3) }
+        shieldBtn.setOnClickListener { pressVisual(4) }
+        visHideBtn.setOnClickListener { visBox.visibility = View.GONE }
+        visualBtn.setOnClickListener {
+            console.visibility = View.GONE
+            players.visibility = View.GONE
+            hostBox.visibility = View.GONE
+            visBox.visibility = View.VISIBLE
+            refreshVisual()
+        }
+        val visRefresher = object : Runnable {
+            override fun run() {
+                if (overlay.parent == null) return
+                if (visBox.visibility == View.VISIBLE) refreshVisual()
+                ui.postDelayed(this, 1000)
+            }
+        }
+        ui.postDelayed(visRefresher, 1000)
 
         fun refreshPlayers() {
             try {
@@ -451,12 +536,14 @@ object GameMenu {
         playersBtn.setOnClickListener {
             console.visibility = View.GONE
             hostBox.visibility = View.GONE
+            visBox.visibility = View.GONE
             players.visibility = View.VISIBLE
             refreshPlayers()
         }
         consoleBtn.setOnClickListener {
             players.visibility = View.GONE
             hostBox.visibility = View.GONE
+            visBox.visibility = View.GONE
             console.visibility = View.VISIBLE
             consoleTitle.text = "Console - loading..."
             refreshConsole()
@@ -474,6 +561,7 @@ object GameMenu {
         hostBtn.setOnClickListener {
             console.visibility = View.GONE
             players.visibility = View.GONE
+            visBox.visibility = View.GONE
             hostBox.visibility = View.VISIBLE
             refreshHost()
         }
@@ -545,7 +633,7 @@ object GameMenu {
                 else -> false
             }
         }
-        closeBtn.setOnClickListener { panel.visibility = View.GONE; console.visibility = View.GONE; players.visibility = View.GONE; hostBox.visibility = View.GONE }
+        closeBtn.setOnClickListener { panel.visibility = View.GONE; console.visibility = View.GONE; players.visibility = View.GONE; hostBox.visibility = View.GONE; visBox.visibility = View.GONE }
 
         // keep the status line fresh while the panel is open
         val refresher = object : Runnable {
