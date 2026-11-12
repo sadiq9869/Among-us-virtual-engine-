@@ -98,6 +98,7 @@ public class NativeCore {
      */
     private static boolean isInsideAttributionSourceCheck() {
         try {
+            sPAttr.incrementAndGet();
             StackTraceElement[] stack = new Throwable().getStackTrace();
             int limit = Math.min(stack.length, 16);
             for (int i = 0; i < limit; i++) {
@@ -110,8 +111,67 @@ public class NativeCore {
         return false;
     }
 
+    // ------------------------------------------------------------------ v20 LAG PROBE (measures only, changes no result)
+    // Every 5 s (only inside the Among Us process) one log line with the tag MENUTEST (so the in-game Console shows it):
+    //   PROBE-JAVA ... getCallingUid calls / avg / max, how many of them built a stack trace, redirectPath calls.
+    // Set PROBE_ON = false to switch the probe off completely.
+    private static final boolean PROBE_ON = true;
+    private static final java.util.concurrent.atomic.AtomicLong sPCalls = new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong sPNanos = new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong sPMaxNanos = new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong sPStack = new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong sPAttr = new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong sPRedir = new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicBoolean sProbeStarted = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    private static void probeRecord(long nanos) {
+        sPCalls.incrementAndGet();
+        sPNanos.addAndGet(nanos);
+        long cur = sPMaxNanos.get();
+        while (nanos > cur && !sPMaxNanos.compareAndSet(cur, nanos)) cur = sPMaxNanos.get();
+        if (!sProbeStarted.get()) {
+            try {
+                String pkg = BlackBoxCore.getAppPackageName();
+                if (pkg != null && pkg.equals("com.innersloth.spacemafia") && sProbeStarted.compareAndSet(false, true)) {
+                    Thread t = new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            for (;;) {
+                                try {
+                                    Thread.sleep(5000);
+                                    long calls = sPCalls.getAndSet(0);
+                                    long nanos2 = sPNanos.getAndSet(0);
+                                    long max = sPMaxNanos.getAndSet(0);
+                                    long stack = sPStack.getAndSet(0);
+                                    long attr = sPAttr.getAndSet(0);
+                                    long redir = sPRedir.getAndSet(0);
+                                    Log.i("MENUTEST", "PROBE-JAVA 5s: getCallingUid calls=" + calls
+                                            + " avg=" + (calls > 0 ? (nanos2 / calls / 1000) : 0) + "us max=" + (max / 1000)
+                                            + "us total=" + (nanos2 / 1000000) + "ms | fullStackTraces=" + stack
+                                            + " attrChecks=" + attr + " | redirectPath calls=" + redir);
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        }
+                    }, "menuprobe-java");
+                    t.setDaemon(true);
+                    t.start();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
     @Keep
     public static int getCallingUid(int origCallingUid) {
+        if (!PROBE_ON) return getCallingUidWork(origCallingUid);
+        final long t0 = System.nanoTime();
+        final int r = getCallingUidWork(origCallingUid);
+        probeRecord(System.nanoTime() - t0);
+        return r;
+    }
+
+    private static int getCallingUidWork(int origCallingUid) {
         int result = getCallingUidImpl(origCallingUid);
         try {
             // MICROGAS: only look at the stack when we are about to return a virtual uid.
@@ -181,6 +241,7 @@ public class NativeCore {
                 
                 
                 try {
+                    sPStack.incrementAndGet();
                     StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
                     for (StackTraceElement element : stackTrace) {
                         String className = element.getClassName();
@@ -213,11 +274,13 @@ public class NativeCore {
 
     @Keep
     public static String redirectPath(String path) {
+        if (PROBE_ON) sPRedir.incrementAndGet();
         return IOCore.get().redirectPath(path);
     }
 
     @Keep
     public static File redirectPath(File path) {
+        if (PROBE_ON) sPRedir.incrementAndGet();
         return IOCore.get().redirectPath(path);
     }
 
