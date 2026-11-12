@@ -1,6 +1,6 @@
-// MENUTEST v17 = v16 + new Submit Scan (RpcSetScanner hologram, auto stop after kScanMs, millisecond log)
-//   v17b: the player WALKS to the pad (RpcSnapTo steps, like WalkToPad), then to Position+Offset (like WalkToOffset); the scan starts when he is there.
-//         nameTick is NOT run automatically any more (kNameTickAuto=false; names are still refreshed before SelectRoles); SLOW-hook timing log.
+// MENUTEST v18 = v17 + PASSIVE "REALSCAN" logger: when YOU do the real Submit Scan task, everything the game does is logged with
+//   millisecond times (log-only hooks, nothing is changed, nothing is sent). Lines start with "REALSCAN" (tag MENUTEST).
+// MENUTEST v17 = v16 + new Submit Scan (RpcSetScanner hologram, pulled to the pad with RpcSnapTo, auto stop after kScanMs, millisecond log)
 // MENUTEST v16 = v15 (Always Imposter swapped DURING SelectRoles via RpcSetRole hook) +
 //   * "Swap now" removed completely (button, JNI function, old after-match swap code)
 //   * player text is "Name(Colour)" with exactly ONE bracket pair (the game's colour text is stripped of its own brackets first)
@@ -45,6 +45,8 @@
 
 #define TAG "MENUTEST"
 #define LOGI(...) do { __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__); usleep(1500); } while (0)
+// v18: same as LOGI but WITHOUT the usleep, for the REALSCAN lines (they are written from game hooks / every 45 ms and must not stall the Unity thread)
+#define LOGQ(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
 // ---------------------------------------------------------------- config
 static const long kStartDelayMs = 30000;   // UNCALIBRATED: no il2cpp call before this (v6 worked with it)
@@ -76,11 +78,6 @@ static void setStatus(const char *fmt, ...) {
     __android_log_print(ANDROID_LOG_INFO, TAG, "STATUS: %s", buf);
 }
 
-static long nowUs() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
-}
 static long nowMs() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1019,9 +1016,7 @@ static void nameTick(long maxAgeMs) {
         if (!f_AllPlayers) return;
     }
     if (!f_roleAssigned && !guarded(resolveHostFn, nullptr)) return;
-    long tu = nowUs();
     if (!guarded(refreshNamesFn, nullptr)) LOGI("MENUTEST refreshNamesFn FAULT");
-    LOGI("MENUTEST NAMETICK took %ld us (players %d)", nowUs() - tu, g_nameCount);
 }
 
 // ---------------------------------------------------------------- v16: visual tasks (Submit Scan, Clear Asteroids, Empty Trash, Prime Shields)
@@ -1038,11 +1033,7 @@ static const int  kAsteroidShots = 20;     // the real task needs 20 destroyed a
 static const long kAsteroidGapMs = 450;    // + random 0..349 ms between shots (a guess at a human rhythm)
 static const long kScanMs = 10000;         // the real scan takes about 10 s (wiki: "about ten seconds"; the exact ScanDuration is an inspector value, NOT in dump.cs)
 static const long  kScanWatchMs = 100;     // v17: how often the running scan is checked (position, death, time)
-static const long  kScanGraceMs = 400;     // v17: no "left the pad" check right after the arrival
-static const float kWalkSpeed = 2.5f;      // v17b: walking speed in map units per second [GUESS: Among Us base speed 2.5]
-static const long  kWalkStepMs = 30;       // v17b: one RpcSnapTo step every 30 ms while walking
-static const long  kWalkMaxMs = 2500;      // v17b: a long walk is sped up so it never takes longer than this
-static const bool  kNameTickAuto = false;  // v17b: false = the pointer->name table is NOT refreshed every 1.5 s (lag suspect); it is still refreshed right before SelectRoles
+static const long  kScanGraceMs = 700;     // v17: no "left the pad" check right after the snap
 static const float kScanStopDist = 0.75f;  // v17: farther than this from the scan spot = scan is stopped
 static const float kScanExtraX = 0.0f, kScanExtraY = 0.0f;   // v17 calibration added to MedScanner.Position (0 = use Position as it is)
 
@@ -1072,6 +1063,8 @@ static void *m_RpcPlayAnim = nullptr, *m_RpcUpdateSysByte = nullptr;
 static void *f_ShipWeapons = nullptr, *f_ShipShields = nullptr, *f_ShipHatch = nullptr, *f_ShipMedScanner = nullptr, *f_PlayerId = nullptr;
 static bool g_visResolved = false;
 static void *m_RpcSetScanner = nullptr, *f_NetTransform = nullptr, *m_RpcSnapTo = nullptr, *m_GetTruePos = nullptr, *m_ScanPos = nullptr, *f_ScanOffset = nullptr;   // v17
+// v18: 1 while OUR OWN menu code calls one of the RPCs below (the REALSCAN hooks then log "by=MENU" instead of "by=GAME")
+static int g_ownCall = 0;
 
 static void resolveVisualFn(void *) {
     if (g_visResolved) return;
@@ -1146,19 +1139,14 @@ static bool sendScan(void *ship, unsigned pid, bool request) {
     uint64_t amt = (request ? 128u : 64u) | (pid & 31u);
     void *args[2] = {&st, &amt};
     bool ok = false;
+    g_ownCall = 1;
     invokeRaw(m_RpcUpdateSysByte, ship, args, "RpcUpdateSystem(MedBay)", &ok);
+    g_ownCall = 0;
     return ok;
 }
 
-struct VisSeq {
-    bool active = false; int kind = 0; int left = 0; long nextAt = 0; unsigned pid = 0;
-    long startAt = 0, endAt = 0; float refX = 0, refY = 0;
-    // v17b Submit Scan: phase 0 = walking (seg 0: to MedScanner.Position, seg 1: to Position+Offset), phase 1 = hologram running
-    int phase = 0, seg = 0; long t0 = 0, segStart = 0, segMs = 0;
-    float sx = 0, sy = 0, tx = 0, ty = 0, finX = 0, finY = 0;
-    bool reqSent = false, scanOn = false;
-};
-static VisSeq g_vs;     // Unity thread only
+struct VisSeq { bool active; int kind; int left; long nextAt; unsigned pid; long startAt, endAt; float refX, refY; };
+static VisSeq g_vs = {false, 0, 0, 0, 0, 0, 0, 0.f, 0.f};     // Unity thread only
 
 // ---- v17: Submit Scan helpers (Unity thread, inside guarded())
 static bool readVec(void *boxed, float *out, int n) {
@@ -1175,7 +1163,7 @@ static bool getPos2(void *local, float *xy) {
     return ok && readVec(r, xy, 2);
 }
 // the spot where the scanning player stands: MedScanner.Position (+ calibration constants). Logs Position and Offset.
-static bool scanSpot(void *ship, float *pad, float *fin) {
+static bool scanSpot(void *ship, float *xy) {
     if (!f_ShipMedScanner || !m_ScanPos) return false;
     void *sc = nullptr;
     p_field_get_value(ship, f_ShipMedScanner, &sc);
@@ -1187,8 +1175,8 @@ static bool scanSpot(void *ship, float *pad, float *fin) {
     float off[3] = {0, 0, 0};
     if (f_ScanOffset) p_field_get_value(sc, f_ScanOffset, off);
     LOGI("MENUTEST SCAN spot: MedScanner.Position=(%.3f, %.3f, %.3f) Offset=(%.3f, %.3f, %.3f) extra=(%.2f, %.2f)", v[0], v[1], v[2], off[0], off[1], off[2], kScanExtraX, kScanExtraY);
-    pad[0] = v[0]; pad[1] = v[1];                                   // MedScanMinigame.WalkToPad goes here first
-    fin[0] = v[0] + off[0] + kScanExtraX; fin[1] = v[1] + off[1] + kScanExtraY;   // then WalkToOffset: Position + Offset [GUESS from the state names]
+    xy[0] = v[0] + kScanExtraX;
+    xy[1] = v[1] + kScanExtraY;
     return true;
 }
 static bool sendScanner(void *local, bool on) {
@@ -1196,7 +1184,9 @@ static bool sendScanner(void *local, bool on) {
     uint64_t b = on ? 1 : 0;
     void *args[1] = {&b};
     bool ok = false;
+    g_ownCall = 1;
     invokeRaw(m_RpcSetScanner, local, args, "RpcSetScanner", &ok);
+    g_ownCall = 0;
     return ok;
 }
 static bool snapTo(void *local, float x, float y) {
@@ -1207,7 +1197,9 @@ static bool snapTo(void *local, float x, float y) {
     float v[2] = {x, y};
     void *args[1] = {v};
     bool ok = false;
+    g_ownCall = 1;
     invokeRaw(m_RpcSnapTo, nt, args, "RpcSnapTo", &ok);
+    g_ownCall = 0;
     return ok;
 }
 static bool localDead(void *local) {
@@ -1219,23 +1211,14 @@ static bool localDead(void *local) {
 // ends a running Submit Scan: scanner OFF first, then the MedBay release. why = short reason for the log. Always logs the exact run time.
 static void endScan(const char *why, void *local, void *ship) {
     long now = nowMs();
-    long total = now - g_vs.t0;
-    long scan = g_vs.scanOn ? now - g_vs.startAt : 0;
+    long dur = now - g_vs.startAt;
     bool offOk = false, relOk = false;
-    if (g_vs.scanOn && local) offOk = sendScanner(local, false);
-    if (g_vs.reqSent && ship) relOk = sendScan(ship, g_vs.pid, false);
+    if (local) offOk = sendScanner(local, false);
+    if (ship) relOk = sendScan(ship, g_vs.pid, false);
     g_vs.active = false;
-    LOGI("MENUTEST SCAN t+%ldms: STOP (%s) phase=%d scannerOff=%d release=%d scanRan=%ldms", total, why, g_vs.phase, offOk ? 1 : 0, relOk ? 1 : 0, scan);
-    setVisMsg("Submit Scan stopped: %s. Scan ran %ld.%03ld s (planned %ld.%03ld s), whole action %ld.%03ld s.", why, scan / 1000, scan % 1000, kScanMs / 1000, kScanMs % 1000, total / 1000, total % 1000);
+    LOGI("MENUTEST SCAN t+%ldms: STOP (%s) scannerOff=%d release=%d", dur, why, offOk ? 1 : 0, relOk ? 1 : 0);
+    setVisMsg("Submit Scan stopped: %s. It ran %ld.%03ld s (planned %ld.%03ld s). Scanner off=%d, release=%d.", why, dur / 1000, dur % 1000, kScanMs / 1000, kScanMs % 1000, offOk ? 1 : 0, relOk ? 1 : 0);
 }
-
-static long walkMs(float x0, float y0, float x1, float y1) {
-    float d = sqrtf((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
-    if (d < 0.02f) return 0;
-    long ms = (long)(d / kWalkSpeed * 1000.f);
-    return ms > kWalkMaxMs ? kWalkMaxMs : ms;
-}
-
 static int g_visWhich = 0;
 
 static void visualReqFn(void *) {
@@ -1269,18 +1252,26 @@ static void visualReqFn(void *) {
         unsigned pid = 255;
         if (f_PlayerId) { uint64_t b = 0; p_field_get_value(local, f_PlayerId, &b); pid = (unsigned)(b & 0xff); }
         if (pid > 31) { setVisMsg("Submit Scan: your player id (%u) cannot be sent (scanner uses 0..31). Nothing sent.", pid); return; }
-        float pad[2] = {0, 0}, fin[2] = {0, 0}, cur[2] = {0, 0};
-        if (!scanSpot(ship, pad, fin)) { setVisMsg("Submit Scan: could not read the scanner position. Nothing sent."); return; }
-        if (!getPos2(local, cur)) { setVisMsg("Submit Scan: could not read your position. Nothing sent."); return; }
-        long m0 = walkMs(cur[0], cur[1], pad[0], pad[1]);
-        LOGI("MENUTEST SCAN t+0ms: START you=(%.3f, %.3f) pad=(%.3f, %.3f) final=(%.3f, %.3f) pid=%u walk to pad %ld ms", cur[0], cur[1], pad[0], pad[1], fin[0], fin[1], pid, m0);
-        g_vs = VisSeq();
-        g_vs.active = true; g_vs.kind = VIS_SCAN; g_vs.pid = pid; g_vs.phase = 0; g_vs.seg = 0;
-        g_vs.t0 = t0; g_vs.segStart = t0; g_vs.segMs = m0;
-        g_vs.sx = cur[0]; g_vs.sy = cur[1]; g_vs.tx = pad[0]; g_vs.ty = pad[1];
-        g_vs.finX = fin[0]; g_vs.finY = fin[1];
-        g_vs.nextAt = t0;   // first step on the next tick
-        setVisMsg("Submit Scan: walking to the pad (%ld ms), then to the scan spot. Hologram starts when you are there; it stops by itself after %ld.%03ld s.", m0, kScanMs / 1000, kScanMs % 1000);
+        float spot[2] = {0, 0}, cur[2] = {0, 0};
+        if (!scanSpot(ship, spot)) { setVisMsg("Submit Scan: could not read the scanner position. Nothing sent."); return; }
+        bool haveCur = getPos2(local, cur);
+        float dist = haveCur ? sqrtf((cur[0] - spot[0]) * (cur[0] - spot[0]) + (cur[1] - spot[1]) * (cur[1] - spot[1])) : -1.f;
+        LOGI("MENUTEST SCAN t+0ms: START you=(%.3f, %.3f) spot=(%.3f, %.3f) distance=%.2f pid=%u", cur[0], cur[1], spot[0], spot[1], dist, pid);
+        if (!snapTo(local, spot[0], spot[1])) { setVisMsg("Submit Scan: RpcSnapTo threw an exception. Nothing else sent."); return; }
+        LOGI("MENUTEST SCAN t+%ldms: pulled to the pad (RpcSnapTo)", nowMs() - t0);
+        if (!sendScan(ship, pid, true)) { setVisMsg("Submit Scan: the MedBay request threw an exception. Nothing else sent."); return; }
+        LOGI("MENUTEST SCAN t+%ldms: MedBay request sent", nowMs() - t0);
+        if (!sendScanner(local, true)) {
+            sendScan(ship, pid, false);
+            setVisMsg("Submit Scan: RpcSetScanner(true) threw an exception. Request was released again.");
+            return;
+        }
+        const long t1 = nowMs();
+        LOGI("MENUTEST SCAN t+%ldms: hologram ON (RpcSetScanner true); auto stop at t+%ldms", t1 - t0, t1 - t0 + kScanMs);
+        g_vs.active = true; g_vs.kind = VIS_SCAN; g_vs.pid = pid;
+        g_vs.startAt = t1; g_vs.endAt = t1 + kScanMs; g_vs.refX = spot[0]; g_vs.refY = spot[1];
+        g_vs.nextAt = t1 + kScanWatchMs;
+        setVisMsg("Submit Scan: you were %.1f away, pulled to the pad. Hologram ON; it stops by itself after %ld.%03ld s (or if you move away, die or press again).", dist < 0 ? 0.f : dist, kScanMs / 1000, kScanMs % 1000);
         return;
     }
     if (!m_RpcPlayAnim) { setVisMsg("RpcPlayAnimation not found in this game build (or its parameter is not a byte). Nothing sent."); return; }
@@ -1322,35 +1313,8 @@ static void visualStepFn(void *) {
         g_vs.nextAt = now + kAsteroidGapMs + (long)visRnd(350);
         setVisMsg("Clear Asteroids: shot %d/%d sent.", kAsteroidShots - g_vs.left, kAsteroidShots);
     } else if (g_vs.kind == VIS_SCAN) {
-        if (localDead(local)) { endScan("you died", local, ship); return; }
-        if (g_vs.phase == 0) {   // ---- walking (RpcSnapTo steps)
-            long el = now - g_vs.segStart;
-            float f = g_vs.segMs > 0 ? (float)el / (float)g_vs.segMs : 1.f;
-            bool arrived = f >= 1.f;
-            if (arrived) f = 1.f;
-            if (!snapTo(local, g_vs.sx + (g_vs.tx - g_vs.sx) * f, g_vs.sy + (g_vs.ty - g_vs.sy) * f)) { endScan("walking failed (RpcSnapTo threw)", local, ship); return; }
-            if (!arrived) { g_vs.nextAt = now + kWalkStepMs; return; }
-            if (g_vs.seg == 0) {   // reached MedScanner.Position -> short walk to Position+Offset
-                long m1 = walkMs(g_vs.tx, g_vs.ty, g_vs.finX, g_vs.finY);
-                LOGI("MENUTEST SCAN t+%ldms: reached the pad, walking to the scan spot (%ld ms)", now - g_vs.t0, m1);
-                g_vs.seg = 1; g_vs.sx = g_vs.tx; g_vs.sy = g_vs.ty; g_vs.tx = g_vs.finX; g_vs.ty = g_vs.finY;
-                g_vs.segStart = now; g_vs.segMs = m1; g_vs.nextAt = now + kWalkStepMs;
-                return;
-            }
-            LOGI("MENUTEST SCAN t+%ldms: reached the scan spot (%.3f, %.3f)", now - g_vs.t0, g_vs.finX, g_vs.finY);
-            if (!sendScan(ship, g_vs.pid, true)) { endScan("MedBay request threw", local, ship); return; }
-            g_vs.reqSent = true;
-            LOGI("MENUTEST SCAN t+%ldms: MedBay request sent", nowMs() - g_vs.t0);
-            if (!sendScanner(local, true)) { endScan("RpcSetScanner(true) threw", local, ship); return; }
-            g_vs.scanOn = true; g_vs.phase = 1;
-            g_vs.startAt = nowMs(); g_vs.endAt = g_vs.startAt + kScanMs; g_vs.refX = g_vs.finX; g_vs.refY = g_vs.finY;
-            g_vs.nextAt = g_vs.startAt + kScanWatchMs;
-            LOGI("MENUTEST SCAN t+%ldms: hologram ON (RpcSetScanner true); auto stop at t+%ldms", g_vs.startAt - g_vs.t0, g_vs.endAt - g_vs.t0);
-            setVisMsg("Submit Scan: hologram ON. It stops by itself after %ld.%03ld s (or if you move away, die or press again).", kScanMs / 1000, kScanMs % 1000);
-            return;
-        }
-        // ---- phase 1: hologram running
         if (now >= g_vs.endAt) { endScan("time is up", local, ship); return; }
+        if (localDead(local)) { endScan("you died", local, ship); return; }
         if (now - g_vs.startAt >= kScanGraceMs) {
             float c[2];
             if (getPos2(local, c)) {
@@ -1389,23 +1353,384 @@ static void runVisual() {
     }
 }
 
+// ---------------------------------------------------------------- v18: REALSCAN = passive logger for the REAL Submit Scan task
+// Purpose: when the user does the real task (walks to the scanner, scans, leaves), log exactly what the game does, so that
+// position / timing / sequence are KNOWN instead of guessed. NOTHING here changes game state and NOTHING is sent to the host.
+// Source of the names: dump.cs of 2026.11.3 (MedScanMinigame: Begin/Close/WalkToPad/WalkToOffset, fields medscan @0xA0, ScanDuration @0xA8,
+// ScanTimer @0xAC, state @0xD0 (enum PositionState None 0 / WalkingToPad 1 / WalkingToOffset 2); MedScanSystem: <CurrentUser>k__BackingField,
+// UsersList; PlayerControl: moveable, scannerCount). Everything is looked up BY NAME at run time; a name that is missing only
+// removes that part of the log (a "not found" line says which).
+// Log-only hooks (Dobby, arguments are passed on unchanged): MedScanMinigame.Begin / Close / WalkToPad / WalkToOffset,
+// PlayerControl.RpcSetScanner, ShipStatus.RpcUpdateSystem(byte) (only SystemTypes.MedBay is logged),
+// CustomNetworkTransform.RpcSnapTo / SnapTo (only for the local player, only while a scan session runs).
+// The hooks only write plain memory + log (no il2cpp calls). Positions/fields are read every ~45 ms from the FixedUpdate tick, inside guarded().
+// A session starts at MedScanMinigame.Begin and ends 1.5 s after Close (or after 60 s) with a SUMMARY block.
+// [GUESS] the Vector2 argument of RpcSnapTo/SnapTo arrives in two float registers (standard arm64 ABI); the hooks pass the same values on.
+static void *m_MGBegin = nullptr, *m_MGClose = nullptr, *m_MGWalkPad = nullptr, *m_MGWalkOff = nullptr, *m_SnapTo = nullptr;
+static void *f_mgMedscan = nullptr, *f_mgScanDur = nullptr, *f_mgScanTimer = nullptr, *f_mgState = nullptr;
+static void *f_msCur = nullptr, *f_msUsers = nullptr, *f_listSize = nullptr;
+static void *f_pcMoveable = nullptr, *f_pcScannerCount = nullptr;
+static std::atomic<int> g_rsHooks{0};
+static void *g_localNT = nullptr;      // LocalPlayer.NetTransform (refreshed every 3 s while no session runs, and at session start)
+static long g_rsNtAt = 0;
+
+struct RealScan {
+    bool active;
+    long t0, closeAtAbs, nextAt;
+    void *mg;
+    bool spotDone, haveSpot;
+    float spot3[3], off3[3];
+    unsigned pid;
+    bool haveLast; float lastX, lastY; long lastT;
+    bool haveStart; float startX, startY;
+    bool haveStand; float standX, standY;
+    int lastState; long tState[3];
+    long tWalkPad, tWalkOff, tReq, tRel, tOn, tOff, tClose;
+    int lastMove, lastScnCnt;
+    float maxSpd; long maxSpdAt; int jumps, snaps, samples;
+    float timerMax, durSeen;
+};
+static RealScan g_rs;
+
+static float dist2(float ax, float ay, float bx, float by) { float dx = ax - bx, dy = ay - by; return sqrtf(dx * dx + dy * dy); }
+
+static void rsEvent(const char *fmt, ...) {
+    char buf[300];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (g_rs.active) LOGQ("MENUTEST REALSCAN t+%ldms EVENT %s", nowMs() - g_rs.t0, buf);
+    else LOGQ("MENUTEST REALSCAN t=%ld (no session) EVENT %s", nowMs() % 1000000, buf);
+}
+
+static void rsFinish(const char *why) {
+    if (!g_rs.active) return;
+    g_rs.active = false;
+    LOGQ("MENUTEST REALSCAN ===== SUMMARY (%s) | valid for game build 2026.11.3 only =====", why);
+    if (g_rs.haveStart) LOGQ("MENUTEST REALSCAN start position (first sample after Begin): (%.3f, %.3f)", g_rs.startX, g_rs.startY);
+    if (g_rs.haveSpot) {
+        float fx = g_rs.spot3[0] + g_rs.off3[0], fy = g_rs.spot3[1] + g_rs.off3[1];
+        LOGQ("MENUTEST REALSCAN MedScanner.Position=(%.3f, %.3f, %.3f) Offset=(%.3f, %.3f, %.3f) Position+Offset=(%.3f, %.3f)",
+             g_rs.spot3[0], g_rs.spot3[1], g_rs.spot3[2], g_rs.off3[0], g_rs.off3[1], g_rs.off3[2], fx, fy);
+        if (g_rs.haveStand)
+            LOGQ("MENUTEST REALSCAN STANDING position while scanning: (%.3f, %.3f) | vs Position: dx=%.3f dy=%.3f dist=%.3f | vs Position+Offset: dx=%.3f dy=%.3f dist=%.3f",
+                 g_rs.standX, g_rs.standY, g_rs.standX - g_rs.spot3[0], g_rs.standY - g_rs.spot3[1], dist2(g_rs.standX, g_rs.standY, g_rs.spot3[0], g_rs.spot3[1]),
+                 g_rs.standX - fx, g_rs.standY - fy, dist2(g_rs.standX, g_rs.standY, fx, fy));
+    }
+    if (!g_rs.haveStand) LOGQ("MENUTEST REALSCAN no standing position recorded (RpcSetScanner(true) by the game was not seen)");
+    LOGQ("MENUTEST REALSCAN events in ms after Begin (-1 = not seen): WalkToPad-coroutine=%ld state1-first-seen=%ld WalkToOffset-coroutine=%ld state2-first-seen=%ld MedBayRequest=%ld ScannerON=%ld ScannerOFF=%ld MedBayRelease=%ld Close=%ld",
+         g_rs.tWalkPad, g_rs.tState[1], g_rs.tWalkOff, g_rs.tState[2], g_rs.tReq, g_rs.tOn, g_rs.tOff, g_rs.tRel, g_rs.tClose);
+    if (g_rs.tOn >= 0 && g_rs.tOff >= 0) LOGQ("MENUTEST REALSCAN hologram was ON for %ld ms (RpcSetScanner true -> false)", g_rs.tOff - g_rs.tOn);
+    LOGQ("MENUTEST REALSCAN ScanDuration field=%.3f s | ScanTimer highest value seen=%.3f s", g_rs.durSeen, g_rs.timerMax);
+    LOGQ("MENUTEST REALSCAN movement: highest speed between samples %.2f units/s (at t+%ldms) | JUMPS (>1.0 unit in one sample)=%d | RpcSnapTo/SnapTo calls seen=%d | samples=%d",
+         g_rs.maxSpd, g_rs.maxSpdAt, g_rs.jumps, g_rs.snaps, g_rs.samples);
+    LOGQ("MENUTEST REALSCAN ===== END OF SUMMARY =====");
+}
+
+static void rsStart(void *mg, long t, const char *how) {
+    if (g_rs.active) rsFinish("a new scan started");
+    memset(&g_rs, 0, sizeof(g_rs));
+    g_rs.active = true;
+    g_rs.t0 = t;
+    g_rs.mg = mg;
+    g_rs.nextAt = 0;
+    g_rs.lastState = -1; g_rs.lastMove = -1; g_rs.lastScnCnt = -1;
+    for (int i = 0; i < 3; i++) g_rs.tState[i] = -1;
+    g_rs.tWalkPad = g_rs.tWalkOff = g_rs.tReq = g_rs.tRel = g_rs.tOn = g_rs.tOff = g_rs.tClose = -1;
+    g_rs.pid = 255;
+    LOGQ("MENUTEST REALSCAN t+0ms SESSION START (%s) minigame=%p", how, mg);
+}
+
+// ---- hooks (log-only, plain memory only, arguments passed on unchanged)
+typedef void (*fn_mgbegin_t)(void *self, void *task, const void *method);
+typedef void (*fn_mgclose_t)(void *self, const void *method);
+typedef void *(*fn_mgwalk_t)(void *self, const void *method);
+typedef void (*fn_rpcscanner_t)(void *self, uint64_t value, const void *method);
+typedef void (*fn_updsys_t)(void *self, uint64_t sys, uint64_t amt, const void *method);
+typedef void (*fn_snap_t)(void *self, float x, float y, const void *method);
+static fn_mgbegin_t orig_mgbegin = nullptr;
+static fn_mgclose_t orig_mgclose = nullptr;
+static fn_mgwalk_t orig_mgwalkpad = nullptr, orig_mgwalkoff = nullptr;
+static fn_rpcscanner_t orig_rpcscanner = nullptr;
+static fn_updsys_t orig_updsys = nullptr;
+static fn_snap_t orig_rpcsnap = nullptr, orig_snap = nullptr;
+
+static void hk_mgbegin(void *self, void *task, const void *method) {
+    long t = nowMs();
+    rsStart(self, t, "MedScanMinigame.Begin");
+    if (orig_mgbegin) orig_mgbegin(self, task, method);
+    if (g_rs.active) LOGQ("MENUTEST REALSCAN t+%ldms EVENT Begin() returned (it took %ld ms)", nowMs() - g_rs.t0, nowMs() - t);
+}
+static void hk_mgclose(void *self, const void *method) {
+    long t = nowMs();
+    if (g_rs.active) {
+        g_rs.tClose = t - g_rs.t0;
+        g_rs.closeAtAbs = t;
+        g_rs.mg = nullptr;        // the minigame object is going away: never read it again
+        LOGQ("MENUTEST REALSCAN t+%ldms EVENT Close() called", t - g_rs.t0);
+    } else {
+        LOGQ("MENUTEST REALSCAN t=%ld (no session) EVENT MedScanMinigame.Close() called", t % 1000000);
+    }
+    if (orig_mgclose) orig_mgclose(self, method);
+}
+static void *hk_mgwalkpad(void *self, const void *method) {
+    void *r = orig_mgwalkpad ? orig_mgwalkpad(self, method) : nullptr;
+    if (g_rs.active && g_rs.tWalkPad < 0) g_rs.tWalkPad = nowMs() - g_rs.t0;
+    rsEvent("WalkToPad() coroutine created");
+    return r;
+}
+static void *hk_mgwalkoff(void *self, const void *method) {
+    void *r = orig_mgwalkoff ? orig_mgwalkoff(self, method) : nullptr;
+    if (g_rs.active && g_rs.tWalkOff < 0) g_rs.tWalkOff = nowMs() - g_rs.t0;
+    rsEvent("WalkToOffset() coroutine created");
+    return r;
+}
+static void hk_rpcscanner(void *self, uint64_t value, const void *method) {
+    bool on = (value & 0xff) != 0;
+    const char *by = g_ownCall ? "MENU" : "GAME";
+    if (!g_ownCall && on && !g_rs.active) rsStart(nullptr, nowMs(), "RpcSetScanner(true) seen without Begin");
+    if (g_rs.active && !g_ownCall) {
+        long rel = nowMs() - g_rs.t0;
+        if (on) { if (g_rs.tOn < 0) g_rs.tOn = rel; }
+        else if (g_rs.tOff < 0) g_rs.tOff = rel;
+    }
+    rsEvent("PlayerControl.RpcSetScanner(%s) by=%s (this is the hologram)", on ? "true" : "false", by);
+    if (orig_rpcscanner) orig_rpcscanner(self, value, method);
+}
+static void hk_updsys(void *self, uint64_t sys, uint64_t amt, const void *method) {
+    if ((sys & 0xff) == kSysMedBay) {
+        unsigned a = (unsigned)(amt & 0xff);
+        const char *kind = (a & 128) ? "Request" : ((a & 64) ? "Release" : "other");
+        if (g_rs.active && !g_ownCall) {
+            long rel = nowMs() - g_rs.t0;
+            if (a & 128) { if (g_rs.tReq < 0) g_rs.tReq = rel; }
+            else if (a & 64) { if (g_rs.tRel < 0) g_rs.tRel = rel; }
+        }
+        rsEvent("ShipStatus.RpcUpdateSystem(MedBay) amount=%u (%s, player id %u) by=%s", a, kind, a & 31u, g_ownCall ? "MENU" : "GAME");
+    }
+    if (orig_updsys) orig_updsys(self, sys, amt, method);
+}
+static void hk_rpcsnap(void *self, float x, float y, const void *method) {
+    if (g_rs.active && self && self == g_localNT) {
+        g_rs.snaps++;
+        rsEvent("CustomNetworkTransform.RpcSnapTo(%.3f, %.3f) by=%s", x, y, g_ownCall ? "MENU" : "GAME");
+    }
+    if (orig_rpcsnap) orig_rpcsnap(self, x, y, method);
+}
+static void hk_snap(void *self, float x, float y, const void *method) {
+    if (g_rs.active && self && self == g_localNT) {
+        g_rs.snaps++;
+        rsEvent("CustomNetworkTransform.SnapTo(%.3f, %.3f) by=%s", x, y, g_ownCall ? "MENU" : "GAME");
+    }
+    if (orig_snap) orig_snap(self, x, y, method);
+}
+
+// ---- sampler: runs on the Unity thread (from hk_fixed) inside guarded(); NOT called from a hook
+static void rsSampleFn(void *) {
+    if (!g_rs.active) return;
+    void *local = nullptr;
+    if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
+    if (!local) return;
+    long now = nowMs();
+    long rel = now - g_rs.t0;
+
+    if (f_NetTransform) { void *nt = nullptr; p_field_get_value(local, f_NetTransform, &nt); g_localNT = nt; }
+
+    if (!g_rs.spotDone) {
+        g_rs.spotDone = true;
+        void *ship = staticObj(f_ShipInst, m_ShipInst);
+        if (ship && f_ShipMedScanner && m_ScanPos) {
+            void *sc = nullptr;
+            p_field_get_value(ship, f_ShipMedScanner, &sc);
+            if (sc) {
+                bool ok = false;
+                void *r = invokeRaw(m_ScanPos, sc, nullptr, "MedScanner.get_Position", &ok);
+                float v[3] = {0, 0, 0};
+                if (ok && readVec(r, v, 3)) {
+                    float off[3] = {0, 0, 0};
+                    if (f_ScanOffset) p_field_get_value(sc, f_ScanOffset, off);
+                    memcpy(g_rs.spot3, v, sizeof(v));
+                    memcpy(g_rs.off3, off, sizeof(off));
+                    g_rs.haveSpot = true;
+                }
+            }
+        }
+        if (f_PlayerId) { uint64_t b = 0; p_field_get_value(local, f_PlayerId, &b); g_rs.pid = (unsigned)(b & 0xff); }
+        if (g_rs.haveSpot)
+            LOGQ("MENUTEST REALSCAN t+%ldms HEADER player id=%u | MedScanner.Position=(%.3f, %.3f, %.3f) Offset=(%.3f, %.3f, %.3f) Position+Offset=(%.3f, %.3f)", rel, g_rs.pid,
+                 g_rs.spot3[0], g_rs.spot3[1], g_rs.spot3[2], g_rs.off3[0], g_rs.off3[1], g_rs.off3[2], g_rs.spot3[0] + g_rs.off3[0], g_rs.spot3[1] + g_rs.off3[1]);
+        else
+            LOGQ("MENUTEST REALSCAN t+%ldms HEADER player id=%u | scanner position could not be read (no map / name missing)", rel, g_rs.pid);
+    }
+
+    float cur[2] = {0, 0};
+    bool haveCur = getPos2(local, cur);
+    bool mv = false, haveMv = false;
+    if (f_pcMoveable) haveMv = readBoolField(local, f_pcMoveable, &mv);
+    unsigned scn = 0;
+    bool haveScn = false;
+    if (f_pcScannerCount) { uint64_t b = 0; p_field_get_value(local, f_pcScannerCount, &b); scn = (unsigned)(b & 0xff); haveScn = true; }
+
+    int state = -1, curUser = -1, users = -1;
+    float timer = -1.f, dur = -1.f;
+    if (g_rs.mg) {
+        uint64_t b = 0;
+        if (f_mgState) { b = 0; p_field_get_value(g_rs.mg, f_mgState, &b); state = (int)(uint32_t)(b & 0xffffffffu); }
+        if (f_mgScanTimer) { b = 0; p_field_get_value(g_rs.mg, f_mgScanTimer, &b); memcpy(&timer, &b, 4); }
+        if (f_mgScanDur) { b = 0; p_field_get_value(g_rs.mg, f_mgScanDur, &b); memcpy(&dur, &b, 4); }
+        void *msys = nullptr;
+        if (f_mgMedscan) p_field_get_value(g_rs.mg, f_mgMedscan, &msys);
+        if (msys) {
+            if (f_msCur) { b = 0; p_field_get_value(msys, f_msCur, &b); curUser = (int)(b & 0xff); }
+            if (f_msUsers) {
+                void *lst = nullptr;
+                p_field_get_value(msys, f_msUsers, &lst);
+                if (lst) {
+                    if (!f_listSize) f_listSize = findField(p_object_get_class(lst), "_size");
+                    if (f_listSize) { b = 0; p_field_get_value(lst, f_listSize, &b); users = (int)(uint32_t)(b & 0xffffffffu); }
+                }
+            }
+        }
+        if (timer > g_rs.timerMax && timer < 1000.f) g_rs.timerMax = timer;
+        if (dur > 0.f && dur < 1000.f) g_rs.durSeen = dur;
+        if (state != g_rs.lastState) {
+            LOGQ("MENUTEST REALSCAN t+%ldms EVENT minigame state %d -> %d (0 None, 1 WalkingToPad, 2 WalkingToOffset) at pos=(%.3f, %.3f)", rel, g_rs.lastState, state, cur[0], cur[1]);
+            if (state >= 0 && state < 3 && g_rs.tState[state] < 0) g_rs.tState[state] = rel;
+            g_rs.lastState = state;
+        }
+    }
+    if (haveMv && (int)mv != g_rs.lastMove) {
+        LOGQ("MENUTEST REALSCAN t+%ldms EVENT PlayerControl.moveable %d -> %d", rel, g_rs.lastMove, mv ? 1 : 0);
+        g_rs.lastMove = mv ? 1 : 0;
+    }
+    if (haveScn && (int)scn != g_rs.lastScnCnt) {
+        LOGQ("MENUTEST REALSCAN t+%ldms EVENT PlayerControl.scannerCount %d -> %u", rel, g_rs.lastScnCnt, scn);
+        g_rs.lastScnCnt = (int)scn;
+    }
+
+    float step = 0.f, spd = 0.f;
+    bool jump = false;
+    if (haveCur) {
+        if (!g_rs.haveStart) { g_rs.haveStart = true; g_rs.startX = cur[0]; g_rs.startY = cur[1]; }
+        if (g_rs.haveLast && now > g_rs.lastT) {
+            step = dist2(cur[0], cur[1], g_rs.lastX, g_rs.lastY);
+            spd = step / ((float)(now - g_rs.lastT) / 1000.f);
+            if (step > 1.0f) { jump = true; g_rs.jumps++; }
+            else if (spd > g_rs.maxSpd) { g_rs.maxSpd = spd; g_rs.maxSpdAt = rel; }
+        }
+        g_rs.haveLast = true; g_rs.lastX = cur[0]; g_rs.lastY = cur[1]; g_rs.lastT = now;
+        if (g_rs.tOn >= 0 && !g_rs.haveStand) { g_rs.haveStand = true; g_rs.standX = cur[0]; g_rs.standY = cur[1]; }
+    }
+    g_rs.samples++;
+
+    char dpart[120];
+    dpart[0] = 0;
+    if (g_rs.haveSpot && haveCur)
+        snprintf(dpart, sizeof(dpart), " dPad=%.3f dPad+Off=%.3f", dist2(cur[0], cur[1], g_rs.spot3[0], g_rs.spot3[1]),
+                 dist2(cur[0], cur[1], g_rs.spot3[0] + g_rs.off3[0], g_rs.spot3[1] + g_rs.off3[1]));
+    char mpart[160];
+    if (g_rs.mg) snprintf(mpart, sizeof(mpart), " state=%d timer=%.2f/%.2f cur=%d users=%d", state, timer, dur, curUser, users);
+    else snprintf(mpart, sizeof(mpart), " minigame=gone");
+    LOGQ("MENUTEST REALSCAN t+%ldms S pos=(%.3f, %.3f)%s step=%.3f spd=%.2f moveable=%d scannerCount=%u%s%s", rel, cur[0], cur[1], dpart, step, spd,
+         haveMv ? (mv ? 1 : 0) : -1, scn, mpart, jump ? " JUMP" : "");
+
+    if (g_rs.closeAtAbs && now >= g_rs.closeAtAbs + 1500) { rsFinish("task closed + 1.5 s"); return; }
+    if (rel > 60000) { rsFinish("60 s limit"); return; }
+}
+static void rsRefreshNTFn(void *) {
+    void *local = nullptr;
+    if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
+    if (local && f_NetTransform) { void *nt = nullptr; p_field_get_value(local, f_NetTransform, &nt); g_localNT = nt; }
+}
+static void realScanTick() {
+    if (!g_rsHooks.load(std::memory_order_relaxed)) return;
+    long now = nowMs();
+    if (!g_rs.active) {
+        if (now - g_rsNtAt > 3000) { g_rsNtAt = now; if (!guarded(rsRefreshNTFn, nullptr)) LOGQ("MENUTEST REALSCAN rsRefreshNTFn FAULT"); }
+        return;
+    }
+    if (now < g_rs.nextAt) return;
+    g_rs.nextAt = now + 45;
+    if (!guarded(rsSampleFn, nullptr)) {
+        LOGI("MENUTEST REALSCAN rsSampleFn FAULT");
+        rsFinish("fault in the sampler");
+    }
+}
+
+// ---- install (called once from the watcher thread, each step via guarded())
+static bool rsHook(const char *label, void *m, void *repl, void **orig, void *baseM, bool wantVoid) {
+    if (!m) { LOGI("MENUTEST REALSCAN hook %s: method not found, skipped", label); return false; }
+    if (baseM && baseM == m) { LOGI("MENUTEST REALSCAN hook %s: same method as the base class, skipped (would hit every minigame)", label); return false; }
+    void *tgt = *(void **)m;
+    if (!tgt || !inIl2cppText((unsigned long)tgt)) { LOGI("MENUTEST REALSCAN hook %s: code pointer %p is not inside libil2cpp, skipped", label, tgt); return false; }
+    if (wantVoid && p_method_get_return_type) {
+        void *rt = p_method_get_return_type(m);
+        if (!rt || p_type_get_type(rt) != 0x01) { LOGI("MENUTEST REALSCAN hook %s: return type is not void, skipped", label); return false; }
+    }
+    int r = DobbyHook(tgt, repl, orig);
+    bool ok = (r == 0 && *orig);
+    LOGI("MENUTEST REALSCAN hook %s %s (r=%d target=%p)", label, ok ? "installed" : "NOT installed", r, tgt);
+    if (!ok) *orig = nullptr;
+    return ok;
+}
+static void installRealScanFn(void *) {
+    void *kMG = p_class_from_name(g_image, "", "MedScanMinigame");
+    void *kMini = p_class_from_name(g_image, "", "Minigame");
+    void *kMSys = p_class_from_name(g_image, "", "MedScanSystem");
+    void *kNT = p_class_from_name(g_image, "", "CustomNetworkTransform");
+    LOGI("MENUTEST REALSCAN classes: MedScanMinigame=%p Minigame=%p MedScanSystem=%p CustomNetworkTransform=%p", kMG, kMini, kMSys, kNT);
+    f_pcMoveable = findField(k_PlayerControl, "moveable");
+    f_pcScannerCount = findField(k_PlayerControl, "scannerCount");
+    if (kMSys) {
+        f_msCur = findField(kMSys, "<CurrentUser>k__BackingField");
+        if (!f_msCur) f_msCur = findField(kMSys, "CurrentUser");
+        f_msUsers = findField(kMSys, "UsersList");
+    }
+    int n = 0;
+    if (kMG) {
+        f_mgMedscan = findField(kMG, "medscan");
+        f_mgScanDur = findField(kMG, "ScanDuration");
+        f_mgScanTimer = findField(kMG, "ScanTimer");
+        f_mgState = findField(kMG, "state");
+        m_MGBegin = findMethod(kMG, "Begin", 1);
+        m_MGClose = findMethod(kMG, "Close", 0);
+        m_MGWalkPad = findMethod(kMG, "WalkToPad", 0);
+        m_MGWalkOff = findMethod(kMG, "WalkToOffset", 0);
+        void *bBegin = kMini ? findMethod(kMini, "Begin", 1) : nullptr;
+        void *bClose = kMini ? findMethod(kMini, "Close", 0) : nullptr;
+        if (rsHook("MedScanMinigame.Begin", m_MGBegin, (void *)hk_mgbegin, (void **)&orig_mgbegin, bBegin, true)) n++;
+        if (rsHook("MedScanMinigame.Close", m_MGClose, (void *)hk_mgclose, (void **)&orig_mgclose, bClose, true)) n++;
+        if (rsHook("MedScanMinigame.WalkToPad", m_MGWalkPad, (void *)hk_mgwalkpad, (void **)&orig_mgwalkpad, nullptr, false)) n++;
+        if (rsHook("MedScanMinigame.WalkToOffset", m_MGWalkOff, (void *)hk_mgwalkoff, (void **)&orig_mgwalkoff, nullptr, false)) n++;
+    } else {
+        LOGI("MENUTEST REALSCAN class MedScanMinigame not found in this build: no minigame hooks");
+    }
+    LOGI("MENUTEST REALSCAN fields: medscan=%p ScanDuration=%p ScanTimer=%p state=%p | MedScanSystem CurrentUser=%p UsersList=%p | moveable=%p scannerCount=%p",
+         f_mgMedscan, f_mgScanDur, f_mgScanTimer, f_mgState, f_msCur, f_msUsers, f_pcMoveable, f_pcScannerCount);
+    if (rsHook("PlayerControl.RpcSetScanner", m_RpcSetScanner, (void *)hk_rpcscanner, (void **)&orig_rpcscanner, nullptr, true)) n++;
+    if (rsHook("ShipStatus.RpcUpdateSystem(byte)", m_RpcUpdateSysByte, (void *)hk_updsys, (void **)&orig_updsys, nullptr, true)) n++;
+    m_SnapTo = kNT ? findMethod(kNT, "SnapTo", 1) : nullptr;
+    if (rsHook("CustomNetworkTransform.RpcSnapTo", m_RpcSnapTo, (void *)hk_rpcsnap, (void **)&orig_rpcsnap, nullptr, true)) n++;
+    if (rsHook("CustomNetworkTransform.SnapTo", m_SnapTo, (void *)hk_snap, (void **)&orig_snap, nullptr, true)) n++;
+    LOGI("MENUTEST REALSCAN installed %d hook(s). Do the REAL Submit Scan task now; lines start with REALSCAN.", n);
+    if (n > 0) g_rsHooks.store(1);
+}
+
 // ---------------------------------------------------------------- main-thread dispatch: hook on PlayerControl::FixedUpdate
 typedef void (*fn_fixedupdate_t)(void *self, const void *method);
 static fn_fixedupdate_t orig_fixed = nullptr;
 
-static std::atomic<int> g_slowLogged{0};
 static void hk_fixed(void *self, const void *method) {
     if (orig_fixed) orig_fixed(self, method);
-    const long tu0 = nowUs();
     if (g_req.load(std::memory_order_relaxed) && g_req.exchange(false)) runRequest();
     if (g_reqPlayers.load(std::memory_order_relaxed) && g_reqPlayers.exchange(false)) runPlayers();
     if (g_reqHostInfo.load(std::memory_order_relaxed) && g_reqHostInfo.exchange(false)) runHostInfo();
     if (g_reqVisual.load(std::memory_order_relaxed) != 0) runVisual();
     visualTick();
-    if (kNameTickAuto) nameTick(1500);
+    realScanTick();
+    nameTick(1500);
     logTick();
-    const long dtu = nowUs() - tu0;   // v17b: how long the menu's own work took inside this FixedUpdate call (lag diagnosis)
-    if (dtu > 4000 && g_slowLogged.fetch_add(1) < 60) LOGI("MENUTEST SLOW menu work in FixedUpdate hook: %ld us", dtu);
 }
 
 // v11: observer hook on PlayerControl::CoSetRole(role, canOverride). It only LOGS (no il2cpp calls, no guarded()), so it cannot
@@ -1670,6 +1995,13 @@ static void *watcher(void *) {
         LOGI("MENUTEST SelectRoles log hook skipped (method not found)");
     }
 
+    // v18: passive REAL Submit Scan logger. Each resolve step is its own guarded() call (guarded() is not recursive).
+    if (guarded(resolveExtraFn, nullptr) && guarded(resolveHostFn, nullptr) && guarded(resolveVisualFn, nullptr)) {
+        if (!guarded(installRealScanFn, nullptr)) LOGI("MENUTEST REALSCAN installRealScanFn FAULT: logger not (fully) installed");
+    } else {
+        LOGI("MENUTEST REALSCAN: a resolve step faulted, the real-scan logger is NOT installed");
+    }
+
     g_state.store(ST_READY);
     setStatus("Menu ready (%s). Join a match and press 'Complete my tasks'.",
               g_hooked.load() ? "main-thread mode" : "helper-thread mode, less safe");
@@ -1688,7 +2020,8 @@ static void *watcher(void *) {
         if (g_reqHostInfo.exchange(false)) runHostInfo();
         if (g_reqVisual.load() != 0) runVisual();
         visualTick();
-        if (kNameTickAuto) nameTick(1500);
+        realScanTick();
+        nameTick(1500);
         logTick();
     }
     return nullptr;
@@ -1696,7 +2029,7 @@ static void *watcher(void *) {
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v17 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v18 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
