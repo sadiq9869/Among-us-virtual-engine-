@@ -16,10 +16,12 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
@@ -46,6 +48,9 @@ object NativeMenu {
     // v16 visual tasks: which = 1 Submit Scan, 2 Clear Asteroids, 3 Empty Trash, 4 Prime Shields
     external fun requestVisual(which: Int): Int
     external fun visualText(): String
+    // v21 lag test: 0 = menu work OFF (soft), 1 = menu work ON, 2 = unhook ALL hooks (until the game is restarted)
+    // returns 1 done/accepted, 0 menu not ready, -1 not in hook mode, 2 already unhooked
+    external fun lagMode(mode: Int): Int
 }
 
 /**
@@ -104,6 +109,7 @@ object GameMenu {
         try {
             if (application == null || registered) return
             registered = true
+            startUiProbe()
             application.registerActivityLifecycleCallbacks(
                 object : Application.ActivityLifecycleCallbacks {
                     override fun onActivityResumed(activity: Activity) {
@@ -128,6 +134,48 @@ object GameMenu {
         } catch (t: Throwable) {
             Log.e(TAG, "init failed: $t")
         }
+    }
+
+    // ---- v21 UI-thread probe: every 200 ms a tiny message is posted to the Android main (UI) thread and the delay until it runs
+    // is measured. A big delay = the UI thread is busy (touch events for kill/chat/move wait behind it). One log line per 5 s.
+    private val uiProbeStarted = AtomicBoolean(false)
+    private val uiMax = AtomicLong(0)
+    private val uiSum = AtomicLong(0)
+    private val uiCnt = AtomicLong(0)
+    private val uiSlow = AtomicLong(0)
+
+    private fun startUiProbe() {
+        if (!uiProbeStarted.compareAndSet(false, true)) return
+        val th = Thread {
+            var lastLog = SystemClock.uptimeMillis()
+            while (true) {
+                try {
+                    val t0 = SystemClock.uptimeMillis()
+                    ui.post {
+                        val d = SystemClock.uptimeMillis() - t0
+                        uiCnt.incrementAndGet()
+                        uiSum.addAndGet(d)
+                        if (d > 100) uiSlow.incrementAndGet()
+                        var cur = uiMax.get()
+                        while (d > cur && !uiMax.compareAndSet(cur, d)) cur = uiMax.get()
+                    }
+                    Thread.sleep(200)
+                    val now = SystemClock.uptimeMillis()
+                    if (now - lastLog >= 5000) {
+                        lastLog = now
+                        val cnt = uiCnt.getAndSet(0)
+                        val sum = uiSum.getAndSet(0)
+                        val mx = uiMax.getAndSet(0)
+                        val slow = uiSlow.getAndSet(0)
+                        Log.i("MENUTEST", "PROBE-UI 5s: uiThreadDelay samples=$cnt avg=${if (cnt > 0) sum / cnt else 0}ms max=${mx}ms over100ms=$slow")
+                    }
+                } catch (e: Throwable) {
+                }
+            }
+        }
+        th.isDaemon = true
+        th.name = "menuprobe-ui"
+        th.start()
     }
 
     private fun dp(activity: Activity, v: Int): Int =
@@ -214,14 +262,19 @@ object GameMenu {
         consoleBtn.text = "Console (logs)"
         consoleBtn.isAllCaps = false
         panel.addView(consoleBtn)
+
+        val lagBtn = Button(activity)
+        lagBtn.text = "Lag test"
+        lagBtn.isAllCaps = false
+        panel.addView(lagBtn)
         panel.addView(closeBtn)
 
         // compact buttons so the panel (now 6 buttons) fits on a landscape phone screen
-        for (b in listOf(completeBtn, visualBtn, playersBtn, hostBtn, consoleBtn, closeBtn)) {
+        for (b in listOf(completeBtn, visualBtn, playersBtn, hostBtn, consoleBtn, lagBtn, closeBtn)) {
             b.minHeight = 0
             b.minimumHeight = 0
             b.textSize = 13f
-            b.setPadding(dp(activity, 8), dp(activity, 6), dp(activity, 8), dp(activity, 6))
+            b.setPadding(dp(activity, 8), dp(activity, 3), dp(activity, 8), dp(activity, 3))   // v21: 7 buttons now, so a bit more compact
         }
 
         val panelLp = FrameLayout.LayoutParams(dp(activity, 270), ViewGroup.LayoutParams.WRAP_CONTENT)
@@ -488,6 +541,122 @@ object GameMenu {
         visLp.topMargin = dp(activity, 16)
         overlay.addView(visBox, visLp)
 
+        // ---- v21 lag test box: find out what causes the lag by switching parts off while playing
+        val lagBox = LinearLayout(activity)
+        lagBox.orientation = LinearLayout.VERTICAL
+        lagBox.visibility = View.GONE
+        lagBox.background = cbg.constantState?.newDrawable()?.mutate() ?: cbg
+        lagBox.setPadding(dp(activity, 8), dp(activity, 8), dp(activity, 8), dp(activity, 8))
+        val lagTitle = TextView(activity)
+        lagTitle.setTextColor(Color.WHITE)
+        lagTitle.textSize = 13f
+        lagTitle.text = "Lag test (keep the Console CLOSED while testing)"
+        lagBox.addView(lagTitle)
+        val lagInfo = TextView(activity)
+        lagInfo.typeface = Typeface.MONOSPACE
+        lagInfo.textSize = 10f
+        lagInfo.setTextColor(Color.argb(255, 205, 210, 225))
+        lagInfo.text = "1) Play normally and press 'Lag mark' whenever it lags.\n" +
+            "2) 'Hide menu 60 s': menu fully hidden for 60 s, comes back alone.\n" +
+            "3) 'Menu work OFF': the hook only calls the game (undo: ON).\n" +
+            "4) 'Unhook ALL': every hook removed, game fully original. Menu features stop until you restart the game.\n" +
+            "Then Console > Copy log and send it."
+        val lagScroll = ScrollView(activity)
+        lagScroll.addView(lagInfo)
+        lagBox.addView(lagScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        val lagMarkBtn = Button(activity)
+        lagMarkBtn.text = "Lag mark"
+        val lagHideBtn = Button(activity)
+        lagHideBtn.text = "Hide menu 60 s"
+        val lagSoftBtn = Button(activity)
+        lagSoftBtn.text = "Menu work OFF"
+        val lagUnhookBtn = Button(activity)
+        lagUnhookBtn.text = "Unhook ALL"
+        val lagCloseBtn = Button(activity)
+        lagCloseBtn.text = "Hide"
+        for (b in listOf(lagMarkBtn, lagHideBtn, lagSoftBtn, lagUnhookBtn, lagCloseBtn)) {
+            b.isAllCaps = false
+            b.minHeight = 0
+            b.minimumHeight = 0
+            b.textSize = 12f
+            b.setPadding(dp(activity, 6), dp(activity, 4), dp(activity, 6), dp(activity, 4))
+        }
+        val lagRow1 = LinearLayout(activity)
+        lagRow1.orientation = LinearLayout.HORIZONTAL
+        val lagRow2 = LinearLayout(activity)
+        lagRow2.orientation = LinearLayout.HORIZONTAL
+        val lagBtnLp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        lagRow1.addView(lagMarkBtn, lagBtnLp)
+        lagRow1.addView(lagHideBtn, lagBtnLp)
+        lagRow2.addView(lagSoftBtn, lagBtnLp)
+        lagRow2.addView(lagUnhookBtn, lagBtnLp)
+        lagBox.addView(lagRow1)
+        lagBox.addView(lagRow2)
+        lagBox.addView(lagCloseBtn)
+        val lagLp = FrameLayout.LayoutParams(consoleLp.width, consoleLp.height)
+        lagLp.gravity = Gravity.TOP or Gravity.START
+        lagLp.leftMargin = dp(activity, 296)
+        lagLp.topMargin = dp(activity, 16)
+        overlay.addView(lagBox, lagLp)
+
+        var lagMarkCount = 0
+        var hideSeq = 0
+        var softOff = false
+        lagMarkBtn.setOnClickListener {
+            lagMarkCount++
+            Log.i("MENUTEST", "LAGMARK #$lagMarkCount (the user feels lag right now)")
+            lagInfo.text = "Lag mark #$lagMarkCount written to the log."
+        }
+        lagHideBtn.setOnClickListener {
+            hideSeq++
+            val mySeq = hideSeq
+            Log.i("MENUTEST", "LAGTEST menu HIDDEN for 60 s (overlay GONE)")
+            overlay.visibility = View.GONE
+            ui.postDelayed({
+                if (mySeq == hideSeq) {
+                    overlay.visibility = View.VISIBLE
+                    Log.i("MENUTEST", "LAGTEST menu visible again")
+                }
+            }, 60000)
+        }
+        lagSoftBtn.setOnClickListener {
+            val r = try {
+                NativeMenu.lagMode(if (softOff) 1 else 0)
+            } catch (t: Throwable) {
+                -2
+            }
+            if (r == 1) {
+                softOff = !softOff
+                lagSoftBtn.text = if (softOff) "Menu work ON" else "Menu work OFF"
+                lagInfo.text = if (softOff) "Menu work is OFF: the hook only calls the game. Play and watch the lag." else "Menu work is ON again."
+            } else {
+                lagInfo.text = "Menu work switch: not available (result $r). 0 = menu not ready yet, -1 = no hook mode, -2 = native library missing."
+            }
+        }
+        lagUnhookBtn.setOnClickListener {
+            val r = try {
+                NativeMenu.lagMode(2)
+            } catch (t: Throwable) {
+                -2
+            }
+            lagInfo.text = when (r) {
+                1 -> "Unhook ALL requested: all hooks are removed on the next game frame (see 'LAGTEST' lines in the log). Menu features stop until you restart the game."
+                2 -> "Hooks are already removed."
+                -1 -> "No hooks were installed (helper-thread mode)."
+                0 -> "Menu not ready yet."
+                else -> "Native library missing ($r)."
+            }
+            Log.i("MENUTEST", "LAGTEST unhook ALL pressed -> $r")
+        }
+        lagCloseBtn.setOnClickListener { lagBox.visibility = View.GONE }
+        lagBtn.setOnClickListener {
+            console.visibility = View.GONE
+            players.visibility = View.GONE
+            hostBox.visibility = View.GONE
+            visBox.visibility = View.GONE
+            lagBox.visibility = View.VISIBLE
+        }
+
         fun refreshVisual() {
             try {
                 visInfoView.text = NativeMenu.visualText()
@@ -510,6 +679,7 @@ object GameMenu {
         shieldBtn.setOnClickListener { pressVisual(4) }
         visHideBtn.setOnClickListener { visBox.visibility = View.GONE }
         visualBtn.setOnClickListener {
+            lagBox.visibility = View.GONE
             console.visibility = View.GONE
             players.visibility = View.GONE
             hostBox.visibility = View.GONE
@@ -534,6 +704,7 @@ object GameMenu {
             }
         }
         playersBtn.setOnClickListener {
+            lagBox.visibility = View.GONE
             console.visibility = View.GONE
             hostBox.visibility = View.GONE
             visBox.visibility = View.GONE
@@ -541,6 +712,7 @@ object GameMenu {
             refreshPlayers()
         }
         consoleBtn.setOnClickListener {
+            lagBox.visibility = View.GONE
             players.visibility = View.GONE
             hostBox.visibility = View.GONE
             visBox.visibility = View.GONE
@@ -559,6 +731,7 @@ object GameMenu {
         ui.postDelayed(playersRefresher, 1000)
 
         hostBtn.setOnClickListener {
+            lagBox.visibility = View.GONE
             console.visibility = View.GONE
             players.visibility = View.GONE
             visBox.visibility = View.GONE
@@ -633,7 +806,7 @@ object GameMenu {
                 else -> false
             }
         }
-        closeBtn.setOnClickListener { panel.visibility = View.GONE; console.visibility = View.GONE; players.visibility = View.GONE; hostBox.visibility = View.GONE; visBox.visibility = View.GONE }
+        closeBtn.setOnClickListener { panel.visibility = View.GONE; console.visibility = View.GONE; players.visibility = View.GONE; hostBox.visibility = View.GONE; visBox.visibility = View.GONE; lagBox.visibility = View.GONE }
 
         // keep the status line fresh while the panel is open
         val refresher = object : Runnable {
