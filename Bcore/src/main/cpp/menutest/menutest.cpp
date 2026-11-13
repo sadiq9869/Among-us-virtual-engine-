@@ -1,4 +1,4 @@
-// MENUTEST v20 = v19 + LAG PROBE (PROBE-HOOK / PROBE-CPU lines every 5 s: lobby/match, per-thread CPU, FixedUpdate gaps, menu cost) + nameTick no longer runs every 1.5 s. Java side: NativeCore PROBE-JAVA line.
+// MENUTEST v21 = v20 lag probe (PROBE-HOOK / PROBE-CPU / PROBE-SYS every 5 s) + LAG TEST switches (JNI lagMode: menu work OFF soft, Unhook ALL) + run-queue wait (schedstat), cpu freq, temperature. Java side: NativeCore PROBE-JAVA, GameMenu PROBE-UI.
 // MENUTEST v19 = v17 + REALSCAN logger REMOVED + Submit Scan like the REAL task (numbers from the user's REALSCAN log, build 2026.11.3):
 //   request first, WALK (game physics: PlayerPhysics.SetNormalizedVelocity, leg animation, ~2.5 units/s, slows near the pad) to
 //   MedScannerBehaviour.Position (the real task stood 0.021 from Position, NOT at Position+Offset), then hologram ON 10 s, OFF, release.
@@ -1457,6 +1457,16 @@ static void probePhaseTick() {   // every 5 s, Unity thread: resolve once (one-t
     guarded(phaseFn, nullptr);
 }
 
+// v21 LAG TEST switches (set from the menu's "Lag test" box through JNI lagMode(); read here on the Unity thread)
+//   g_menuWork = 0 : "Menu work OFF" = hk_fixed only calls the game's own FixedUpdate (soft switch, reversible, hook stays installed)
+//   g_hookCmd  = 1 : "Unhook ALL" = DobbyDestroy on every hook (executed at the END of hk_fixed, i.e. on the Unity thread). NOT reversible
+//                    until the game is restarted (re-hooking from another thread while the game runs the function could crash it).
+static std::atomic<int> g_menuWork{1};
+static std::atomic<int> g_hookCmd{0};
+static std::atomic<int> g_hooksActive{1};
+static void *g_tgtFixed = nullptr, *g_tgtRpc = nullptr, *g_tgtSel = nullptr, *g_tgtCo = nullptr;   // hook targets (for DobbyDestroy)
+static void applyHookCmd(int c);   // defined after hk_selectroles
+
 static void hk_fixed(void *self, const void *method) {
     const long t0 = kProbeOn ? nowUs() : 0;
     if (kProbeOn && g_lastCallUs) {
@@ -1466,13 +1476,15 @@ static void hk_fixed(void *self, const void *method) {
     }
     if (orig_fixed) orig_fixed(self, method);
     const long t1 = kProbeOn ? nowUs() : 0;
-    if (g_req.load(std::memory_order_relaxed) && g_req.exchange(false)) runRequest();
-    if (g_reqPlayers.load(std::memory_order_relaxed) && g_reqPlayers.exchange(false)) runPlayers();
-    if (g_reqHostInfo.load(std::memory_order_relaxed) && g_reqHostInfo.exchange(false)) runHostInfo();
-    if (g_reqVisual.load(std::memory_order_relaxed) != 0) runVisual();
-    visualTick();
-    // v20: nameTick(1500) is NOT called every 1.5 s any more (names are still refreshed right before SelectRoles in hk_selectroles)
-    logTick();
+    if (g_menuWork.load(std::memory_order_relaxed)) {
+        if (g_req.load(std::memory_order_relaxed) && g_req.exchange(false)) runRequest();
+        if (g_reqPlayers.load(std::memory_order_relaxed) && g_reqPlayers.exchange(false)) runPlayers();
+        if (g_reqHostInfo.load(std::memory_order_relaxed) && g_reqHostInfo.exchange(false)) runHostInfo();
+        if (g_reqVisual.load(std::memory_order_relaxed) != 0) runVisual();
+        visualTick();
+        // v20: nameTick(1500) is NOT called every 1.5 s any more (names are still refreshed right before SelectRoles in hk_selectroles)
+        logTick();
+    }
     if (kProbeOn) {
         probePhaseTick();
         const long t2 = nowUs();
@@ -1483,9 +1495,13 @@ static void hk_fixed(void *self, const void *method) {
         g_pMenuUs.fetch_add(t2 - t1, std::memory_order_relaxed);
         atomicMax(g_pMenuMaxUs, t2 - t1);
     }
+    {   // v21: "Unhook ALL" is executed last, we are still on the Unity thread inside the hook; nothing below uses the removed hooks
+        int hc = g_hookCmd.load(std::memory_order_relaxed);
+        if (hc) { g_hookCmd.store(0); applyHookCmd(hc); }
+    }
 }
 
-struct ProbeThr { int tid; unsigned long ticks; char name[20]; double pct; };
+struct ProbeThr { int tid; unsigned long ticks; char name[20]; double pct; unsigned long long waitNs; double wpct; };
 static ProbeThr g_prevThr[512];
 static int g_prevThrN = 0;
 static ProbeThr g_curThr[512];
@@ -1529,10 +1545,23 @@ static void *probeThreadMain(void *) {
                 if (sscanf(rp + 2, "%*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %lu %lu", &ut, &st) != 2) continue;
                 t.ticks = ut + st;
                 t.pct = 0;
+                t.waitNs = 0;
+                t.wpct = 0;
+                {   // v21: run-queue wait = time the thread was READY to run but had no CPU core ("run_ns wait_ns timeslices")
+                    char sp[64];
+                    snprintf(sp, sizeof(sp), "/proc/self/task/%d/schedstat", tid);
+                    FILE *sf = fopen(sp, "r");
+                    if (sf) {
+                        unsigned long long rn = 0, wn = 0;
+                        if (fscanf(sf, "%llu %llu", &rn, &wn) == 2) t.waitNs = wn;
+                        fclose(sf);
+                    }
+                }
                 for (int i = 0; i < g_prevThrN; i++) {
                     if (g_prevThr[i].tid == tid) {
                         unsigned long dtk = t.ticks >= g_prevThr[i].ticks ? t.ticks - g_prevThr[i].ticks : 0;
                         t.pct = (double)dtk * (1000.0 / (double)hz) / (double)dt * 100.0;
+                        if (t.waitNs >= g_prevThr[i].waitNs) t.wpct = (double)(t.waitNs - g_prevThr[i].waitNs) / ((double)dt * 1000000.0) * 100.0;
                         break;
                     }
                 }
@@ -1542,6 +1571,15 @@ static void *probeThreadMain(void *) {
         }
         double total = 0;
         for (int i = 0; i < n; i++) total += g_curThr[i].pct;
+        // the two threads that matter for "lag": the game's main thread and the Android UI thread (touch, overlay)
+        char key[200];
+        key[0] = 0;
+        for (int i = 0; i < n; i++) {
+            const char *tag = !strcmp(g_curThr[i].name, "UnityMain") ? "UnityMain" : (!strcmp(g_curThr[i].name, "loth.spacemafia") ? "UI(loth.spacemafia)" : nullptr);
+            if (!tag) continue;
+            size_t len = strlen(key);
+            snprintf(key + len, sizeof(key) - len, "%s%s cpu=%.0f%% waitForCpu=%.0f%%", len ? " | " : "", tag, g_curThr[i].pct, g_curThr[i].wpct);
+        }
         char top[400];
         top[0] = 0;
         for (int k = 0; k < 6; k++) {   // top 6 by pct (selection)
@@ -1549,9 +1587,33 @@ static void *probeThreadMain(void *) {
             for (int i = 0; i < n; i++) if (g_curThr[i].pct >= 0 && (best < 0 || g_curThr[i].pct > g_curThr[best].pct)) best = i;
             if (best < 0 || g_curThr[best].pct < 0.5) break;
             size_t len = strlen(top);
-            snprintf(top + len, sizeof(top) - len, "%s%s %.0f%%", len ? " | " : "", g_curThr[best].name, g_curThr[best].pct);
+            snprintf(top + len, sizeof(top) - len, "%s%s %.0f%% (wait %.0f%%)", len ? " | " : "", g_curThr[best].name, g_curThr[best].pct, g_curThr[best].wpct);
             g_curThr[best].pct = -1;
         }
+        // ---- cpu frequency (MHz, cpu0..7) and the hottest thermal zone (-1 = not readable on this phone)
+        char freq[160];
+        freq[0] = 0;
+        for (int c = 0; c < 8; c++) {
+            char p[96];
+            snprintf(p, sizeof(p), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", c);
+            long khz = -1;
+            FILE *ff = fopen(p, "r");
+            if (ff) { if (fscanf(ff, "%ld", &khz) != 1) khz = -1; fclose(ff); }
+            size_t len = strlen(freq);
+            snprintf(freq + len, sizeof(freq) - len, "%s%ld", c ? "," : "", khz > 0 ? khz / 1000 : -1L);
+        }
+        long maxT = -1;
+        int zones = 0;
+        for (int z = 0; z < 40; z++) {
+            char p[96];
+            snprintf(p, sizeof(p), "/sys/class/thermal/thermal_zone%d/temp", z);
+            FILE *tf = fopen(p, "r");
+            if (!tf) continue;
+            long tv = -1;
+            if (fscanf(tf, "%ld", &tv) == 1) { zones++; if (tv > maxT) maxT = tv; }
+            fclose(tf);
+        }
+        double maxC = maxT > 1000 ? maxT / 1000.0 : (double)maxT;
         // ---- memory / thread count
         long rssKb = -1, thr = -1;
         FILE *fs = fopen("/proc/self/status", "r");
@@ -1570,9 +1632,10 @@ static void *probeThreadMain(void *) {
         long origUs = g_pOrigUs.exchange(0), origMax = g_pOrigMaxUs.exchange(0), menuUs = g_pMenuUs.exchange(0), menuMax = g_pMenuMaxUs.exchange(0);
         int ph = g_phase.load();
         const char *phs = ph == 1 ? "MATCH" : (ph == 0 ? "LOBBY" : "?");
-        LOGQ("MENUTEST PROBE-HOOK phase=%s dt=%ldms | FixedUpdate calls=%ld gapMax=%ldms gap>100ms=%ld | game(orig) avg=%ldus max=%ldus | MENU part avg=%ldus max=%ldus total=%ldms",
-             phs, dt, calls, gapMax / 1000, gap100, calls ? origUs / calls : 0, origMax, calls ? menuUs / calls : 0, menuMax, menuUs / 1000);
-        LOGQ("MENUTEST PROBE-CPU phase=%s process=%.0f%% (100%% = one core) threads=%ld rss=%ldMB | top: %s", phs, total, thr, rssKb > 0 ? rssKb / 1024 : -1, top);
+        LOGQ("MENUTEST PROBE-HOOK phase=%s hooks=%s menuWork=%s dt=%ldms | FixedUpdate calls=%ld gapMax=%ldms gap>100ms=%ld | game(orig) avg=%ldus max=%ldus | MENU part avg=%ldus max=%ldus total=%ldms",
+             phs, g_hooksActive.load() ? "ON" : "OFF", g_menuWork.load() ? "ON" : "OFF", dt, calls, gapMax / 1000, gap100, calls ? origUs / calls : 0, origMax, calls ? menuUs / calls : 0, menuMax, menuUs / 1000);
+        LOGQ("MENUTEST PROBE-CPU phase=%s process=%.0f%% (100%% = one core) threads=%ld rss=%ldMB | %s | top: %s", phs, total, thr, rssKb > 0 ? rssKb / 1024 : -1, key, top);
+        LOGQ("MENUTEST PROBE-SYS phase=%s cpuMHz(cpu0..7)=%s | thermal zones readable=%d hottest=%.1fC", phs, freq, zones, maxC);
     }
     return nullptr;
 }
@@ -1656,6 +1719,23 @@ static void hk_selectroles(void *self, const void *method) {
     LOGI("MENUTEST SELECTROLES EXIT t=%ld swapped=%d", nowMs() % 1000000, g_displaced ? 1 : 0);
     g_assignLogAt.store(nowMs() + 2500);
     g_rpcLogged.store(0);
+}
+
+// v21: "Unhook ALL" (lag test). Runs on the Unity thread at the end of hk_fixed. The game goes back to its own original code
+// everywhere; the menu's game features stop working until the game is restarted. Other hooks first, FixedUpdate last.
+static void applyHookCmd(int c) {
+    if (c != 1 || !g_hooksActive.load()) return;
+    LOGI("MENUTEST LAGTEST unhook ALL: removing hooks (FixedUpdate=%p RpcSetRole=%p SelectRoles=%p CoSetRole=%p)", g_tgtFixed, g_tgtRpc, g_tgtSel, g_tgtCo);
+    if (g_tgtCo)  { int r = DobbyDestroy(g_tgtCo);  orig_cosetrole = nullptr;    LOGI("MENUTEST LAGTEST CoSetRole hook removed r=%d", r); }
+    if (g_tgtRpc) { int r = DobbyDestroy(g_tgtRpc); orig_rpcsetrole = nullptr;   LOGI("MENUTEST LAGTEST RpcSetRole hook removed r=%d", r); }
+    if (g_tgtSel) { int r = DobbyDestroy(g_tgtSel); orig_selectroles = nullptr;  LOGI("MENUTEST LAGTEST SelectRoles hook removed r=%d", r); }
+    g_hooksActive.store(0);
+    if (g_tgtFixed) {
+        LOGI("MENUTEST LAGTEST FixedUpdate hook removed next (the game runs the original code from now on)");
+        int r = DobbyDestroy(g_tgtFixed);
+        orig_fixed = nullptr;
+        LOGI("MENUTEST LAGTEST FixedUpdate hook removed r=%d", r);
+    }
 }
 
 // ---------------------------------------------------------------- watcher thread: waits, resolves, hooks
@@ -1786,6 +1866,7 @@ static void *watcher(void *) {
             int r = DobbyHook(target, (void *)hk_fixed, (void **)&orig_fixed);
             if (r == 0 && orig_fixed) {
                 g_hooked.store(true);
+                g_tgtFixed = target;
                 LOGI("MENUTEST hook on PlayerControl::FixedUpdate installed (target=%p)", target);
             } else {
                 LOGI("MENUTEST DobbyHook failed r=%d; using helper-thread fallback", r);
@@ -1804,7 +1885,7 @@ static void *watcher(void *) {
         if (rt && p_type_get_type(rt) == 0x01 && tgt && inIl2cppText((unsigned long)tgt)) {
             int r = DobbyHook(tgt, (void *)hk_cosetrole, (void **)&orig_cosetrole);
             LOGI("MENUTEST CoSetRole observer hook %s (r=%d target=%p)", (r == 0 && orig_cosetrole) ? "installed" : "NOT installed", r, tgt);
-            if (r != 0) orig_cosetrole = nullptr;
+            if (r != 0) orig_cosetrole = nullptr; else g_tgtCo = tgt;
         } else {
             LOGI("MENUTEST CoSetRole observer hook skipped: return type=0x%x (void is 0x1), target=%p, inside libil2cpp=%d",
                  rt ? p_type_get_type(rt) : -1, tgt, (tgt && inIl2cppText((unsigned long)tgt)) ? 1 : 0);
@@ -1820,7 +1901,7 @@ static void *watcher(void *) {
         if (rt && p_type_get_type(rt) == 0x01 && tgt && inIl2cppText((unsigned long)tgt)) {
             int r = DobbyHook(tgt, (void *)hk_rpcsetrole, (void **)&orig_rpcsetrole);
             LOGI("MENUTEST RpcSetRole log hook %s (r=%d target=%p)", (r == 0 && orig_rpcsetrole) ? "installed" : "NOT installed", r, tgt);
-            if (r != 0) orig_rpcsetrole = nullptr;
+            if (r != 0) orig_rpcsetrole = nullptr; else g_tgtRpc = tgt;
         } else {
             LOGI("MENUTEST RpcSetRole log hook skipped: return type=0x%x, target=%p", rt ? p_type_get_type(rt) : -1, tgt);
         }
@@ -1831,7 +1912,7 @@ static void *watcher(void *) {
         if (rt && p_type_get_type(rt) == 0x01 && tgt && inIl2cppText((unsigned long)tgt)) {
             int r = DobbyHook(tgt, (void *)hk_selectroles, (void **)&orig_selectroles);
             LOGI("MENUTEST SelectRoles log hook %s (r=%d target=%p)", (r == 0 && orig_selectroles) ? "installed" : "NOT installed", r, tgt);
-            if (r != 0) orig_selectroles = nullptr;
+            if (r != 0) orig_selectroles = nullptr; else g_tgtSel = tgt;
         } else {
             LOGI("MENUTEST SelectRoles log hook skipped: return type=0x%x, target=%p", rt ? p_type_get_type(rt) : -1, tgt);
         }
@@ -1841,7 +1922,7 @@ static void *watcher(void *) {
 
     if (kProbeOn) {   // v20: lag probe thread (reads /proc only; prints PROBE-HOOK / PROBE-CPU every 5 s)
         pthread_t pt;
-        if (pthread_create(&pt, nullptr, probeThreadMain, nullptr) == 0) { pthread_detach(pt); LOGI("MENUTEST v20 lag probe started (every 5 s)"); }
+        if (pthread_create(&pt, nullptr, probeThreadMain, nullptr) == 0) { pthread_detach(pt); LOGI("MENUTEST v21 lag probe started (every 5 s)"); }
         else LOGI("MENUTEST v20 lag probe: pthread_create failed");
     }
     g_state.store(ST_READY);
@@ -1869,7 +1950,7 @@ static void *watcher(void *) {
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v20 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v21 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
@@ -1945,6 +2026,24 @@ Java_top_niunaijun_blackboxa_menu_NativeMenu_requestHostInfo(JNIEnv *env, jobjec
     if (g_state.load() != ST_READY) return 0;
     g_reqHostInfo.store(true);
     return 1;
+}
+
+// v21 LAG TEST: mode 0 = "Menu work OFF" (soft: the hook stays, the menu does nothing), 1 = "Menu work ON",
+// 2 = "Unhook ALL" (DobbyDestroy on every hook, executed on the Unity thread; undone only by restarting the game).
+// Returns 1 = done/accepted, 0 = menu not ready, -1 = not in hook mode (helper-thread fallback), 2 = already unhooked.
+extern "C" JNIEXPORT jint JNICALL
+Java_top_niunaijun_blackboxa_menu_NativeMenu_lagMode(JNIEnv *env, jobject thiz, jint mode) {
+    if (g_state.load() != ST_READY) return 0;
+    if (mode == 0) { g_menuWork.store(0); LOGI("MENUTEST LAGTEST menu work OFF (soft)"); return 1; }
+    if (mode == 1) { g_menuWork.store(1); LOGI("MENUTEST LAGTEST menu work ON"); return 1; }
+    if (mode == 2) {
+        if (!g_hooked.load()) return -1;
+        if (!g_hooksActive.load()) return 2;
+        g_hookCmd.store(1);
+        LOGI("MENUTEST LAGTEST unhook ALL requested (runs on the next FixedUpdate)");
+        return 1;
+    }
+    return 0;
 }
 
 // v16: visual tasks. which: 1 = Submit Scan, 2 = Clear Asteroids, 3 = Empty Trash, 4 = Prime Shields. The work runs on the Unity thread.
