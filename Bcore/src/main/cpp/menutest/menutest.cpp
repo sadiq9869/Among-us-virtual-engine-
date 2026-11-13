@@ -1,4 +1,4 @@
-// MENUTEST v21 = v20 lag probe (PROBE-HOOK / PROBE-CPU / PROBE-SYS every 5 s) + LAG TEST switches (JNI lagMode: menu work OFF soft, Unhook ALL) + run-queue wait (schedstat), cpu freq, temperature. Java side: NativeCore PROBE-JAVA, GameMenu PROBE-UI.
+// MENUTEST v22 = v21 + C# SAMPLER (PROF lines: which C# methods the busy IL2CPP threads run) + per-thread system time. See PROBE-* lines every 5 s.
 // MENUTEST v19 = v17 + REALSCAN logger REMOVED + Submit Scan like the REAL task (numbers from the user's REALSCAN log, build 2026.11.3):
 //   request first, WALK (game physics: PlayerPhysics.SetNormalizedVelocity, leg animation, ~2.5 units/s, slows near the pad) to
 //   MedScannerBehaviour.Position (the real task stood 0.021 from Position, NOT at Position+Offset), then hologram ON 10 s, OFF, release.
@@ -234,6 +234,18 @@ static fn_string_chars_t p_string_chars;
 static fn_string_length_t p_string_length;
 static fn_method_get_return_type_t p_method_get_return_type;
 
+// v22: managed (C#) stack sampler API (all optional)
+typedef void **(*fn_thread_get_all_t)(size_t *size);
+typedef bool (*fn_thread_top_frame_t)(void *thread, void *frame);
+typedef bool (*fn_thread_frame_at_t)(void *thread, int offset, void *frame);
+typedef void *(*fn_method_get_class_t)(void *method);
+typedef const char *(*fn_class_get_ns_t)(void *klass);
+static fn_thread_get_all_t p_thread_get_all;
+static fn_thread_top_frame_t p_thread_top_frame;
+static fn_thread_frame_at_t p_thread_frame_at;
+static fn_method_get_class_t p_method_get_class;
+static fn_class_get_ns_t p_class_get_ns;
+
 static bool resolveAll(void *h) {
     struct Entry { const char *name; void **slot; bool required; };
     Entry entries[] = {
@@ -265,6 +277,11 @@ static bool resolveAll(void *h) {
         {"il2cpp_string_chars", (void **)&p_string_chars, false},
         {"il2cpp_string_length", (void **)&p_string_length, false},
         {"il2cpp_method_get_return_type", (void **)&p_method_get_return_type, false},
+        {"il2cpp_thread_get_all_attached_threads", (void **)&p_thread_get_all, false},
+        {"il2cpp_thread_get_top_frame", (void **)&p_thread_top_frame, false},
+        {"il2cpp_thread_get_frame_at", (void **)&p_thread_frame_at, false},
+        {"il2cpp_method_get_class", (void **)&p_method_get_class, false},
+        {"il2cpp_class_get_namespace", (void **)&p_class_get_ns, false},
     };
     bool ok = true;
     for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
@@ -1501,7 +1518,68 @@ static void hk_fixed(void *self, const void *method) {
     }
 }
 
-struct ProbeThr { int tid; unsigned long ticks; char name[20]; double pct; unsigned long long waitNs; double wpct; };
+// ---------------------------------------------------------------- v22 managed (C#) sampler
+// 10 times per second the TOP C# method of every thread known to il2cpp is read (il2cpp_thread_get_top_frame, read-only, under the crash
+// guard). Every 5 s the most frequent ones are printed as "MENUTEST PROF n x Tk Class::method <- caller". Tk = index of the thread in il2cpp's
+// thread list. This shows which C# code the busy "IL2CPP Threadpool" threads run. Set kProfOn=false to switch it off.
+static const bool kProfOn = true;
+struct ProfEnt { char text[200]; int count; };
+static ProfEnt g_prof[200];
+static int g_profN = 0, g_profSamples = 0, g_profFaults = 0, g_profNoFrame = 0;
+static void profAdd(const char *text) {
+    for (int i = 0; i < g_profN; i++) if (!strcmp(g_prof[i].text, text)) { g_prof[i].count++; return; }
+    if (g_profN < 200) { snprintf(g_prof[g_profN].text, sizeof(g_prof[g_profN].text), "%s", text); g_prof[g_profN].count = 1; g_profN++; }
+}
+static void methodLabel(void *m, char *out, size_t cap) {
+    const char *mn = p_method_get_name ? p_method_get_name(m) : nullptr;
+    void *k = p_method_get_class ? p_method_get_class(m) : nullptr;
+    const char *cn = (k && p_class_get_name) ? p_class_get_name(k) : nullptr;
+    const char *ns = (k && p_class_get_ns) ? p_class_get_ns(k) : nullptr;
+    snprintf(out, cap, "%s%s%s::%s", (ns && *ns) ? ns : "", (ns && *ns) ? "." : "", cn ? cn : "?", mn ? mn : "?");
+}
+static bool profReady() { return kProfOn && p_thread_get_all && p_thread_top_frame && p_method_get_name; }
+static void profSampleOnce(void *) {
+    size_t n = 0;
+    void **ths = p_thread_get_all(&n);
+    if (!ths || n == 0) return;
+    if (n > 64) n = 64;
+    for (size_t i = 0; i < n; i++) {
+        void *t = ths[i];
+        if (!t) continue;
+        alignas(16) unsigned char fr[256];
+        memset(fr, 0, sizeof(fr));
+        if (!p_thread_top_frame(t, fr)) { g_profNoFrame++; continue; }
+        void *m = *(void **)fr;   // Il2CppStackFrameInfo starts with the MethodInfo*
+        if (!m) { g_profNoFrame++; continue; }
+        char a[110], b[110], line[200];
+        methodLabel(m, a, sizeof(a));
+        b[0] = 0;
+        if (p_thread_frame_at) {
+            memset(fr, 0, sizeof(fr));
+            if (p_thread_frame_at(t, 1, fr)) {
+                void *m2 = *(void **)fr;
+                if (m2 && m2 != m) methodLabel(m2, b, sizeof(b));
+            }
+        }
+        snprintf(line, sizeof(line), "T%zu %s%s%s", i, a, b[0] ? " <- " : "", b);
+        profAdd(line);
+    }
+    g_profSamples++;
+}
+static void profPrintAndReset() {
+    if (!profReady()) return;
+    LOGQ("MENUTEST PROF-HEADER samples=%d faults=%d threadsWithoutManagedFrame=%d distinct=%d (10 Hz; Tk = k-th thread of il2cpp)", g_profSamples, g_profFaults, g_profNoFrame, g_profN);
+    for (int k = 0; k < 10; k++) {
+        int best = -1;
+        for (int i = 0; i < g_profN; i++) if (g_prof[i].count > 0 && (best < 0 || g_prof[i].count > g_prof[best].count)) best = i;
+        if (best < 0) break;
+        LOGQ("MENUTEST PROF %3d x %s", g_prof[best].count, g_prof[best].text);
+        g_prof[best].count = -g_prof[best].count;   // mark as printed
+    }
+    g_profN = 0; g_profSamples = 0; g_profFaults = 0; g_profNoFrame = 0;
+}
+
+struct ProbeThr { int tid; unsigned long ticks; char name[20]; double pct; unsigned long long waitNs; double wpct; unsigned long stTicks; double spct; };
 static ProbeThr g_prevThr[512];
 static int g_prevThrN = 0;
 static ProbeThr g_curThr[512];
@@ -1511,7 +1589,10 @@ static void *probeThreadMain(void *) {
     const long hz = sysconf(_SC_CLK_TCK) > 0 ? sysconf(_SC_CLK_TCK) : 100;
     long lastMs = nowMs();
     for (;;) {
-        usleep(5000 * 1000);
+        for (int sidx = 0; sidx < 50; sidx++) {   // 50 x 100 ms = 5 s; the C# sampler runs once per 100 ms
+            usleep(100 * 1000);
+            if (profReady() && !guarded(profSampleOnce, nullptr)) g_profFaults++;
+        }
         long now = nowMs();
         long dt = now - lastMs;
         if (dt <= 0) dt = 1;
@@ -1544,6 +1625,8 @@ static void *probeThreadMain(void *) {
                 unsigned long ut = 0, st = 0;
                 if (sscanf(rp + 2, "%*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %lu %lu", &ut, &st) != 2) continue;
                 t.ticks = ut + st;
+                t.stTicks = st;
+                t.spct = 0;
                 t.pct = 0;
                 t.waitNs = 0;
                 t.wpct = 0;
@@ -1561,6 +1644,7 @@ static void *probeThreadMain(void *) {
                     if (g_prevThr[i].tid == tid) {
                         unsigned long dtk = t.ticks >= g_prevThr[i].ticks ? t.ticks - g_prevThr[i].ticks : 0;
                         t.pct = (double)dtk * (1000.0 / (double)hz) / (double)dt * 100.0;
+                        if (t.stTicks >= g_prevThr[i].stTicks) t.spct = (double)(t.stTicks - g_prevThr[i].stTicks) * (1000.0 / (double)hz) / (double)dt * 100.0;
                         if (t.waitNs >= g_prevThr[i].waitNs) t.wpct = (double)(t.waitNs - g_prevThr[i].waitNs) / ((double)dt * 1000000.0) * 100.0;
                         break;
                     }
@@ -1587,7 +1671,7 @@ static void *probeThreadMain(void *) {
             for (int i = 0; i < n; i++) if (g_curThr[i].pct >= 0 && (best < 0 || g_curThr[i].pct > g_curThr[best].pct)) best = i;
             if (best < 0 || g_curThr[best].pct < 0.5) break;
             size_t len = strlen(top);
-            snprintf(top + len, sizeof(top) - len, "%s%s %.0f%% (wait %.0f%%)", len ? " | " : "", g_curThr[best].name, g_curThr[best].pct, g_curThr[best].wpct);
+            snprintf(top + len, sizeof(top) - len, "%s%s %.0f%% (wait %.0f%%, sys %.0f%%)", len ? " | " : "", g_curThr[best].name, g_curThr[best].pct, g_curThr[best].wpct, g_curThr[best].spct);
             g_curThr[best].pct = -1;
         }
         // ---- cpu frequency (MHz, cpu0..7) and the hottest thermal zone (-1 = not readable on this phone)
@@ -1635,6 +1719,7 @@ static void *probeThreadMain(void *) {
         LOGQ("MENUTEST PROBE-HOOK phase=%s hooks=%s menuWork=%s dt=%ldms | FixedUpdate calls=%ld gapMax=%ldms gap>100ms=%ld | game(orig) avg=%ldus max=%ldus | MENU part avg=%ldus max=%ldus total=%ldms",
              phs, g_hooksActive.load() ? "ON" : "OFF", g_menuWork.load() ? "ON" : "OFF", dt, calls, gapMax / 1000, gap100, calls ? origUs / calls : 0, origMax, calls ? menuUs / calls : 0, menuMax, menuUs / 1000);
         LOGQ("MENUTEST PROBE-CPU phase=%s process=%.0f%% (100%% = one core) threads=%ld rss=%ldMB | %s | top: %s", phs, total, thr, rssKb > 0 ? rssKb / 1024 : -1, key, top);
+        profPrintAndReset();
         LOGQ("MENUTEST PROBE-SYS phase=%s cpuMHz(cpu0..7)=%s | thermal zones readable=%d hottest=%.1fC", phs, freq, zones, maxC);
     }
     return nullptr;
@@ -1922,7 +2007,7 @@ static void *watcher(void *) {
 
     if (kProbeOn) {   // v20: lag probe thread (reads /proc only; prints PROBE-HOOK / PROBE-CPU every 5 s)
         pthread_t pt;
-        if (pthread_create(&pt, nullptr, probeThreadMain, nullptr) == 0) { pthread_detach(pt); LOGI("MENUTEST v21 lag probe started (every 5 s)"); }
+        if (pthread_create(&pt, nullptr, probeThreadMain, nullptr) == 0) { pthread_detach(pt); LOGI("MENUTEST v22 lag probe + C# sampler started (every 5 s)"); }
         else LOGI("MENUTEST v20 lag probe: pthread_create failed");
     }
     g_state.store(ST_READY);
@@ -1950,7 +2035,7 @@ static void *watcher(void *) {
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v21 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v22 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
