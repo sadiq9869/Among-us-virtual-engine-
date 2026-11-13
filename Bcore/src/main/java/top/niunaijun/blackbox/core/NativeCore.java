@@ -124,6 +124,55 @@ public class NativeCore {
     private static final java.util.concurrent.atomic.AtomicLong sPRedir = new java.util.concurrent.atomic.AtomicLong();
     private static final java.util.concurrent.atomic.AtomicBoolean sProbeStarted = new java.util.concurrent.atomic.AtomicBoolean(false);
 
+    // v22 Java sampler: once per second the top stack frames of every RUNNABLE Java thread are read (Thread.getAllStackTraces) and
+    // every 5 s the most frequent ones are printed as "PROBE-JAVAPROF n/5 threadName | top <- caller <- ...". Shows what a busy Java
+    // thread (for example "Thread-8") is doing. Set PROFILE_ON = false to switch it off.
+    private static final boolean PROFILE_ON = true;
+
+    private static void sampleJavaThreads(java.util.HashMap<String, Integer> hist) {
+        try {
+            java.util.Map<Thread, StackTraceElement[]> all = Thread.getAllStackTraces();
+            Thread self = Thread.currentThread();
+            for (java.util.Map.Entry<Thread, StackTraceElement[]> e : all.entrySet()) {
+                Thread t = e.getKey();
+                if (t == self || t.getState() != Thread.State.RUNNABLE) continue;
+                String n = t.getName();
+                if (n == null) n = "?";
+                if (n.startsWith("Binder:") || n.equals("Signal Catcher") || n.startsWith("menuprobe")) continue;
+                StackTraceElement[] st = e.getValue();
+                if (st == null || st.length == 0) continue;
+                StringBuilder sb = new StringBuilder(n).append(" | ");
+                int lim = Math.min(4, st.length);
+                for (int k = 0; k < lim; k++) {
+                    if (k > 0) sb.append(" <- ");
+                    sb.append(st[k].getClassName()).append('.').append(st[k].getMethodName());
+                    int ln = st[k].getLineNumber();
+                    if (ln > 0) sb.append(':').append(ln);
+                }
+                String key = sb.toString();
+                Integer c = hist.get(key);
+                hist.put(key, c == null ? 1 : c + 1);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void printJavaProfile(java.util.HashMap<String, Integer> hist) {
+        try {
+            for (int k = 0; k < 8; k++) {
+                String best = null;
+                int bestC = 0;
+                for (java.util.Map.Entry<String, Integer> e : hist.entrySet()) {
+                    if (e.getValue() > bestC) { bestC = e.getValue(); best = e.getKey(); }
+                }
+                if (best == null) break;
+                Log.i("MENUTEST", "PROBE-JAVAPROF " + bestC + "/5 " + best);
+                hist.put(best, -bestC);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     private static void probeRecord(long nanos) {
         sPCalls.incrementAndGet();
         sPNanos.addAndGet(nanos);
@@ -138,7 +187,12 @@ public class NativeCore {
                         public void run() {
                             for (;;) {
                                 try {
-                                    Thread.sleep(5000);
+                                    final java.util.HashMap<String, Integer> hist = new java.util.HashMap<String, Integer>();
+                                    for (int i = 0; i < 5; i++) {   // 5 x 1 s = 5 s; one Java stack sample per second
+                                        Thread.sleep(1000);
+                                        if (PROFILE_ON) sampleJavaThreads(hist);
+                                    }
+                                    if (PROFILE_ON) printJavaProfile(hist);
                                     long calls = sPCalls.getAndSet(0);
                                     long nanos2 = sPNanos.getAndSet(0);
                                     long max = sPMaxNanos.getAndSet(0);
