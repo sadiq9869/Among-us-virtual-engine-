@@ -127,7 +127,7 @@ public class NativeCore {
     // v22 Java sampler: once per second the top stack frames of every RUNNABLE Java thread are read (Thread.getAllStackTraces) and
     // every 5 s the most frequent ones are printed as "PROBE-JAVAPROF n/5 threadName | top <- caller <- ...". Shows what a busy Java
     // thread (for example "Thread-8") is doing. Set PROFILE_ON = false to switch it off.
-    private static final boolean PROFILE_ON = true;
+    private static final boolean PROFILE_ON = false;   // v23: off by default
 
     private static void sampleJavaThreads(java.util.HashMap<String, Integer> hist) {
         try {
