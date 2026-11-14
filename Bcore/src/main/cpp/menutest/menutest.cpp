@@ -1,3 +1,4 @@
+// MENUTEST v23 = v22 + ACCOUNT (unlock all cosmetics via Free flags + PlayerPurchasesData.GetPurchase hook, name, level). Probes (C# sampler) default OFF.
 // MENUTEST v22 = v21 + C# SAMPLER (PROF lines: which C# methods the busy IL2CPP threads run) + per-thread system time. See PROBE-* lines every 5 s.
 // MENUTEST v19 = v17 + REALSCAN logger REMOVED + Submit Scan like the REAL task (numbers from the user's REALSCAN log, build 2026.11.3):
 //   request first, WALK (game physics: PlayerPhysics.SetNormalizedVelocity, leg animation, ~2.5 units/s, slows near the pad) to
@@ -246,6 +247,16 @@ static fn_thread_frame_at_t p_thread_frame_at;
 static fn_method_get_class_t p_method_get_class;
 static fn_class_get_ns_t p_class_get_ns;
 
+// v23: Account API (all optional)
+typedef void *(*fn_string_new_utf16_t)(const uint16_t *chars, int32_t len);
+typedef void (*fn_field_set_value_t)(void *obj, void *field, void *value);
+typedef int (*fn_field_get_offset_t)(void *field);
+typedef uintptr_t (*fn_array_length_t)(void *arr);
+static fn_string_new_utf16_t p_string_new_utf16;
+static fn_field_set_value_t p_field_set_value;
+static fn_field_get_offset_t p_field_get_offset;
+static fn_array_length_t p_array_length;
+
 static bool resolveAll(void *h) {
     struct Entry { const char *name; void **slot; bool required; };
     Entry entries[] = {
@@ -282,6 +293,10 @@ static bool resolveAll(void *h) {
         {"il2cpp_thread_get_frame_at", (void **)&p_thread_frame_at, false},
         {"il2cpp_method_get_class", (void **)&p_method_get_class, false},
         {"il2cpp_class_get_namespace", (void **)&p_class_get_ns, false},
+        {"il2cpp_string_new_utf16", (void **)&p_string_new_utf16, false},
+        {"il2cpp_field_set_value", (void **)&p_field_set_value, false},
+        {"il2cpp_field_get_offset", (void **)&p_field_get_offset, false},
+        {"il2cpp_array_length", (void **)&p_array_length, false},
     };
     bool ok = true;
     for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
@@ -1447,6 +1462,318 @@ static void runVisual() {
 }
 
 // ---------------------------------------------------------------- main-thread dispatch: hook on PlayerControl::FixedUpdate
+// ---------------------------------------------------------------- v23 ACCOUNT: unlock all cosmetics, set name, set level
+// Every class / field / method name below comes from the user's dump.cs (Among Us build 2026.11.3). NO field offset is hardcoded:
+// fields are found BY NAME and written with il2cpp_field_set_value. Dump values logged next to the runtime ones as a cross-check:
+//   CosmeticData.Free 0x81, BundleData.Free 0x41, CosmicubeData.Free 0x4C, HatManager arrays 0x48..0x68, lists 0x78..0x90.
+// Il2CppArray 64-bit header (length at +0x18, first element at +0x20) is the only layout constant; it is validated at run time
+// against il2cpp_array_length and the array pass is skipped when they disagree.
+// UNKNOWN until tested in game: (1) whether the game's "is unlocked" check reads CosmeticData.Free and/or PlayerPurchasesData.GetPurchase
+// (both are covered); (2) whether the host and the other players accept cosmetic ids / names / levels you do not own; (3) whether the
+// game shows level or level+1 for the value passed to RpcSetLevel. Nothing here is saved to the Innersloth account.
+static const int  kNameMaxUnits = 100;      // sanity bound chosen by me (UTF-16 units), NOT a game value
+static const int  kMaxCosmetics = 4000;     // sanity bound for one list/array
+static const long kAcctTickMs   = 5000;     // how often the Unity thread re-checks that the catalog was unlocked
+static const int  kArrLenOff = 0x18, kArrDataOff = 0x20;   // il2cpp 64-bit array layout, validated at run time
+
+
+static std::atomic<int> g_acctUnlock{1};          // the tick button, ON by default
+static std::atomic<int> g_reqAcct{0};             // bit0 = set name, bit1 = set level (consumed on the Unity thread)
+static std::atomic<long> g_reqAcctAt{0};
+static std::mutex g_acctMx;
+static uint16_t g_reqNameBuf[kNameMaxUnits + 1];
+static int g_reqNameLen = 0;
+static std::atomic<unsigned long long> g_reqLevelVal{0};
+static char g_acctMsg[700] = "Account: nothing done yet.";
+static char g_acctUnlockMsg[300] = "Unlock: not applied yet (needs HatManager, i.e. a lobby or a match).";
+static std::atomic<long> g_gpHits{0};
+static bool g_gpHookOn = false;
+static void *g_tgtGP = nullptr;
+
+static void setAcctMsg(const char *fmt, ...) {
+    char buf[700];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    { std::lock_guard<std::mutex> lk(g_acctMx); strncpy(g_acctMsg, buf, sizeof(g_acctMsg) - 1); g_acctMsg[sizeof(g_acctMsg) - 1] = 0; }
+    LOGI("MENUTEST ACCOUNT: %s", buf);
+}
+static void setUnlockMsg(const char *fmt, ...) {
+    char buf[300];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    { std::lock_guard<std::mutex> lk(g_acctMx); strncpy(g_acctUnlockMsg, buf, sizeof(g_acctUnlockMsg) - 1); g_acctUnlockMsg[sizeof(g_acctUnlockMsg) - 1] = 0; }
+    LOGI("MENUTEST UNLOCK: %s", buf);
+}
+
+// class lookup: the dump shows these classes in the global namespace or in AmongUs.Data / AmongUs.Data.Player
+static void *classByName(const char *name) {
+    static const char *kNs[] = {"", "AmongUs.Data", "AmongUs.Data.Player", "AmongUs.Data.Legacy"};
+    for (size_t i = 0; i < sizeof(kNs) / sizeof(kNs[0]); i++) {
+        void *k = p_class_from_name(g_image, kNs[i], name);
+        if (k) return k;
+    }
+    return nullptr;
+}
+static bool isBoolField(void *f) {
+    if (!f || !p_field_get_type) return false;
+    void *t = p_field_get_type(f);
+    return t && p_type_get_type(t) == 0x02;   // ECMA element type boolean
+}
+static void *acctStatic(void *field, void *getter) {
+    if (field && p_field_get_flags && !(p_field_get_flags(field) & 0x10)) field = nullptr;   // FIELD_ATTRIBUTE_STATIC
+    return staticObj(field, getter);
+}
+
+// ---- resolved names (filled once by acctResolveFn)
+static bool g_acctResolved = false;
+static void *k_HatManager = nullptr, *f_HMInst = nullptr, *m_HMInst = nullptr;
+static void *f_HM_pets = nullptr, *f_HM_hats = nullptr, *f_HM_skins = nullptr, *f_HM_visors = nullptr, *f_HM_plates = nullptr;
+static void *f_HM_bundles = nullptr, *f_HM_featItems = nullptr, *f_HM_featBundles = nullptr, *f_HM_featCubes = nullptr;
+static void *f_CD_Free = nullptr, *f_BD_Free = nullptr, *f_CC_Free = nullptr;
+static void *m_RpcSetName = nullptr, *m_CmdCheckName = nullptr, *m_RpcSetLevel = nullptr, *f_NI_PlayerLevel = nullptr;
+
+static void logFieldOffset(const char *label, void *f, int dumpOff) {
+    if (!f) { LOGI("MENUTEST acct field %s: NOT FOUND (dump says 0x%x)", label, dumpOff); return; }
+    int off = p_field_get_offset ? p_field_get_offset(f) : -1;
+    LOGI("MENUTEST acct field %s: runtime offset 0x%x, dump 0x%x, bool=%d%s", label, off, dumpOff, isBoolField(f) ? 1 : 0,
+         (off == dumpOff) ? "" : "  <-- DIFFERENT from the dump (the game build changed?)");
+}
+
+static void acctResolveFn(void *) {
+    if (g_acctResolved) return;
+    g_acctResolved = true;
+    k_HatManager = classByName("HatManager");
+    if (k_HatManager) {
+        f_HMInst = findField(k_HatManager, "Instance");
+        if (!f_HMInst) f_HMInst = findField(k_HatManager, "_instance");
+        m_HMInst = findMethod(k_HatManager, "get_Instance", 0);
+        f_HM_pets = findField(k_HatManager, "allPets");
+        f_HM_hats = findField(k_HatManager, "allHats");
+        f_HM_skins = findField(k_HatManager, "allSkins");
+        f_HM_visors = findField(k_HatManager, "allVisors");
+        f_HM_plates = findField(k_HatManager, "allNamePlates");
+        f_HM_bundles = findField(k_HatManager, "allBundles");
+        f_HM_featItems = findField(k_HatManager, "allFeaturedItems");
+        f_HM_featBundles = findField(k_HatManager, "allFeaturedBundles");
+        f_HM_featCubes = findField(k_HatManager, "allFeaturedCubes");
+    }
+    void *kcd = classByName("CosmeticData"), *kbd = classByName("BundleData"), *kcc = classByName("CosmicubeData");
+    if (kcd) f_CD_Free = findField(kcd, "Free");
+    if (kbd) f_BD_Free = findField(kbd, "Free");
+    if (kcc) f_CC_Free = findField(kcc, "Free");
+    LOGI("MENUTEST acct HatManager=%p inst(field=%p,getter=%p) CosmeticData=%p BundleData=%p CosmicubeData=%p", k_HatManager, f_HMInst, m_HMInst, kcd, kbd, kcc);
+    logFieldOffset("CosmeticData.Free", f_CD_Free, 0x81);
+    logFieldOffset("BundleData.Free", f_BD_Free, 0x41);
+    logFieldOffset("CosmicubeData.Free", f_CC_Free, 0x4C);
+    logFieldOffset("HatManager.allPets", f_HM_pets, 0x48);
+    logFieldOffset("HatManager.allHats", f_HM_hats, 0x50);
+    logFieldOffset("HatManager.allSkins", f_HM_skins, 0x58);
+    logFieldOffset("HatManager.allVisors", f_HM_visors, 0x60);
+    logFieldOffset("HatManager.allNamePlates", f_HM_plates, 0x68);
+    logFieldOffset("HatManager.allBundles", f_HM_bundles, 0x78);
+    logFieldOffset("HatManager.allFeaturedItems", f_HM_featItems, 0x80);
+    logFieldOffset("HatManager.allFeaturedBundles", f_HM_featBundles, 0x88);
+    logFieldOffset("HatManager.allFeaturedCubes", f_HM_featCubes, 0x90);
+    m_RpcSetName = findMethod(k_PlayerControl, "RpcSetName", 1);
+    m_CmdCheckName = findMethod(k_PlayerControl, "CmdCheckName", 1);
+    m_RpcSetLevel = findMethod(k_PlayerControl, "RpcSetLevel", 1);
+    if (k_NetInfo) f_NI_PlayerLevel = findField(k_NetInfo, "PlayerLevel");
+    LOGI("MENUTEST acct PlayerControl RpcSetName=%p CmdCheckName=%p RpcSetLevel=%p | NetworkedPlayerInfo.PlayerLevel=%p (dump 0x60)",
+         m_RpcSetName, m_CmdCheckName, m_RpcSetLevel, f_NI_PlayerLevel);
+}
+
+// ---- unlock: CosmeticData.Free / BundleData.Free / CosmicubeData.Free = true for every item the game's lists hold
+static bool readArrayField(void *obj, void *field, void **outArr, int *outLen) {
+    *outArr = nullptr; *outLen = 0;
+    if (!field) return false;
+    void *arr = nullptr;
+    p_field_get_value(obj, field, &arr);
+    if (!arr) return true;   // a null array is an empty array
+    if (!p_array_length) return false;
+    uintptr_t n = p_array_length(arr);
+    uintptr_t hdr = *(uintptr_t *)((char *)arr + kArrLenOff);
+    if (n != hdr || n > (uintptr_t)kMaxCosmetics) return false;
+    *outArr = arr; *outLen = (int)n;
+    return true;
+}
+static bool readListField(void *obj, void *field, void **outList, void **outItem, int *outCount) {
+    *outList = nullptr; *outItem = nullptr; *outCount = 0;
+    if (!field) return false;
+    void *list = nullptr;
+    p_field_get_value(obj, field, &list);
+    if (!list) return true;
+    void *lk = p_object_get_class(list);
+    void *mCount = findMethod(lk, "get_Count", 0), *mItem = findMethod(lk, "get_Item", 1);
+    int n = 0;
+    if (!mCount || !mItem || !invokeInt(mCount, list, nullptr, "get_Count", &n)) return false;
+    if (n < 0 || n > kMaxCosmetics) return false;
+    *outList = list; *outItem = mItem; *outCount = n;
+    return true;
+}
+static int setFreeInArray(void *arr, int len, void *freeField) {
+    int n = 0;
+    for (int i = 0; i < len; i++) {
+        void *it = *(void **)((char *)arr + kArrDataOff + (size_t)i * sizeof(void *));
+        if (!it) continue;
+        uint8_t v = 1;
+        p_field_set_value(it, freeField, &v);
+        n++;
+    }
+    return n;
+}
+static int setFreeInList(void *list, void *mItem, int count, void *freeField) {
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        int idx = i;
+        void *args[1] = {&idx};
+        bool ok = false;
+        void *it = invokeRaw(mItem, list, args, "get_Item", &ok);
+        if (!ok || !it) continue;
+        uint8_t v = 1;
+        p_field_set_value(it, freeField, &v);
+        n++;
+    }
+    return n;
+}
+
+static unsigned long long g_ulLastSig = 0;
+static void unlockFn(void *) {
+    if (!k_HatManager || !p_field_set_value) { setUnlockMsg("Unlock: HatManager class or il2cpp_field_set_value missing (see logcat MENUTEST acct)."); return; }
+    void *hm = acctStatic(f_HMInst, m_HMInst);
+    if (!hm) return;   // HatManager does not exist yet (before a lobby): try again at the next tick
+    struct ArrSpec { const char *name; void *f; void *arr; int len; int done; };
+    ArrSpec as[5] = {{"pets", f_HM_pets, nullptr, 0, 0}, {"hats", f_HM_hats, nullptr, 0, 0}, {"skins", f_HM_skins, nullptr, 0, 0},
+                     {"visors", f_HM_visors, nullptr, 0, 0}, {"nameplates", f_HM_plates, nullptr, 0, 0}};
+    struct ListSpec { const char *name; void *f; void *freeF; void *list; void *mItem; int count; int done; };
+    ListSpec ls[4] = {{"bundles", f_HM_bundles, f_BD_Free, nullptr, nullptr, 0, 0}, {"featured items", f_HM_featItems, f_CD_Free, nullptr, nullptr, 0, 0},
+                      {"featured bundles", f_HM_featBundles, f_BD_Free, nullptr, nullptr, 0, 0}, {"cosmicubes", f_HM_featCubes, f_CC_Free, nullptr, nullptr, 0, 0}};
+    unsigned long long sig = (unsigned long long)(uintptr_t)hm;
+    bool bad = false;
+    char why[160] = "";
+    for (int i = 0; i < 5; i++) {
+        if (!readArrayField(hm, as[i].f, &as[i].arr, &as[i].len)) { bad = true; snprintf(why, sizeof(why), "array %s unreadable/implausible", as[i].name); break; }
+        sig = sig * 1000003ULL + (unsigned long long)as[i].len + 1;
+    }
+    if (!bad) for (int i = 0; i < 4; i++) {
+        if (!readListField(hm, ls[i].f, &ls[i].list, &ls[i].mItem, &ls[i].count)) { bad = true; snprintf(why, sizeof(why), "list %s unreadable/implausible", ls[i].name); break; }
+        sig = sig * 1000003ULL + (unsigned long long)ls[i].count + 1;
+    }
+    if (bad) { setUnlockMsg("Unlock skipped: %s (field missing or layout check failed). Nothing was written.", why); return; }
+    if (sig == g_ulLastSig) return;   // same HatManager and same counts: already done
+    if (!isBoolField(f_CD_Free) || !isBoolField(f_BD_Free) || !isBoolField(f_CC_Free)) {
+        setUnlockMsg("Unlock skipped: a 'Free' field was not found or is not a bool in this build (see logcat MENUTEST acct field lines). Nothing was written.");
+        return;
+    }
+    for (int i = 0; i < 5; i++) as[i].done = setFreeInArray(as[i].arr, as[i].len, f_CD_Free);
+    for (int i = 0; i < 4; i++) ls[i].done = setFreeInList(ls[i].list, ls[i].mItem, ls[i].count, ls[i].freeF);
+    g_ulLastSig = sig;
+    setUnlockMsg("Unlock applied: pets %d, hats %d, skins %d, visors %d, nameplates %d | bundles %d, featured items %d, featured bundles %d, cosmicubes %d (Free=true).",
+                 as[0].done, as[1].done, as[2].done, as[3].done, as[4].done, ls[0].done, ls[1].done, ls[2].done, ls[3].done);
+}
+static long g_acctNextMs = 0;   // Unity thread only
+static void acctTick() {
+    if (!g_acctUnlock.load(std::memory_order_relaxed)) return;
+    long now = nowMs();
+    if (now < g_acctNextMs) return;
+    g_acctNextMs = now + kAcctTickMs;
+    if (!g_acctResolved && !guarded(acctResolveFn, nullptr)) { setUnlockMsg("Fault while resolving HatManager (see logcat MENUTEST)."); return; }
+    if (!guarded(unlockFn, nullptr)) setUnlockMsg("Crash guard caught a fault while unlocking (see logcat MENUTEST).");
+}
+
+// ---- PlayerPurchasesData.GetPurchase(string,string) -> true while the tick is ON. (DataManager has no GetPurchase: the static one in the
+// dump belongs to LegacySaveManager, the old-save migration, and is NOT hooked.)
+typedef bool (*fn_pp_getpurchase_t)(void *self, void *itemKey, void *bundleKey, const void *method);
+static fn_pp_getpurchase_t orig_pp_getpurchase = nullptr;
+static bool hk_pp_getpurchase(void *self, void *itemKey, void *bundleKey, const void *method) {
+    if (g_acctUnlock.load(std::memory_order_relaxed)) { g_gpHits.fetch_add(1, std::memory_order_relaxed); return true; }
+    return orig_pp_getpurchase ? orig_pp_getpurchase(self, itemKey, bundleKey, method) : false;
+}
+static void installPurchaseHook() {
+    void *k = classByName("PlayerPurchasesData");
+    void *m = k ? p_class_get_method_from_name(k, "GetPurchase", 2) : nullptr;
+    if (!m || !p_method_get_return_type) { LOGI("MENUTEST acct GetPurchase hook skipped: class=%p method=%p", k, m); return; }
+    void *rt = p_method_get_return_type(m);
+    void *tgt = *(void **)m;
+    if (!rt || p_type_get_type(rt) != 0x02 || !tgt || !inIl2cppText((unsigned long)tgt)) {
+        LOGI("MENUTEST acct GetPurchase hook skipped: return type=0x%x (bool is 0x2), target=%p", rt ? p_type_get_type(rt) : -1, tgt);
+        return;
+    }
+    int r = DobbyHook(tgt, (void *)hk_pp_getpurchase, (void **)&orig_pp_getpurchase);
+    if (r == 0 && orig_pp_getpurchase) { g_gpHookOn = true; g_tgtGP = tgt; LOGI("MENUTEST acct PlayerPurchasesData.GetPurchase hook installed (target=%p)", tgt); }
+    else { orig_pp_getpurchase = nullptr; LOGI("MENUTEST acct GetPurchase hook NOT installed r=%d", r); }
+}
+
+// ---- name / level, executed on the Unity thread
+static void readBackName(char *out, size_t cap, void *local) {
+    out[0] = 0;
+    void *d = dataOf(local);
+    if (d && m_get_PlayerName) {
+        bool ok = false;
+        void *s = invokeRaw(m_get_PlayerName, d, nullptr, "get_PlayerName", &ok);
+        if (ok) il2str(s, out, cap);
+    }
+    if (!out[0]) snprintf(out, cap, "?");
+}
+static void nameFn(void *) {
+    void *local = nullptr;
+    if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
+    if (!local) { setAcctMsg("Name: no local player yet. Join a lobby first."); return; }
+    if (!p_string_new_utf16) { setAcctMsg("Name: il2cpp_string_new_utf16 not found in this build, cannot create the text."); return; }
+    uint16_t buf[kNameMaxUnits + 1];
+    int len;
+    { std::lock_guard<std::mutex> lk(g_acctMx); len = g_reqNameLen; memcpy(buf, g_reqNameBuf, sizeof(buf)); }
+    if (len <= 0 || len > kNameMaxUnits) { setAcctMsg("Name: invalid length %d.", len); return; }
+    int host = hostState();
+    void *s = p_string_new_utf16(buf, len);
+    if (!s) { setAcctMsg("Name: could not create the managed string."); return; }
+    void *args[1] = {s};
+    bool ok = false;
+    char before[96], after[96];
+    readBackName(before, sizeof(before), local);
+    if (host == 1) {
+        if (!m_RpcSetName) { setAcctMsg("Name: PlayerControl.RpcSetName not found."); return; }
+        invokeRaw(m_RpcSetName, local, args, "RpcSetName", &ok);
+        readBackName(after, sizeof(after), local);
+        setAcctMsg("Name: you are HOST, RpcSetName(%d chars) %s. Name before: %s | now: %s. (A read-back does not prove the others see it; check another phone.)",
+                   len, ok ? "called" : "threw an exception (see logcat)", before, after);
+    } else if (host == 0) {
+        if (!m_CmdCheckName) { setAcctMsg("Name: PlayerControl.CmdCheckName not found."); return; }
+        invokeRaw(m_CmdCheckName, local, args, "CmdCheckName", &ok);
+        readBackName(after, sizeof(after), local);
+        setAcctMsg("Name: you are a CLIENT, CmdCheckName(%d chars) %s: the host decides (accept / rename / ignore). Name before: %s | now: %s.",
+                   len, ok ? "sent" : "threw an exception (see logcat)", before, after);
+    } else {
+        setAcctMsg("Name: cannot tell if you are host (AmongUsClient.get_AmHost unavailable). Nothing sent.");
+    }
+}
+static void levelFn(void *) {
+    void *local = nullptr;
+    if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
+    if (!local) { setAcctMsg("Level: no local player yet. Join a lobby first."); return; }
+    if (!m_RpcSetLevel) { setAcctMsg("Level: PlayerControl.RpcSetLevel not found."); return; }
+    uint32_t lv = (uint32_t)g_reqLevelVal.load();
+    void *args[1] = {&lv};
+    bool ok = false;
+    invokeRaw(m_RpcSetLevel, local, args, "RpcSetLevel", &ok);
+    char rb[60] = "n/a";
+    void *d = dataOf(local);
+    if (d && f_NI_PlayerLevel) { uint32_t cur = 0; p_field_get_value(d, f_NI_PlayerLevel, &cur); snprintf(rb, sizeof(rb), "%u", cur); }
+    setAcctMsg("Level: RpcSetLevel(%u) %s. NetworkedPlayerInfo.PlayerLevel now = %s (if the screen shows one more than you typed, type one less).",
+               lv, ok ? "called" : "threw an exception (see logcat)", rb);
+}
+static void runAccount() {
+    int bits = g_reqAcct.exchange(0);
+    if (!bits) return;
+    if (nowMs() - g_reqAcctAt.load() > kReqTtlMs) { setAcctMsg("Press expired: no player object was active within %ld s. Join a lobby and press again.", kReqTtlMs / 1000); return; }
+    if (!guarded(resolveExtraFn, nullptr) || !guarded(resolveHostFn, nullptr) || !guarded(acctResolveFn, nullptr)) { setAcctMsg("Fault while resolving account classes (see logcat MENUTEST)."); return; }
+    if ((bits & 1) && !guarded(nameFn, nullptr)) setAcctMsg("Crash guard caught a fault while setting the name (see logcat MENUTEST).");
+    if ((bits & 2) && !guarded(levelFn, nullptr)) setAcctMsg("Crash guard caught a fault while setting the level (see logcat MENUTEST).");
+}
+
 typedef void (*fn_fixedupdate_t)(void *self, const void *method);
 static fn_fixedupdate_t orig_fixed = nullptr;
 
@@ -1498,6 +1825,8 @@ static void hk_fixed(void *self, const void *method) {
         if (g_reqPlayers.load(std::memory_order_relaxed) && g_reqPlayers.exchange(false)) runPlayers();
         if (g_reqHostInfo.load(std::memory_order_relaxed) && g_reqHostInfo.exchange(false)) runHostInfo();
         if (g_reqVisual.load(std::memory_order_relaxed) != 0) runVisual();
+        if (g_reqAcct.load(std::memory_order_relaxed) != 0) runAccount();   // v23
+        acctTick();                                                          // v23 (every 5 s, cheap when already unlocked)
         visualTick();
         // v20: nameTick(1500) is NOT called every 1.5 s any more (names are still refreshed right before SelectRoles in hk_selectroles)
         logTick();
@@ -1522,7 +1851,7 @@ static void hk_fixed(void *self, const void *method) {
 // 10 times per second the TOP C# method of every thread known to il2cpp is read (il2cpp_thread_get_top_frame, read-only, under the crash
 // guard). Every 5 s the most frequent ones are printed as "MENUTEST PROF n x Tk Class::method <- caller". Tk = index of the thread in il2cpp's
 // thread list. This shows which C# code the busy "IL2CPP Threadpool" threads run. Set kProfOn=false to switch it off.
-static const bool kProfOn = true;
+static const bool kProfOn = false;   // v23: off by default (it was only for the lag hunt)
 struct ProfEnt { char text[200]; int count; };
 static ProfEnt g_prof[200];
 static int g_profN = 0, g_profSamples = 0, g_profFaults = 0, g_profNoFrame = 0;
@@ -1811,6 +2140,7 @@ static void hk_selectroles(void *self, const void *method) {
 static void applyHookCmd(int c) {
     if (c != 1 || !g_hooksActive.load()) return;
     LOGI("MENUTEST LAGTEST unhook ALL: removing hooks (FixedUpdate=%p RpcSetRole=%p SelectRoles=%p CoSetRole=%p)", g_tgtFixed, g_tgtRpc, g_tgtSel, g_tgtCo);
+    if (g_tgtGP)  { int r = DobbyDestroy(g_tgtGP);  orig_pp_getpurchase = nullptr; g_gpHookOn = false; LOGI("MENUTEST LAGTEST GetPurchase hook removed r=%d", r); }
     if (g_tgtCo)  { int r = DobbyDestroy(g_tgtCo);  orig_cosetrole = nullptr;    LOGI("MENUTEST LAGTEST CoSetRole hook removed r=%d", r); }
     if (g_tgtRpc) { int r = DobbyDestroy(g_tgtRpc); orig_rpcsetrole = nullptr;   LOGI("MENUTEST LAGTEST RpcSetRole hook removed r=%d", r); }
     if (g_tgtSel) { int r = DobbyDestroy(g_tgtSel); orig_selectroles = nullptr;  LOGI("MENUTEST LAGTEST SelectRoles hook removed r=%d", r); }
@@ -2005,6 +2335,8 @@ static void *watcher(void *) {
         LOGI("MENUTEST SelectRoles log hook skipped (method not found)");
     }
 
+    installPurchaseHook();   // v23: PlayerPurchasesData.GetPurchase -> true while the Account tick is ON
+
     if (kProbeOn) {   // v20: lag probe thread (reads /proc only; prints PROBE-HOOK / PROBE-CPU every 5 s)
         pthread_t pt;
         if (pthread_create(&pt, nullptr, probeThreadMain, nullptr) == 0) { pthread_detach(pt); LOGI("MENUTEST v22 lag probe + C# sampler started (every 5 s)"); }
@@ -2035,7 +2367,7 @@ static void *watcher(void *) {
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v22 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v23 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
@@ -2162,6 +2494,59 @@ Java_top_niunaijun_blackboxa_menu_NativeMenu_hostInfoText(JNIEnv *env, jobject t
         std::lock_guard<std::mutex> lk(g_hostMx);
         const char *pre = (at == 0 || nowMs() - at > 3000) ? "(no fresh update: no player object is active, join a lobby or match)\n" : "";
         snprintf(buf, sizeof(buf), "%s%s", pre, g_hostInfo);
+    }
+    return env->NewStringUTF(buf);
+}
+
+// ---------------------------------------------------------------- v23 Account JNI
+extern "C" JNIEXPORT void JNICALL
+Java_top_niunaijun_blackboxa_menu_NativeMenu_setUnlockAll(JNIEnv *env, jobject thiz, jint on) {
+    g_acctUnlock.store(on ? 1 : 0);
+    if (on) g_acctNextMs = 0;   // benign race: Unity thread re-checks at its next tick
+    LOGI("MENUTEST ACCOUNT unlock-all tick = %d", on ? 1 : 0);
+}
+
+// returns 1 queued, 0 menu not ready, -1 invalid name (empty or longer than kNameMaxUnits UTF-16 units)
+extern "C" JNIEXPORT jint JNICALL
+Java_top_niunaijun_blackboxa_menu_NativeMenu_requestSetName(JNIEnv *env, jobject thiz, jstring name) {
+    if (g_state.load() != ST_READY) return 0;
+    if (!name) return -1;
+    jsize n = env->GetStringLength(name);
+    if (n <= 0 || n > kNameMaxUnits) return -1;
+    const jchar *c = env->GetStringChars(name, nullptr);
+    if (!c) return -1;
+    {
+        std::lock_guard<std::mutex> lk(g_acctMx);
+        memset(g_reqNameBuf, 0, sizeof(g_reqNameBuf));
+        for (jsize i = 0; i < n; i++) g_reqNameBuf[i] = (uint16_t)c[i];
+        g_reqNameLen = (int)n;
+    }
+    env->ReleaseStringChars(name, c);
+    setAcctMsg("Name: queued (%d chars), waiting for the Unity thread...", (int)n);
+    g_reqAcctAt.store(nowMs());
+    g_reqAcct.fetch_or(1);
+    return 1;
+}
+
+// returns 1 queued, 0 menu not ready, -1 out of range (0 .. 4294967295)
+extern "C" JNIEXPORT jint JNICALL
+Java_top_niunaijun_blackboxa_menu_NativeMenu_requestSetLevel(JNIEnv *env, jobject thiz, jlong level) {
+    if (g_state.load() != ST_READY) return 0;
+    if (level < 0 || level > 4294967295LL) return -1;
+    g_reqLevelVal.store((unsigned long long)level);
+    setAcctMsg("Level: queued (%lld), waiting for the Unity thread...", (long long)level);
+    g_reqAcctAt.store(nowMs());
+    g_reqAcct.fetch_or(2);
+    return 1;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_top_niunaijun_blackboxa_menu_NativeMenu_accountText(JNIEnv *env, jobject thiz) {
+    char buf[1100];
+    {
+        std::lock_guard<std::mutex> lk(g_acctMx);
+        snprintf(buf, sizeof(buf), "Unlock all: %s | GetPurchase hook: %s (forced %ld calls)\n%s\n%s",
+                 g_acctUnlock.load() ? "ON" : "OFF", g_gpHookOn ? "installed" : "NOT installed", g_gpHits.load(), g_acctUnlockMsg, g_acctMsg);
     }
     return env->NewStringUTF(buf);
 }
