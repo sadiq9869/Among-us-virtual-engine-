@@ -51,6 +51,12 @@ object NativeMenu {
     // v21 lag test: 0 = menu work OFF (soft), 1 = menu work ON, 2 = unhook ALL hooks (until the game is restarted)
     // returns 1 done/accepted, 0 menu not ready, -1 not in hook mode, 2 already unhooked
     external fun lagMode(mode: Int): Int
+    // v23 Account: unlock-all tick (native default ON), name, level
+    external fun setUnlockAll(on: Int)
+    // returns 1 queued, 0 menu not ready, -1 invalid (name empty or > 100 UTF-16 units / level outside 0..4294967295)
+    external fun requestSetName(name: String): Int
+    external fun requestSetLevel(level: Long): Int
+    external fun accountText(): String
 }
 
 /**
@@ -66,6 +72,29 @@ object GameMenu {
 
     // ---- console: reads this app's own logcat lines tagged MENUTEST / GameMenu
     private var alwaysImp = false
+    // v23 Account state (in memory only)
+    private var unlockAll = true            // default ON, always
+    private var acctName = ""
+    private var acctLevel = ""
+    private const val ACCT_MAX_LEVEL = 100L  // UNCONFIRMED: a Steam post says the in-game cap is 100; any other value can be typed
+
+    private fun askText(activity: Activity, title: String, initial: String, numeric: Boolean, onOk: (String) -> Unit) {
+        try {
+            val et = android.widget.EditText(activity)
+            et.setText(initial)
+            et.setSelection(et.text.length)
+            if (numeric) et.inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            android.app.AlertDialog.Builder(activity)
+                .setTitle(title)
+                .setView(et)
+                .setPositiveButton("OK") { _, _ -> onOk(et.text.toString()) }
+                .setNegativeButton("Cancel", null)
+                .show()
+        } catch (t: Throwable) {
+            Log.i("GameMenu", "input dialog failed: $t")
+            Toast.makeText(activity, "Input dialog failed: $t", Toast.LENGTH_LONG).show()
+        }
+    }
     private var wantIdx = 0
     private val wantNames = arrayOf("Random", "Impostor", "Shapeshifter", "Phantom", "Viper")
     private const val MAX_SHOWN = 150
@@ -267,10 +296,15 @@ object GameMenu {
         lagBtn.text = "Lag test"
         lagBtn.isAllCaps = false
         panel.addView(lagBtn)
+
+        val acctBtn = Button(activity)
+        acctBtn.text = "Account"
+        acctBtn.isAllCaps = false
+        panel.addView(acctBtn)
         panel.addView(closeBtn)
 
         // compact buttons so the panel (now 6 buttons) fits on a landscape phone screen
-        for (b in listOf(completeBtn, visualBtn, playersBtn, hostBtn, consoleBtn, lagBtn, closeBtn)) {
+        for (b in listOf(completeBtn, visualBtn, playersBtn, hostBtn, consoleBtn, lagBtn, acctBtn, closeBtn)) {
             b.minHeight = 0
             b.minimumHeight = 0
             b.textSize = 13f
@@ -599,6 +633,143 @@ object GameMenu {
         lagLp.topMargin = dp(activity, 16)
         overlay.addView(lagBox, lagLp)
 
+        // ---- v23 Account box: unlock-all tick (default ON), name, level
+        val acctBox = LinearLayout(activity)
+        acctBox.orientation = LinearLayout.VERTICAL
+        acctBox.visibility = View.GONE
+        acctBox.background = cbg.constantState?.newDrawable()?.mutate() ?: cbg
+        acctBox.setPadding(dp(activity, 8), dp(activity, 8), dp(activity, 8), dp(activity, 8))
+        val acctTitle = TextView(activity)
+        acctTitle.setTextColor(Color.WHITE)
+        acctTitle.textSize = 13f
+        acctTitle.text = "Account"
+        acctBox.addView(acctTitle)
+        val acctInfo = TextView(activity)
+        acctInfo.typeface = Typeface.MONOSPACE
+        acctInfo.textSize = 10f
+        acctInfo.setTextColor(Color.argb(255, 205, 210, 225))
+        val acctScroll = ScrollView(activity)
+        acctScroll.addView(acctInfo)
+        acctBox.addView(acctScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        val unlockBtn = Button(activity)
+        val nameEditBtn = Button(activity)
+        val nameApplyBtn = Button(activity)
+        val levelEditBtn = Button(activity)
+        val levelApplyBtn = Button(activity)
+        val levelMaxBtn = Button(activity)
+        val acctHideBtn = Button(activity)
+        acctHideBtn.text = "Hide"
+        for (b in listOf(unlockBtn, nameEditBtn, nameApplyBtn, levelEditBtn, levelApplyBtn, levelMaxBtn, acctHideBtn)) {
+            b.isAllCaps = false
+            b.minHeight = 0
+            b.minimumHeight = 0
+            b.textSize = 12f
+            b.setPadding(dp(activity, 6), dp(activity, 4), dp(activity, 6), dp(activity, 4))
+        }
+        acctBox.addView(unlockBtn)
+        val nameRow = LinearLayout(activity)
+        nameRow.orientation = LinearLayout.HORIZONTAL
+        nameRow.addView(nameEditBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 2f))
+        nameRow.addView(nameApplyBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        acctBox.addView(nameRow)
+        val levelRow = LinearLayout(activity)
+        levelRow.orientation = LinearLayout.HORIZONTAL
+        levelRow.addView(levelEditBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 2f))
+        levelRow.addView(levelApplyBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        levelRow.addView(levelMaxBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        acctBox.addView(levelRow)
+        acctBox.addView(acctHideBtn)
+        val acctLp = FrameLayout.LayoutParams(consoleLp.width, consoleLp.height)
+        acctLp.gravity = Gravity.TOP or Gravity.START
+        acctLp.leftMargin = dp(activity, 296)
+        acctLp.topMargin = dp(activity, 16)
+        overlay.addView(acctBox, acctLp)
+
+        fun updateAcctButtons() {
+            unlockBtn.text = "Unlock all (skins, hats, visors, pets, nameplates, bundles, cubes): " + (if (unlockAll) "ON" else "OFF")
+            nameEditBtn.text = "Name: " + (if (acctName.isEmpty()) "(tap to type)" else acctName)
+            nameApplyBtn.text = "Select"
+            levelEditBtn.text = "Level: " + (if (acctLevel.isEmpty()) "(tap to type)" else acctLevel)
+            levelApplyBtn.text = "Select"
+            levelMaxBtn.text = "Max ($ACCT_MAX_LEVEL)"
+        }
+        fun refreshAcct() {
+            try {
+                acctInfo.text = NativeMenu.accountText()
+            } catch (t: Throwable) {
+                acctInfo.text = "Account: native library not loaded ($t)"
+            }
+        }
+        fun sendLevel(text: String) {
+            val v = text.trim().toLongOrNull()
+            if (v == null || v < 0L || v > 4294967295L) {
+                acctInfo.text = "Level must be a whole number from 0 to 4294967295."
+                return
+            }
+            try {
+                val r = NativeMenu.requestSetLevel(v)
+                if (r == 0) acctInfo.text = "Menu not ready yet (wait for 'Menu ready')."
+                else if (r < 0) acctInfo.text = "Level rejected by the native side."
+            } catch (t: Throwable) {
+                acctInfo.text = "Account: native library not loaded ($t)"
+            }
+            ui.postDelayed({ refreshAcct() }, 500)
+        }
+        updateAcctButtons()
+        try { NativeMenu.setUnlockAll(if (unlockAll) 1 else 0) } catch (t: Throwable) { Log.i("GameMenu", "setUnlockAll not available yet: $t") }
+        unlockBtn.setOnClickListener {
+            unlockAll = !unlockAll
+            try { NativeMenu.setUnlockAll(if (unlockAll) 1 else 0) } catch (t: Throwable) { acctInfo.text = "Account: native library not loaded ($t)" }
+            updateAcctButtons()
+            ui.postDelayed({ refreshAcct() }, 500)
+        }
+        nameEditBtn.setOnClickListener {
+            askText(activity, "Name (shown to everyone)", acctName, false) { acctName = it; updateAcctButtons() }
+        }
+        nameApplyBtn.setOnClickListener {
+            if (acctName.isEmpty()) {
+                acctInfo.text = "Type a name first (tap the Name button)."
+            } else {
+                try {
+                    val r = NativeMenu.requestSetName(acctName)
+                    if (r == 0) acctInfo.text = "Menu not ready yet (wait for 'Menu ready')."
+                    else if (r < 0) acctInfo.text = "Name rejected: it must be 1 to 100 characters."
+                } catch (t: Throwable) {
+                    acctInfo.text = "Account: native library not loaded ($t)"
+                }
+                ui.postDelayed({ refreshAcct() }, 500)
+            }
+        }
+        levelEditBtn.setOnClickListener {
+            askText(activity, "Level (0 - 4294967295)", acctLevel, true) { acctLevel = it.trim(); updateAcctButtons() }
+        }
+        levelApplyBtn.setOnClickListener {
+            if (acctLevel.isEmpty()) acctInfo.text = "Type a level first (tap the Level button)." else sendLevel(acctLevel)
+        }
+        levelMaxBtn.setOnClickListener {
+            acctLevel = ACCT_MAX_LEVEL.toString()
+            updateAcctButtons()
+            sendLevel(acctLevel)
+        }
+        acctHideBtn.setOnClickListener { acctBox.visibility = View.GONE }
+        acctBtn.setOnClickListener {
+            lagBox.visibility = View.GONE
+            console.visibility = View.GONE
+            players.visibility = View.GONE
+            hostBox.visibility = View.GONE
+            visBox.visibility = View.GONE
+            acctBox.visibility = View.VISIBLE
+            refreshAcct()
+        }
+        val acctRefresher = object : Runnable {
+            override fun run() {
+                if (overlay.parent == null) return
+                if (acctBox.visibility == View.VISIBLE) refreshAcct()
+                ui.postDelayed(this, 1000)
+            }
+        }
+        ui.postDelayed(acctRefresher, 1000)
+
         var lagMarkCount = 0
         var hideSeq = 0
         var softOff = false
@@ -650,6 +821,7 @@ object GameMenu {
         }
         lagCloseBtn.setOnClickListener { lagBox.visibility = View.GONE }
         lagBtn.setOnClickListener {
+            acctBox.visibility = View.GONE
             console.visibility = View.GONE
             players.visibility = View.GONE
             hostBox.visibility = View.GONE
@@ -680,6 +852,7 @@ object GameMenu {
         visHideBtn.setOnClickListener { visBox.visibility = View.GONE }
         visualBtn.setOnClickListener {
             lagBox.visibility = View.GONE
+            acctBox.visibility = View.GONE
             console.visibility = View.GONE
             players.visibility = View.GONE
             hostBox.visibility = View.GONE
@@ -705,6 +878,7 @@ object GameMenu {
         }
         playersBtn.setOnClickListener {
             lagBox.visibility = View.GONE
+            acctBox.visibility = View.GONE
             console.visibility = View.GONE
             hostBox.visibility = View.GONE
             visBox.visibility = View.GONE
@@ -713,6 +887,7 @@ object GameMenu {
         }
         consoleBtn.setOnClickListener {
             lagBox.visibility = View.GONE
+            acctBox.visibility = View.GONE
             players.visibility = View.GONE
             hostBox.visibility = View.GONE
             visBox.visibility = View.GONE
@@ -732,6 +907,7 @@ object GameMenu {
 
         hostBtn.setOnClickListener {
             lagBox.visibility = View.GONE
+            acctBox.visibility = View.GONE
             console.visibility = View.GONE
             players.visibility = View.GONE
             visBox.visibility = View.GONE
@@ -806,7 +982,7 @@ object GameMenu {
                 else -> false
             }
         }
-        closeBtn.setOnClickListener { panel.visibility = View.GONE; console.visibility = View.GONE; players.visibility = View.GONE; hostBox.visibility = View.GONE; visBox.visibility = View.GONE; lagBox.visibility = View.GONE }
+        closeBtn.setOnClickListener { panel.visibility = View.GONE; console.visibility = View.GONE; players.visibility = View.GONE; hostBox.visibility = View.GONE; visBox.visibility = View.GONE; lagBox.visibility = View.GONE; acctBox.visibility = View.GONE }
 
         // keep the status line fresh while the panel is open
         val refresher = object : Runnable {
