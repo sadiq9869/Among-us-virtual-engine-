@@ -143,6 +143,14 @@ class BlackBoxLoader {
                                                 Log.e(TAG, "MENUTEST loadLibrary FAILED: ${t}")
                                             }
                                         }
+                                        if (packageName == "com.miniclip.carrom") {
+                                            try {
+                                                System.loadLibrary("carprobe")
+                                                Log.d(TAG, "CARPROBE loadLibrary OK for $processName")
+                                            } catch (t: Throwable) {
+                                                Log.e(TAG, "CARPROBE loadLibrary FAILED: ${t}")
+                                            }
+                                        }
                                     } catch (e: Exception) {
                                         Log.e(TAG, "Error in beforeCreateApplication: ${e.message}")
                                     }
