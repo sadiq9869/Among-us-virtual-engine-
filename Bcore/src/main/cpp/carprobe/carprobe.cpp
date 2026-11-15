@@ -1,4 +1,4 @@
-// carprobe.cpp  v1  -  READ-ONLY probe for Carrom Pool (com.miniclip.carrom).
+// carprobe.cpp  v2 (v1 + garbage filter for freed objects, _controlsLogic link, shows every valid object)  -  READ-ONLY probe for Carrom Pool (com.miniclip.carrom).
 // NO hooks, NO patching, NO writes into the game. It only READS memory (through a pipe, so a bad
 // address gives an error code instead of a crash) and prints values to logcat, tag CARPROBE1.
 //
@@ -248,6 +248,7 @@ static Iv L_angle = {"_angle", -1}, L_dist = {"_distanceToCenter", -1}, L_active
 // remote aim
 static Iv R_angle = {"_angle", -1}, R_power = {"_power", -1}, R_spos = {"_strikerPosition", -1}, R_sid = {"_strikerId", -1};
 // aim guide node
+static Iv F_ctl = {"_controlsLogic", -1};
 static Iv F_maxg = {"mMaxGuides", -1}, F_scale = {"_tableScale", -1}, F_vrot = {"_visualRotation", -1}, F_safe = {"_safeAreaOffset", -1};
 // CCNode parts (found through StrikerNode / PuckNode / ControlsForegroundNode super chain)
 static Iv N_pos = {"_position", -1}, N_vis = {"_visible", -1}, N_run = {"_isRunning", -1}, N_size = {"_contentSize", -1};
@@ -262,7 +263,7 @@ static void resolve_offsets() {
         {&L_angle, C_LOCAL}, {&L_dist, C_LOCAL}, {&L_active, C_LOCAL}, {&L_enabled, C_LOCAL}, {&L_vrot, C_LOCAL},
         {&L_center, C_LOCAL}, {&L_enough, C_LOCAL}, {&L_sid, C_LOCAL},
         {&R_angle, C_REMOTE}, {&R_power, C_REMOTE}, {&R_spos, C_REMOTE}, {&R_sid, C_REMOTE},
-        {&F_maxg, C_FG}, {&F_scale, C_FG}, {&F_vrot, C_FG}, {&F_safe, C_FG},
+        {&F_ctl, C_FG}, {&F_maxg, C_FG}, {&F_scale, C_FG}, {&F_vrot, C_FG}, {&F_safe, C_FG},
         {&N_pos, C_STRIKER}, {&N_vis, C_STRIKER}, {&N_run, C_STRIKER}, {&N_size, C_STRIKER},
         {&P_radius, C_PUCK},
     };
@@ -352,58 +353,60 @@ static bool still_valid(int cls, u64 o) {
 }
 
 // ------------------------------------------------------------------ snapshot
+// Freed objects keep their old isa word, so the heap scan also finds dead memory. Every object
+// below is therefore checked for plausible values (flags are 0/1, numbers in a sane range).
+static bool sane(double v, double lim) { return isfinite(v) && fabs(v) < lim; }
+
 static std::string snapshot() {
-    char b[256];
+    char b[320];
     std::string s;
     int shown;
 
     shown = 0;
     for (u64 o : g_objs[C_LOCAL]) {
-        if (shown >= 3) break;
+        if (shown >= 6) break;
         double ang, dist, cx, cy; float vr; int act, en, enough, sid;
         if (!getd(o, L_angle.off, ang) || !getd(o, L_dist.off, dist)) continue;
-        getb(o, L_active.off, act) || (act = -1);
-        getb(o, L_enabled.off, en) || (en = -1);
-        getb(o, L_enough.off, enough) || (enough = -1);
-        geti(o, L_sid.off, sid) || (sid = -1);
+        if (!getb(o, L_active.off, act) || !getb(o, L_enabled.off, en) || !getb(o, L_enough.off, enough)) continue;
+        if (!geti(o, L_sid.off, sid)) continue;
+        if (!sane(ang, 7.0) || !sane(dist, 5000.0) || act > 1 || en > 1 || enough > 1 || sid < 0 || sid > 16) continue;
         getf(o, L_vrot.off, vr) || (vr = NAN);
-        getpt(o, L_center.off, cx, cy) || (cx = cy = NAN);
+        if (!getpt(o, L_center.off, cx, cy) || !sane(cx, 5000.0) || !sane(cy, 5000.0)) { cx = cy = NAN; }
         snprintf(b, sizeof(b), "LOCAL@%lx ang=%.4f(%.1fdeg) dist=%.2f act=%d en=%d power_ok=%d sid=%d vrot=%.3f ctr=%.1f,%.1f\n",
                  (unsigned long)o, ang, ang * 180.0 / M_PI, dist, act, en, enough, sid, vr, cx, cy);
         s += b; shown++;
     }
     shown = 0;
     for (u64 o : g_objs[C_REMOTE]) {
-        if (shown >= 3) break;
+        if (shown >= 6) break;
         double ang, pw, sx, sy; int sid;
-        if (!getd(o, R_angle.off, ang) || !getd(o, R_power.off, pw)) continue;
-        geti(o, R_sid.off, sid) || (sid = -1);
-        getpt(o, R_spos.off, sx, sy) || (sx = sy = NAN);
+        if (!getd(o, R_angle.off, ang) || !getd(o, R_power.off, pw) || !geti(o, R_sid.off, sid)) continue;
+        if (!sane(ang, 7.0) || !sane(pw, 10000.0) || sid < 0 || sid > 16) continue;
+        if (!getpt(o, R_spos.off, sx, sy) || !sane(sx, 5000.0) || !sane(sy, 5000.0)) continue;
         snprintf(b, sizeof(b), "REMOTE@%lx ang=%.4f(%.1fdeg) power=%.2f sid=%d spos=%.1f,%.1f\n",
                  (unsigned long)o, ang, ang * 180.0 / M_PI, pw, sid, sx, sy);
         s += b; shown++;
     }
     shown = 0;
     for (u64 o : g_objs[C_FG]) {
-        if (shown >= 3) break;
-        int mg; float sc, vr; double px, py; int run;
-        if (!geti(o, F_maxg.off, mg)) continue;
+        if (shown >= 6) break;
+        int mg; float sc, vr; double px, py; int run; u64 ctl = 0;
+        if (!geti(o, F_maxg.off, mg) || mg < 0 || mg > 64) continue;
+        if (!getb(o, N_run.off, run) || run > 1) continue;
         getf(o, F_scale.off, sc) || (sc = NAN);
         getf(o, F_vrot.off, vr) || (vr = NAN);
         getpt(o, N_pos.off, px, py) || (px = py = NAN);
-        getb(o, N_run.off, run) || (run = -1);
-        snprintf(b, sizeof(b), "GUIDE@%lx maxGuides=%d tableScale=%.3f vrot=%.3f pos=%.1f,%.1f run=%d\n",
-                 (unsigned long)o, mg, sc, vr, px, py, run);
+        if (F_ctl.off >= 0) rd(o + F_ctl.off, &ctl, 8);
+        snprintf(b, sizeof(b), "GUIDE@%lx maxGuides=%d tableScale=%.3f vrot=%.3f pos=%.1f,%.1f run=%d logic=%lx\n",
+                 (unsigned long)o, mg, sc, vr, px, py, run, (unsigned long)ctl);
         s += b; shown++;
     }
     shown = 0;
     for (u64 o : g_objs[C_STRIKER]) {
-        if (shown >= 4) break;
+        if (shown >= 6) break;
         double px, py; int vis, run;
-        if (!getpt(o, N_pos.off, px, py) || fabs(px) > 1e6 || fabs(py) > 1e6) continue;
-        getb(o, N_vis.off, vis) || (vis = -1);
-        getb(o, N_run.off, run) || (run = -1);
-        if (run != 1) continue;
+        if (!getpt(o, N_pos.off, px, py) || !sane(px, 5000.0) || !sane(py, 5000.0)) continue;
+        if (!getb(o, N_vis.off, vis) || !getb(o, N_run.off, run) || vis > 1 || run != 1) continue;
         snprintf(b, sizeof(b), "STRIKER@%lx pos=%.1f,%.1f vis=%d\n", (unsigned long)o, px, py, vis);
         s += b; shown++;
     }
@@ -412,11 +415,9 @@ static std::string snapshot() {
     for (u64 o : g_objs[C_PUCK]) {
         if (pn >= 24) break;
         double px, py; float r; int vis, run;
-        if (!getpt(o, N_pos.off, px, py) || fabs(px) > 1e6 || fabs(py) > 1e6) continue;
-        getb(o, N_run.off, run) || (run = -1);
-        if (run != 1) continue;
-        getb(o, N_vis.off, vis) || (vis = -1);
-        getf(o, P_radius.off, r) || (r = NAN);
+        if (!getpt(o, N_pos.off, px, py) || !sane(px, 5000.0) || !sane(py, 5000.0)) continue;
+        if (!getb(o, N_run.off, run) || !getb(o, N_vis.off, vis) || run != 1 || vis > 1) continue;
+        if (!getf(o, P_radius.off, r) || r < 1.0f || r > 200.0f) continue;
         snprintf(b, sizeof(b), " (%.0f,%.0f r%.1f v%d)", px, py, r, vis);
         pk += b; pn++;
     }
@@ -481,7 +482,7 @@ static void* worker(void*) {
 }
 
 __attribute__((constructor)) static void init() {
-    LOG("carprobe v1 loaded");
+    LOG("carprobe v2 loaded");
     pthread_t th;
     pthread_create(&th, nullptr, worker, nullptr);
     pthread_detach(th);
