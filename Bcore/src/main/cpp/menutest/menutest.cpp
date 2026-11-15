@@ -1,3 +1,4 @@
+// MENUTEST v25 = v24 + Always Imposter "hold and release": roles are recorded during SelectRoles and swapped once afterwards, impostor count never changes (fixes the 3->2 impostor black screen).
 // MENUTEST v24 = v23 + Account through the game's OWN save data (DataManager.Player.Customization / Stats), kept in a file and restored after a restart; no direct RpcSetName/CmdCheckName/RpcSetLevel any more (they got the user kicked).
 // MENUTEST v23 = v22 + ACCOUNT (unlock all cosmetics via Free flags + PlayerPurchasesData.GetPurchase hook, name, level). Probes (C# sampler) default OFF.
 // MENUTEST v22 = v21 + C# SAMPLER (PROF lines: which C# methods the busy IL2CPP threads run) + per-thread system time. See PROBE-* lines every 5 s.
@@ -2228,6 +2229,14 @@ static void hk_cosetrole(void *self, uint64_t role, uint64_t canOverride, const 
 // roles, in which order (impostors first?), with which canOverride, and when does RoleManager.SelectRoles start/end.
 // No il2cpp calls inside the hooks (only pointers/numbers are logged); names come from the "ROLES[after-SelectRoles]" line.
 static std::atomic<int> g_rpcLogged{0};
+// v25 "hold and release": while the game assigns roles the hook only RECORDS who got which role and lets the game's own assignment run
+// untouched. After SelectRoles has finished, one decision is made with the whole picture, so the number of impostors never changes:
+//   * I am already an impostor -> only my own role may change (to the wanted impostor role); nobody else is touched.
+//   * I am crew -> I swap roles with ONE impostor chosen uniformly at random by me (he gets my crew role, I get his impostor role, or the
+//     wanted role when one is selected).
+struct SelRec { void *p; unsigned role; };
+static SelRec g_selRec[40];
+static int g_selRecN = 0;
 static void hk_rpcsetrole(void *self, uint64_t role, uint64_t canOverride, const void *method) {
     int seq = g_rpcLogged.fetch_add(1);
     void *local = nullptr;
@@ -2241,48 +2250,63 @@ static void hk_rpcsetrole(void *self, uint64_t role, uint64_t canOverride, const
              pname(self), self == local ? 1 : 0, rv, nm ? nm : "?", (int)(canOverride & 0xff), inSel ? " [in SelectRoles]" : "");
     }
     g_lastMethod = method;
-    // ---- v15: swap while the game assigns roles (host only: SelectRoles runs only on the host)
-    if (inSel && local && orig_rpcsetrole && g_alwaysImp.load()) {
-        if (self == local) {
-            if (isImpRoleVal(rv)) {
-                g_localImpDone = true;                       // the game itself made me an impostor: nothing to swap
-            } else if (g_displaced) {
-                LOGI("MENUTEST V15 REDIRECT: my crew role %u goes to the displaced impostor %p (%s)", rv, g_displaced, pname(g_displaced));
-                orig_rpcsetrole(g_displaced, role, canOverride, method);
-                g_crewGiven = true;
-                setSwapMsg("Always Imposter: the impostor %s got your crew role (%u), you took his impostor role.", pname(g_displaced), rv);
-                return;
-            } else {
-                g_haveLocalCrew = true; g_localCrewRole = rv; // crew role arrived before any impostor role (unexpected order); remembered
-            }
-        } else if (isImpRoleVal(rv) && !g_localImpDone && !g_displaced) {
-            int wi = g_wantIdx.load();
-            unsigned give = (wi > 0 && wi < kWantCount) ? kWantVals[wi] : rv;
-            LOGI("MENUTEST V15 REDIRECT: impostor role %u of %p (%s) goes to ME as %u", rv, self, pname(self), give);
-            g_displaced = self;
-            g_localImpDone = true;
-            if (g_haveLocalCrew) {                           // I already got a crew role: override it, and hand that role to the displaced one
-                orig_rpcsetrole(local, (uint64_t)give, 1, method);
-                orig_rpcsetrole(self, (uint64_t)g_localCrewRole, 1, method);
-                g_crewGiven = true;
-            } else {
-                orig_rpcsetrole(local, (uint64_t)give, canOverride, method);
-            }
-            return;
-        }
+    if (inSel && g_selRecN < 40) {   // record only; the game's assignment is passed through unchanged
+        int k = -1;
+        for (int i = 0; i < g_selRecN; i++) if (g_selRec[i].p == self) { k = i; break; }
+        if (k < 0) k = g_selRecN++;
+        g_selRec[k].p = self;
+        g_selRec[k].role = rv;
     }
     if (orig_rpcsetrole) orig_rpcsetrole(self, role, canOverride, method);
 }
 static void hk_selectroles(void *self, const void *method) {
     nameTick(800);   // v16: make sure the pointer->name table is fresh BEFORE the roles are assigned (names are read here, not in the hooks)
     LOGI("MENUTEST SELECTROLES ENTER t=%ld alwaysImp=%d names=%d", nowMs() % 1000000, g_alwaysImp.load() ? 1 : 0, g_nameCount);
-    g_displaced = nullptr; g_localImpDone = false; g_haveLocalCrew = false; g_crewGiven = false; g_localCrewRole = 0;
+    g_displaced = nullptr;
+    g_selRecN = 0;
     g_inSelect.store(1);
     if (orig_selectroles) orig_selectroles(self, method);
     g_inSelect.store(0);
-    if (g_displaced && !g_crewGiven && orig_rpcsetrole) {   // safety net: the displaced impostor must never stay without a role
-        LOGI("MENUTEST V15 SAFETY: displaced %p (%s) got no crew role, giving Crewmate", g_displaced, pname(g_displaced));
-        orig_rpcsetrole(g_displaced, 0, 1, g_lastMethod);
+    // ---- release: decide once, with the full picture
+    if (g_alwaysImp.load() && orig_rpcsetrole) {
+        void *local = nullptr;
+        if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
+        int me = -1, impN = 0;
+        int impIdx[40];
+        for (int i = 0; i < g_selRecN; i++) {
+            if (g_selRec[i].p == local) me = i;
+            else if (isImpRoleVal(g_selRec[i].role)) impIdx[impN++] = i;
+        }
+        int wi = g_wantIdx.load();
+        const bool haveWant = (wi > 0 && wi < kWantCount);
+        if (!local || me < 0) {
+            LOGI("MENUTEST V25 RELEASE: my own role was not seen (local=%p me=%d recs=%d), nothing changed", local, me, g_selRecN);
+            setSwapMsg("Always Imposter: could not see your role in this match, nothing was changed.");
+        } else if (isImpRoleVal(g_selRec[me].role)) {
+            unsigned cur = g_selRec[me].role, want = haveWant ? kWantVals[wi] : cur;
+            if (want != cur) {
+                orig_rpcsetrole(local, (uint64_t)want, 1, g_lastMethod);
+                LOGI("MENUTEST V25 RELEASE: I was already an impostor (role %u), changed only my role to %u; impostors in the match unchanged (%d)", cur, want, impN + 1);
+                setSwapMsg("Always Imposter: you were already an impostor; your role is now %s. Nobody else was touched (%d impostors).", roleName(want) ? roleName(want) : "?", impN + 1);
+            } else {
+                LOGI("MENUTEST V25 RELEASE: I was already an impostor (role %u), nothing to change", cur);
+                setSwapMsg("Always Imposter: you were already an impostor (%s). Nothing was changed.", roleName(cur) ? roleName(cur) : "?");
+            }
+        } else if (impN == 0) {
+            LOGI("MENUTEST V25 RELEASE: no impostor in this match, nothing to swap with");
+            setSwapMsg("Always Imposter: this match has no other impostor to swap with, nothing was changed.");
+        } else {
+            static std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
+            int pick = impIdx[(int)(rng() % (unsigned)impN)];
+            void *victim = g_selRec[pick].p;
+            unsigned impRole = g_selRec[pick].role, myCrew = g_selRec[me].role;
+            unsigned give = haveWant ? kWantVals[wi] : impRole;
+            g_displaced = victim;
+            LOGI("MENUTEST V25 RELEASE: random pick %d of %d impostors: %p (%s) role %u. He gets my crew role %u, I get %u", pick, impN, victim, pname(victim), impRole, myCrew, give);
+            orig_rpcsetrole(local, (uint64_t)give, 1, g_lastMethod);
+            orig_rpcsetrole(victim, (uint64_t)myCrew, 1, g_lastMethod);
+            setSwapMsg("Always Imposter: swapped with %s (picked at random from %d impostors). He got your crew role (%u), you got %u. Impostor count unchanged.", pname(victim), impN, myCrew, give);
+        }
     }
     LOGI("MENUTEST SELECTROLES EXIT t=%ld swapped=%d", nowMs() % 1000000, g_displaced ? 1 : 0);
     g_assignLogAt.store(nowMs() + 2500);
@@ -2521,7 +2545,7 @@ static void *watcher(void *) {
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v24 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v25 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
