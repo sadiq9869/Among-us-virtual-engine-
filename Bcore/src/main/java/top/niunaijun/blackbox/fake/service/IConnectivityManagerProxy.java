@@ -15,6 +15,7 @@ import java.util.List;
 
 import black.android.net.BRIConnectivityManagerStub;
 import black.android.os.BRServiceManager;
+import top.niunaijun.blackbox.BlackBoxCore;
 import top.niunaijun.blackbox.fake.hook.BinderInvocationStub;
 import top.niunaijun.blackbox.fake.hook.ScanClass;
 import top.niunaijun.blackbox.fake.hook.MethodHook;
@@ -1516,6 +1517,56 @@ public class IConnectivityManagerProxy extends BinderInvocationStub {
             } catch (Exception e) {
                 Slog.e(TAG, "Failed to create fallback NetworkInfo for String (19): " + e.getMessage());
                 return null;
+            }
+        }
+    }
+
+    // CRNET1: Cronet (Carrom Pool) calls ConnectivityManager.getNetworkInfo(Network), which calls
+    // getNetworkInfoForUid(Network, int uid, boolean ignoreBlocked) with Process.myUid().
+    // Inside the container that uid differs from the real calling uid, so the system asks for
+    // NETWORK_STACK permission and throws SecurityException (Cronet thread "CronetInit" died).
+    // Fix: pass the real host uid. Parameter types are checked first; anything unexpected is passed through.
+    @ProxyMethod("getNetworkInfoForUid")
+    public static class GetNetworkInfoForUid extends MethodHook {
+        private static int sLogCount = 0;
+
+        private static void logOnce(String msg) {
+            if (sLogCount < 12) {
+                sLogCount++;
+                Slog.d(TAG, "CRNET1 " + msg);
+            }
+        }
+
+        @Override
+        protected Object hook(Object who, Method method, Object[] args) throws Throwable {
+            Class<?>[] types = method.getParameterTypes();
+            boolean shapeOk = args != null && args.length == 3 && types.length == 3
+                    && types[1] == int.class && args[1] instanceof Integer;
+            if (!shapeOk) {
+                logOnce("unexpected signature, passed through: " + method);
+                return invokeUnwrapped(who, method, args);
+            }
+
+            int original = (Integer) args[1];
+            int hostUid = BlackBoxCore.getHostUid();
+            Object[] fixed = args.clone();
+            fixed[1] = hostUid;
+            logOnce("uid arg " + original + " -> host uid " + hostUid);
+
+            try {
+                return invokeUnwrapped(who, method, fixed);
+            } catch (SecurityException e) {
+                // Last resort so the caller (Cronet) does not die; the answer is a generic "connected" Wi-Fi.
+                logOnce("still SecurityException with host uid, returning fallback: " + e.getMessage());
+                return createNetworkInfo(ConnectivityManager.TYPE_WIFI, 0, "WIFI", "");
+            }
+        }
+
+        private static Object invokeUnwrapped(Object who, Method method, Object[] args) throws Throwable {
+            try {
+                return method.invoke(who, args);
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                throw e.getCause() != null ? e.getCause() : e;
             }
         }
     }
