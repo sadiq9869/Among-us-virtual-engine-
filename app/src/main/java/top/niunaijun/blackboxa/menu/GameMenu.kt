@@ -57,6 +57,10 @@ object NativeMenu {
     external fun requestSetName(name: String): Int
     external fun requestSetLevel(level: Long): Int
     external fun accountText(): String
+    // v24: folder for the saved account file, and the saved values (name "" / level -1 = nothing saved)
+    external fun setStorageDir(dir: String)
+    external fun savedName(): String
+    external fun savedLevel(): Long
 }
 
 /**
@@ -715,6 +719,12 @@ object GameMenu {
             }
             ui.postDelayed({ refreshAcct() }, 500)
         }
+        try {
+            NativeMenu.setStorageDir(activity.filesDir.absolutePath)
+            acctName = NativeMenu.savedName()
+            val sl = NativeMenu.savedLevel()
+            acctLevel = if (sl >= 0) sl.toString() else ""
+        } catch (t: Throwable) { Log.i("GameMenu", "saved account values not available yet: $t") }
         updateAcctButtons()
         try { NativeMenu.setUnlockAll(if (unlockAll) 1 else 0) } catch (t: Throwable) { Log.i("GameMenu", "setUnlockAll not available yet: $t") }
         unlockBtn.setOnClickListener {
@@ -724,7 +734,7 @@ object GameMenu {
             ui.postDelayed({ refreshAcct() }, 500)
         }
         nameEditBtn.setOnClickListener {
-            askText(activity, "Name (shown to everyone)", acctName, false) { acctName = it; updateAcctButtons() }
+            askText(activity, "Name (saved; shown to others after you rejoin the lobby)", acctName, false) { acctName = it; updateAcctButtons() }
         }
         nameApplyBtn.setOnClickListener {
             if (acctName.isEmpty()) {
@@ -741,7 +751,7 @@ object GameMenu {
             }
         }
         levelEditBtn.setOnClickListener {
-            askText(activity, "Level (0 - 4294967295)", acctLevel, true) { acctLevel = it.trim(); updateAcctButtons() }
+            askText(activity, "Level (saved; shown to others after you rejoin the lobby)", acctLevel, true) { acctLevel = it.trim(); updateAcctButtons() }
         }
         levelApplyBtn.setOnClickListener {
             if (acctLevel.isEmpty()) acctInfo.text = "Type a level first (tap the Level button)." else sendLevel(acctLevel)
