@@ -1,3 +1,4 @@
+// MENUTEST v24 = v23 + Account through the game's OWN save data (DataManager.Player.Customization / Stats), kept in a file and restored after a restart; no direct RpcSetName/CmdCheckName/RpcSetLevel any more (they got the user kicked).
 // MENUTEST v23 = v22 + ACCOUNT (unlock all cosmetics via Free flags + PlayerPurchasesData.GetPurchase hook, name, level). Probes (C# sampler) default OFF.
 // MENUTEST v22 = v21 + C# SAMPLER (PROF lines: which C# methods the busy IL2CPP threads run) + per-thread system time. See PROBE-* lines every 5 s.
 // MENUTEST v19 = v17 + REALSCAN logger REMOVED + Submit Scan like the REAL task (numbers from the user's REALSCAN log, build 2026.11.3):
@@ -44,6 +45,7 @@
 #include <sys/syscall.h>
 #include <atomic>
 #include <mutex>
+#include <string>
 #include <random>
 #include "xdl.h"
 #include "Dobby/dobby.h"
@@ -1534,7 +1536,13 @@ static void *k_HatManager = nullptr, *f_HMInst = nullptr, *m_HMInst = nullptr;
 static void *f_HM_pets = nullptr, *f_HM_hats = nullptr, *f_HM_skins = nullptr, *f_HM_visors = nullptr, *f_HM_plates = nullptr;
 static void *f_HM_bundles = nullptr, *f_HM_featItems = nullptr, *f_HM_featBundles = nullptr, *f_HM_featCubes = nullptr;
 static void *f_CD_Free = nullptr, *f_BD_Free = nullptr, *f_CC_Free = nullptr;
-static void *m_RpcSetName = nullptr, *m_CmdCheckName = nullptr, *m_RpcSetLevel = nullptr, *f_NI_PlayerLevel = nullptr;
+// v24: the game's own save data (dump build 2026.11.3): DataManager.get_Player() static -> PlayerData.get_Customization()/get_Stats();
+// PlayerCustomizationData get_/set_ Name, Pet, Hat, Skin, Visor, NamePlate (string); PlayerStatsData get_/set_ Level (uint).
+// The setters go through AbstractSaveDataGroup.SetValue, i.e. the game's normal change/save path.
+static void *m_DM_getPlayer = nullptr, *m_PD_getCust = nullptr, *m_PD_getStats = nullptr, *m_PS_getLevel = nullptr, *m_PS_setLevel = nullptr;
+static void *m_PC_get[6] = {nullptr}, *m_PC_set[6] = {nullptr}, *m_RpcSetCos[6] = {nullptr};
+static const char *kCustName[6] = {"Name", "Pet", "Hat", "Skin", "Visor", "NamePlate"};
+static const char *kRpcCosName[6] = {nullptr, "RpcSetPet", "RpcSetHat", "RpcSetSkin", "RpcSetVisor", "RpcSetNamePlate"};
 
 static void logFieldOffset(const char *label, void *f, int dumpOff) {
     if (!f) { LOGI("MENUTEST acct field %s: NOT FOUND (dump says 0x%x)", label, dumpOff); return; }
@@ -1578,12 +1586,20 @@ static void acctResolveFn(void *) {
     logFieldOffset("HatManager.allFeaturedItems", f_HM_featItems, 0x80);
     logFieldOffset("HatManager.allFeaturedBundles", f_HM_featBundles, 0x88);
     logFieldOffset("HatManager.allFeaturedCubes", f_HM_featCubes, 0x90);
-    m_RpcSetName = findMethod(k_PlayerControl, "RpcSetName", 1);
-    m_CmdCheckName = findMethod(k_PlayerControl, "CmdCheckName", 1);
-    m_RpcSetLevel = findMethod(k_PlayerControl, "RpcSetLevel", 1);
-    if (k_NetInfo) f_NI_PlayerLevel = findField(k_NetInfo, "PlayerLevel");
-    LOGI("MENUTEST acct PlayerControl RpcSetName=%p CmdCheckName=%p RpcSetLevel=%p | NetworkedPlayerInfo.PlayerLevel=%p (dump 0x60)",
-         m_RpcSetName, m_CmdCheckName, m_RpcSetLevel, f_NI_PlayerLevel);
+    void *kdm = classByName("DataManager"), *kpd = classByName("PlayerData"), *kpc = classByName("PlayerCustomizationData"), *kps = classByName("PlayerStatsData");
+    if (kdm) m_DM_getPlayer = findMethod(kdm, "get_Player", 0);
+    if (kpd) { m_PD_getCust = findMethod(kpd, "get_Customization", 0); m_PD_getStats = findMethod(kpd, "get_Stats", 0); }
+    if (kps) { m_PS_getLevel = findMethod(kps, "get_Level", 0); m_PS_setLevel = findMethod(kps, "set_Level", 1); }
+    for (int i = 0; i < 6; i++) {
+        char g[40], s[40];
+        snprintf(g, sizeof(g), "get_%s", kCustName[i]);
+        snprintf(s, sizeof(s), "set_%s", kCustName[i]);
+        if (kpc) { m_PC_get[i] = findMethod(kpc, g, 0); m_PC_set[i] = findMethod(kpc, s, 1); }
+        if (kRpcCosName[i]) m_RpcSetCos[i] = findMethod(k_PlayerControl, kRpcCosName[i], 1);
+    }
+    LOGI("MENUTEST acct save-data: DataManager=%p PlayerData=%p Customization=%p Stats=%p get_Player=%p get_Customization=%p get_Stats=%p get_Level=%p set_Level=%p",
+         kdm, kpd, kpc, kps, m_DM_getPlayer, m_PD_getCust, m_PD_getStats, m_PS_getLevel, m_PS_setLevel);
+    for (int i = 0; i < 6; i++) LOGI("MENUTEST acct save-data %s: get=%p set=%p rpc=%p", kCustName[i], m_PC_get[i], m_PC_set[i], m_RpcSetCos[i]);
 }
 
 // ---- unlock: CosmeticData.Free / BundleData.Free / CosmicubeData.Free = true for every item the game's lists hold
@@ -1675,6 +1691,9 @@ static void unlockFn(void *) {
                  as[0].done, as[1].done, as[2].done, as[3].done, as[4].done, ls[0].done, ls[1].done, ls[2].done, ls[3].done);
 }
 static long g_acctNextMs = 0;   // Unity thread only
+static void syncFn(void *);
+static void applyFn(void *);
+static std::atomic<int> g_applyBits{0};   // bit0 = apply name now, bit1 = apply level now (Unity thread)
 static void acctTick() {
     if (!g_acctUnlock.load(std::memory_order_relaxed)) return;
     long now = nowMs();
@@ -1682,6 +1701,8 @@ static void acctTick() {
     g_acctNextMs = now + kAcctTickMs;
     if (!g_acctResolved && !guarded(acctResolveFn, nullptr)) { setUnlockMsg("Fault while resolving HatManager (see logcat MENUTEST)."); return; }
     if (!guarded(unlockFn, nullptr)) setUnlockMsg("Crash guard caught a fault while unlocking (see logcat MENUTEST).");
+    if (!guarded(syncFn, nullptr)) setAcctMsg("Crash guard caught a fault in the account sync (see logcat MENUTEST).");
+    if (g_applyBits.load() && !guarded(applyFn, nullptr)) setAcctMsg("Crash guard caught a fault while writing name/level (see logcat MENUTEST).");
 }
 
 // ---- PlayerPurchasesData.GetPurchase(string,string) -> true while the tick is ON. (DataManager has no GetPurchase: the static one in the
@@ -1707,71 +1728,204 @@ static void installPurchaseHook() {
     else { orig_pp_getpurchase = nullptr; LOGI("MENUTEST acct GetPurchase hook NOT installed r=%d", r); }
 }
 
-// ---- name / level, executed on the Unity thread
-static void readBackName(char *out, size_t cap, void *local) {
-    out[0] = 0;
-    void *d = dataOf(local);
-    if (d && m_get_PlayerName) {
-        bool ok = false;
-        void *s = invokeRaw(m_get_PlayerName, d, nullptr, "get_PlayerName", &ok);
-        if (ok) il2str(s, out, cap);
-    }
-    if (!out[0]) snprintf(out, cap, "?");
+// ---- v24: persistent account data. Desired values live in g_saved (+ a file in the app's files dir, UTF-16 as hex so any text is safe).
+struct SavedAcct { std::u16string v[6]; long long level; };   // v[0]=name, 1=pet, 2=hat, 3=skin, 4=visor, 5=nameplate
+static SavedAcct g_saved = {{}, -1};
+static std::string g_storeDir;                               // set from Kotlin (filesDir); empty = no file
+static bool g_restored = false;                              // Unity thread only
+
+static std::string hexEnc(const std::u16string &s) {
+    static const char *h = "0123456789abcdef";
+    std::string o;
+    for (char16_t c : s) for (int sh = 12; sh >= 0; sh -= 4) o += h[(c >> sh) & 15];
+    return o;
 }
-static void nameFn(void *) {
-    void *local = nullptr;
-    if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
-    if (!local) { setAcctMsg("Name: no local player yet. Join a lobby first."); return; }
-    if (!p_string_new_utf16) { setAcctMsg("Name: il2cpp_string_new_utf16 not found in this build, cannot create the text."); return; }
-    uint16_t buf[kNameMaxUnits + 1];
-    int len;
-    { std::lock_guard<std::mutex> lk(g_acctMx); len = g_reqNameLen; memcpy(buf, g_reqNameBuf, sizeof(buf)); }
-    if (len <= 0 || len > kNameMaxUnits) { setAcctMsg("Name: invalid length %d.", len); return; }
-    int host = hostState();
-    void *s = p_string_new_utf16(buf, len);
-    if (!s) { setAcctMsg("Name: could not create the managed string."); return; }
+static bool hexDec(const std::string &s, std::u16string &out) {
+    out.clear();
+    if (s.size() % 4) return false;
+    for (size_t i = 0; i < s.size(); i += 4) {
+        unsigned v = 0;
+        for (int k = 0; k < 4; k++) {
+            char ch = s[i + k];
+            int d = (ch >= '0' && ch <= '9') ? ch - '0' : (ch >= 'a' && ch <= 'f') ? ch - 'a' + 10 : -1;
+            if (d < 0) return false;
+            v = v * 16 + (unsigned)d;
+        }
+        out.push_back((char16_t)v);
+    }
+    return true;
+}
+static const char *kSaveKey[6] = {"name", "pet", "hat", "skin", "visor", "plate"};
+static void saveFileLocked() {   // caller holds g_acctMx
+    if (g_storeDir.empty()) return;
+    std::string path = g_storeDir + "/menutest_account.txt", tmp = path + ".tmp";
+    FILE *f = fopen(tmp.c_str(), "w");
+    if (!f) { LOGI("MENUTEST acct save: cannot open %s", tmp.c_str()); return; }
+    for (int i = 0; i < 6; i++) fprintf(f, "%s=%s\n", kSaveKey[i], hexEnc(g_saved.v[i]).c_str());
+    fprintf(f, "level=%lld\n", g_saved.level);
+    fclose(f);
+    if (rename(tmp.c_str(), path.c_str()) != 0) LOGI("MENUTEST acct save: rename failed");
+}
+static void loadFileLocked() {   // caller holds g_acctMx
+    if (g_storeDir.empty()) return;
+    std::string path = g_storeDir + "/menutest_account.txt";
+    FILE *f = fopen(path.c_str(), "r");
+    if (!f) { LOGI("MENUTEST acct load: no saved file yet (%s)", path.c_str()); return; }
+    char line[1200];
+    while (fgets(line, sizeof(line), f)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        const char *val = eq + 1;
+        if (!strcmp(line, "level")) { g_saved.level = atoll(val); continue; }
+        for (int i = 0; i < 6; i++) if (!strcmp(line, kSaveKey[i])) { std::u16string tmp; if (hexDec(val, tmp) && (int)tmp.size() <= 4096) g_saved.v[i] = tmp; }
+    }
+    fclose(f);
+    LOGI("MENUTEST acct load: name %d chars, level %lld, hat %d / skin %d / visor %d / pet %d / plate %d chars", (int)g_saved.v[0].size(), g_saved.level,
+         (int)g_saved.v[2].size(), (int)g_saved.v[3].size(), (int)g_saved.v[4].size(), (int)g_saved.v[1].size(), (int)g_saved.v[5].size());
+}
+
+static void *getPlayerData() {
+    if (!m_DM_getPlayer) return nullptr;
+    bool ok = false;
+    void *r = invokeRaw(m_DM_getPlayer, nullptr, nullptr, "DataManager.get_Player", &ok);
+    return ok ? r : nullptr;
+}
+static void *callGetter(void *m, void *obj, const char *what) {
+    if (!m || !obj) return nullptr;
+    bool ok = false;
+    void *r = invokeRaw(m, obj, nullptr, what, &ok);
+    return ok ? r : nullptr;
+}
+static bool readU16Str(void *s, std::u16string &out) {
+    out.clear();
+    if (!s) return true;
+    if (!p_string_chars || !p_string_length) return false;
+    int n = p_string_length(s);
+    if (n < 0 || n > 4096) return false;
+    out.assign((const char16_t *)p_string_chars(s), (size_t)n);
+    return true;
+}
+static bool getCustStr(void *cust, int i, std::u16string &out) {
+    if (!m_PC_get[i]) return false;
+    bool ok = false;
+    void *s = invokeRaw(m_PC_get[i], cust, nullptr, "Customization.get", &ok);
+    return ok && readU16Str(s, out);
+}
+static bool setCustStr(void *cust, int i, const std::u16string &v) {
+    if (!m_PC_set[i] || !p_string_new_utf16) return false;
+    void *s = p_string_new_utf16((const uint16_t *)v.data(), (int32_t)v.size());
+    if (!s) return false;
     void *args[1] = {s};
     bool ok = false;
-    char before[96], after[96];
-    readBackName(before, sizeof(before), local);
-    if (host == 1) {
-        if (!m_RpcSetName) { setAcctMsg("Name: PlayerControl.RpcSetName not found."); return; }
-        invokeRaw(m_RpcSetName, local, args, "RpcSetName", &ok);
-        readBackName(after, sizeof(after), local);
-        setAcctMsg("Name: you are HOST, RpcSetName(%d chars) %s. Name before: %s | now: %s. (A read-back does not prove the others see it; check another phone.)",
-                   len, ok ? "called" : "threw an exception (see logcat)", before, after);
-    } else if (host == 0) {
-        if (!m_CmdCheckName) { setAcctMsg("Name: PlayerControl.CmdCheckName not found."); return; }
-        invokeRaw(m_CmdCheckName, local, args, "CmdCheckName", &ok);
-        readBackName(after, sizeof(after), local);
-        setAcctMsg("Name: you are a CLIENT, CmdCheckName(%d chars) %s: the host decides (accept / rename / ignore). Name before: %s | now: %s.",
-                   len, ok ? "sent" : "threw an exception (see logcat)", before, after);
-    } else {
-        setAcctMsg("Name: cannot tell if you are host (AmongUsClient.get_AmHost unavailable). Nothing sent.");
-    }
+    invokeRaw(m_PC_set[i], cust, args, "Customization.set", &ok);
+    return ok;
 }
-static void levelFn(void *) {
-    void *local = nullptr;
-    if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
-    if (!local) { setAcctMsg("Level: no local player yet. Join a lobby first."); return; }
-    if (!m_RpcSetLevel) { setAcctMsg("Level: PlayerControl.RpcSetLevel not found."); return; }
-    uint32_t lv = (uint32_t)g_reqLevelVal.load();
-    void *args[1] = {&lv};
+static bool getLevelNow(void *stats, uint32_t *out) {
+    int v = 0;
+    if (!m_PS_getLevel || !stats || !invokeInt(m_PS_getLevel, stats, nullptr, "Stats.get_Level", &v)) return false;
+    *out = (uint32_t)v;
+    return true;
+}
+static bool setLevelNow(void *stats, uint32_t v) {
+    if (!m_PS_setLevel || !stats) return false;
+    void *args[1] = {&v};
     bool ok = false;
-    invokeRaw(m_RpcSetLevel, local, args, "RpcSetLevel", &ok);
-    char rb[60] = "n/a";
-    void *d = dataOf(local);
-    if (d && f_NI_PlayerLevel) { uint32_t cur = 0; p_field_get_value(d, f_NI_PlayerLevel, &cur); snprintf(rb, sizeof(rb), "%u", cur); }
-    setAcctMsg("Level: RpcSetLevel(%u) %s. NetworkedPlayerInfo.PlayerLevel now = %s (if the screen shows one more than you typed, type one less).",
-               lv, ok ? "called" : "threw an exception (see logcat)", rb);
+    invokeRaw(m_PS_setLevel, stats, args, "Stats.set_Level", &ok);
+    return ok;
 }
+static std::string u16ToUtf8Short(const std::u16string &s) {   // log/message helper only (BMP, lossy for surrogates)
+    std::string o;
+    for (char16_t c : s) {
+        if (o.size() > 80) break;
+        if (c < 0x80) o += (char)c;
+        else if (c < 0x800) { o += (char)(0xC0 | (c >> 6)); o += (char)(0x80 | (c & 0x3F)); }
+        else { o += (char)(0xE0 | (c >> 12)); o += (char)(0x80 | ((c >> 6) & 0x3F)); o += (char)(0x80 | (c & 0x3F)); }
+    }
+    return o;
+}
+
+// "Select" for name / level: write into the game's own save data. The game itself sends these values to the lobby when you join,
+// so it takes effect at the next lobby join. No direct Rpc/Cmd call is made.
+static void applyFn(void *) {
+    int bits = g_applyBits.exchange(0);
+    void *pd = getPlayerData();
+    void *cust = callGetter(m_PD_getCust, pd, "PlayerData.get_Customization");
+    void *stats = callGetter(m_PD_getStats, pd, "PlayerData.get_Stats");
+    if (!pd || !cust) { setAcctMsg("Saved to the file. The game's save data is not loaded yet; it is applied automatically at the next check (5 s)."); g_restored = false; g_applyBits.fetch_or(bits); return; }
+    char m1[260] = "", m2[260] = "";
+    SavedAcct want;
+    { std::lock_guard<std::mutex> lk(g_acctMx); want = g_saved; }
+    if (bits & 1) {
+        std::u16string back;
+        bool ok = setCustStr(cust, 0, want.v[0]);
+        bool rb = getCustStr(cust, 0, back);
+        snprintf(m1, sizeof(m1), "Name: set in the game's save data %s (read-back %s: \"%s\"). ", ok ? "OK" : "FAILED", rb ? "ok" : "failed", u16ToUtf8Short(back).c_str());
+    }
+    if (bits & 2) {
+        uint32_t before = 0, after = 0;
+        bool hb = getLevelNow(stats, &before);
+        bool ok = want.level >= 0 && want.level <= 4294967295LL && setLevelNow(stats, (uint32_t)want.level);
+        bool ha = getLevelNow(stats, &after);
+        snprintf(m2, sizeof(m2), "Level: Stats.Level %s (before %s%u, now %s%u). If the screen shows one more or less than you typed, adjust by one. ",
+                 ok ? "set" : "FAILED to set", hb ? "" : "?", before, ha ? "" : "?", after);
+    }
+    setAcctMsg("%s%sRejoin the lobby (leave and join again) so the game sends it to the others. Saved to the file too.", m1, m2);
+}
+// every 5 s while unlock is ON: after a restart put the saved values back, later remember what the user equips
+static void syncFn(void *) {
+    if (g_ulLastSig == 0) return;                // wait until the catalog is unlocked, otherwise the game resets the choice again
+    void *pd = getPlayerData();
+    void *cust = callGetter(m_PD_getCust, pd, "PlayerData.get_Customization");
+    if (!pd || !cust) return;
+    SavedAcct want;
+    { std::lock_guard<std::mutex> lk(g_acctMx); want = g_saved; }
+    std::u16string cur[6];
+    for (int i = 0; i < 6; i++) if (!getCustStr(cust, i, cur[i])) { setAcctMsg("Account sync: cannot read Customization.%s (see logcat MENUTEST acct save-data lines).", kCustName[i]); return; }
+    if (!g_restored) {
+        bool changed[6] = {false};
+        int n = 0;
+        for (int i = 0; i < 6; i++)
+            if (!want.v[i].empty() && cur[i] != want.v[i] && setCustStr(cust, i, want.v[i])) { changed[i] = true; cur[i] = want.v[i]; n++; }
+        char lv[80] = "";
+        if (want.level >= 0 && want.level <= 4294967295LL) {
+            void *stats = callGetter(m_PD_getStats, pd, "PlayerData.get_Stats");
+            uint32_t now = 0;
+            if (getLevelNow(stats, &now) && now != (uint32_t)want.level && setLevelNow(stats, (uint32_t)want.level)) { snprintf(lv, sizeof(lv), ", level -> %lld", want.level); n++; }
+        }
+        void *local = nullptr;
+        if (f_LocalPlayer) p_field_static_get_value(f_LocalPlayer, &local);
+        int pushed = 0;
+        if (local) for (int i = 1; i < 6; i++) if (changed[i] && m_RpcSetCos[i]) {   // same call the game's closet makes
+            if (!p_string_new_utf16) break;
+            void *s = p_string_new_utf16((const uint16_t *)want.v[i].data(), (int32_t)want.v[i].size());
+            void *args[1] = {s};
+            bool ok = false;
+            invokeRaw(m_RpcSetCos[i], local, args, kRpcCosName[i], &ok);
+            if (ok) pushed++;
+        }
+        g_restored = true;
+        setAcctMsg("Account restored after start: %d value(s) put back into the game's save data%s; %d cosmetic(s) pushed to this lobby. Name/level show to others after you rejoin.", n, lv, pushed);
+        return;
+    }
+    bool dirty = false;
+    {
+        std::lock_guard<std::mutex> lk(g_acctMx);
+        for (int i = 1; i < 6; i++) if (g_saved.v[i] != cur[i]) { g_saved.v[i] = cur[i]; dirty = true; }
+        if (dirty) saveFileLocked();
+    }
+    if (dirty) LOGI("MENUTEST acct: equipped cosmetics changed, saved to file");
+}
+
 static void runAccount() {
     int bits = g_reqAcct.exchange(0);
     if (!bits) return;
-    if (nowMs() - g_reqAcctAt.load() > kReqTtlMs) { setAcctMsg("Press expired: no player object was active within %ld s. Join a lobby and press again.", kReqTtlMs / 1000); return; }
-    if (!guarded(resolveExtraFn, nullptr) || !guarded(resolveHostFn, nullptr) || !guarded(acctResolveFn, nullptr)) { setAcctMsg("Fault while resolving account classes (see logcat MENUTEST)."); return; }
-    if ((bits & 1) && !guarded(nameFn, nullptr)) setAcctMsg("Crash guard caught a fault while setting the name (see logcat MENUTEST).");
-    if ((bits & 2) && !guarded(levelFn, nullptr)) setAcctMsg("Crash guard caught a fault while setting the level (see logcat MENUTEST).");
+    if (nowMs() - g_reqAcctAt.load() > kReqTtlMs) { setAcctMsg("Press expired: no player object was active within %ld s. Press again.", kReqTtlMs / 1000); return; }
+    if (!g_acctResolved && !guarded(acctResolveFn, nullptr)) { setAcctMsg("Fault while resolving account classes (see logcat MENUTEST)."); return; }
+    g_applyBits.fetch_or(bits);
+    if (!guarded(applyFn, nullptr)) setAcctMsg("Crash guard caught a fault while writing name/level (see logcat MENUTEST).");
 }
 
 typedef void (*fn_fixedupdate_t)(void *self, const void *method);
@@ -2367,7 +2521,7 @@ static void *watcher(void *) {
 
 __attribute__((constructor))
 static void menutest_ctor() {
-    LOGI("MENUTEST v23 loaded in pid=%d uid=%d", getpid(), getuid());
+    LOGI("MENUTEST v24 loaded in pid=%d uid=%d", getpid(), getuid());
     pthread_t th;
     if (pthread_create(&th, nullptr, watcher, nullptr) == 0) {
         pthread_detach(th);
@@ -2517,12 +2671,11 @@ Java_top_niunaijun_blackboxa_menu_NativeMenu_requestSetName(JNIEnv *env, jobject
     if (!c) return -1;
     {
         std::lock_guard<std::mutex> lk(g_acctMx);
-        memset(g_reqNameBuf, 0, sizeof(g_reqNameBuf));
-        for (jsize i = 0; i < n; i++) g_reqNameBuf[i] = (uint16_t)c[i];
-        g_reqNameLen = (int)n;
+        g_saved.v[0].assign((const char16_t *)c, (size_t)n);
+        saveFileLocked();
     }
     env->ReleaseStringChars(name, c);
-    setAcctMsg("Name: queued (%d chars), waiting for the Unity thread...", (int)n);
+    setAcctMsg("Name: saved (%d chars), writing it into the game's save data...", (int)n);
     g_reqAcctAt.store(nowMs());
     g_reqAcct.fetch_or(1);
     return 1;
@@ -2533,11 +2686,36 @@ extern "C" JNIEXPORT jint JNICALL
 Java_top_niunaijun_blackboxa_menu_NativeMenu_requestSetLevel(JNIEnv *env, jobject thiz, jlong level) {
     if (g_state.load() != ST_READY) return 0;
     if (level < 0 || level > 4294967295LL) return -1;
-    g_reqLevelVal.store((unsigned long long)level);
-    setAcctMsg("Level: queued (%lld), waiting for the Unity thread...", (long long)level);
+    { std::lock_guard<std::mutex> lk(g_acctMx); g_saved.level = (long long)level; saveFileLocked(); }
+    setAcctMsg("Level: saved (%lld), writing it into the game's save data...", (long long)level);
     g_reqAcctAt.store(nowMs());
     g_reqAcct.fetch_or(2);
     return 1;
+}
+
+// v24: folder for the account file (Kotlin passes filesDir). Loads the saved values at once.
+extern "C" JNIEXPORT void JNICALL
+Java_top_niunaijun_blackboxa_menu_NativeMenu_setStorageDir(JNIEnv *env, jobject thiz, jstring dir) {
+    if (!dir) return;
+    const char *d = env->GetStringUTFChars(dir, nullptr);
+    if (!d) return;
+    {
+        std::lock_guard<std::mutex> lk(g_acctMx);
+        g_storeDir = d;
+        loadFileLocked();
+    }
+    env->ReleaseStringUTFChars(dir, d);
+}
+extern "C" JNIEXPORT jstring JNICALL
+Java_top_niunaijun_blackboxa_menu_NativeMenu_savedName(JNIEnv *env, jobject thiz) {
+    std::u16string s;
+    { std::lock_guard<std::mutex> lk(g_acctMx); s = g_saved.v[0]; }
+    return env->NewString((const jchar *)s.data(), (jsize)s.size());
+}
+extern "C" JNIEXPORT jlong JNICALL
+Java_top_niunaijun_blackboxa_menu_NativeMenu_savedLevel(JNIEnv *env, jobject thiz) {
+    std::lock_guard<std::mutex> lk(g_acctMx);
+    return (jlong)g_saved.level;
 }
 
 extern "C" JNIEXPORT jstring JNICALL
