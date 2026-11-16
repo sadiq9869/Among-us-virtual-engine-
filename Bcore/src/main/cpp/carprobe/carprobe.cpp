@@ -1,4 +1,4 @@
-// carprobe.cpp  v2 (v1 + garbage filter for freed objects, _controlsLogic link, shows every valid object)  -  READ-ONLY probe for Carrom Pool (com.miniclip.carrom).
+// carprobe.cpp  v2.1 (v1 + garbage filter for freed objects, _controlsLogic link, shows every valid object)  -  READ-ONLY probe for Carrom Pool (com.miniclip.carrom).
 // NO hooks, NO patching, NO writes into the game. It only READS memory (through a pipe, so a bad
 // address gives an error code instead of a crash) and prints values to logcat, tag CARPROBE1.
 //
@@ -463,6 +463,10 @@ static void* worker(void*) {
             lastScan = now_ms();
             LOG("heap scan %ld ms: LOCAL=%d REMOTE=%d GUIDE=%d STRIKER=%d PUCK=%d", lastScan - s0,
                 count_valid(C_LOCAL), count_valid(C_REMOTE), count_valid(C_FG), count_valid(C_STRIKER), count_valid(C_PUCK));
+            LOG("state cls L=%lx R=%lx G=%lx S=%lx P=%lx | off L.ang=%d L.dist=%d R.ang=%d R.pow=%d G.max=%d G.ctl=%d N.pos=%d N.run=%d P.rad=%d",
+                (unsigned long)g_cls[C_LOCAL], (unsigned long)g_cls[C_REMOTE], (unsigned long)g_cls[C_FG],
+                (unsigned long)g_cls[C_STRIKER], (unsigned long)g_cls[C_PUCK],
+                L_angle.off, L_dist.off, R_angle.off, R_power.off, F_maxg.off, F_ctl.off, N_pos.off, N_run.off, P_radius.off);
         }
         // drop freed objects
         for (int c = 0; c < C_COUNT; c++) {
@@ -482,7 +486,7 @@ static void* worker(void*) {
 }
 
 __attribute__((constructor)) static void init() {
-    LOG("carprobe v2 loaded");
+    LOG("carprobe v2.1 loaded");
     pthread_t th;
     pthread_create(&th, nullptr, worker, nullptr);
     pthread_detach(th);
