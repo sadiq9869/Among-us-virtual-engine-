@@ -1,4 +1,5 @@
-// carprobe.cpp  v3 (adds ONE test write: mMaxGuides of the LOCAL player's guide node; v2.1 + garbage filter for freed objects, _controlsLogic link, shows every valid object)  -  READ-ONLY probe for Carrom Pool (com.miniclip.carrom).
+// carprobe.cpp  v4 = STAGE 1 RECON for the solid-line feature: parent chains, PocketNode positions, shot recording at 16 ms.
+//   (v3 base: adds ONE test write: mMaxGuides of the LOCAL player's guide node; v2.1 + garbage filter for freed objects, _controlsLogic link, shows every valid object)  -  READ-ONLY probe for Carrom Pool (com.miniclip.carrom).
 // NO hooks and NO code patching. It READS memory (through a pipe, so a bad address gives an error code
 // instead of a crash) and prints values to logcat, tag CARPROBE1.
 // v3 TEST ONLY: it also writes ONE int (mMaxGuides = kTestMaxGuides) into the guide node that belongs to the
@@ -43,7 +44,7 @@ static const long  kScanWaitMs   = 6000;               // heap rescan interval w
 static const long  kScanSlowMs   = 25000;              // heap rescan interval when everything is found
 static const int   kMaxPerClass  = 200;                // max heap hits kept per class
 static const size_t CH = 16384;                        // read chunk
-static const int   kTestMaxGuides = 25;                // TEST: value written to mMaxGuides of the LOCAL guide (0 = no write at all)
+static const int   kTestMaxGuides = 0;                 // TEST: value written to mMaxGuides of the LOCAL guide (0 = no write at all)
 
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -251,9 +252,9 @@ static int ivar_off(u64 c, const char* iv, int depth = 0) {
 }
 
 // ------------------------------------------------------------------ classes + ivars we care about
-enum { C_LOCAL, C_REMOTE, C_FG, C_STRIKER, C_PUCK, C_COUNT };
+enum { C_LOCAL, C_REMOTE, C_FG, C_STRIKER, C_PUCK, C_POCKET, C_COUNT };
 static const char* kClassNames[C_COUNT] = {
-    "ControlsLogicLocal", "ControlsLogicRemote", "ControlsForegroundNode", "StrikerNode", "PuckNode"
+    "ControlsLogicLocal", "ControlsLogicRemote", "ControlsForegroundNode", "StrikerNode", "PuckNode", "PocketNode"
 };
 static u64 g_cls[C_COUNT];
 
@@ -270,6 +271,7 @@ static Iv F_maxg = {"mMaxGuides", -1}, F_scale = {"_tableScale", -1}, F_vrot = {
 // CCNode parts (found through StrikerNode / PuckNode / ControlsForegroundNode super chain)
 static Iv N_pos = {"_position", -1}, N_vis = {"_visible", -1}, N_run = {"_isRunning", -1}, N_size = {"_contentSize", -1};
 static Iv P_radius = {"_radius", -1};
+static Iv N_parent = {"_parent", -1}, N_anchor = {"_anchorPoint", -1}, N_scx = {"_scaleX", -1}, N_scy = {"_scaleY", -1}, N_rot = {"_rotationX", -1};
 
 static void resolve_offsets() {
     for (int i = 0; i < C_COUNT; i++) {
@@ -283,6 +285,7 @@ static void resolve_offsets() {
         {&F_ctl, C_FG}, {&F_maxg, C_FG}, {&F_scale, C_FG}, {&F_vrot, C_FG}, {&F_safe, C_FG},
         {&N_pos, C_STRIKER}, {&N_vis, C_STRIKER}, {&N_run, C_STRIKER}, {&N_size, C_STRIKER},
         {&P_radius, C_PUCK},
+        {&N_parent, C_STRIKER}, {&N_anchor, C_STRIKER}, {&N_scx, C_STRIKER}, {&N_scy, C_STRIKER}, {&N_rot, C_STRIKER},
     };
     for (auto& e : t) {
         e.iv->off = g_cls[e.cls] ? ivar_off(g_cls[e.cls], e.iv->name) : -1;
@@ -463,6 +466,17 @@ static std::string snapshot() {
     }
     snprintf(b, sizeof(b), "PUCKS n=%d:", pn);
     s += b; s += pk; s += "\n";
+    std::string pc; int pcn = 0;
+    for (u64 o : g_objs[C_POCKET]) {
+        if (pcn >= 12) break;
+        double px, py; int vis, run;
+        if (!getpt(o, N_pos.off, px, py) || !sane(px, 5000.0) || !sane(py, 5000.0)) continue;
+        if (!getb(o, N_vis.off, vis) || !getb(o, N_run.off, run) || vis > 1 || run > 1) continue;
+        snprintf(b, sizeof(b), " @%lx(%.1f,%.1f v%d r%d)", (unsigned long)o, px, py, vis, run);
+        pc += b; pcn++;
+    }
+    snprintf(b, sizeof(b), "POCKETS n=%d:", pcn);
+    s += b; s += pc; s += "\n";
     return s;
 }
 
@@ -479,6 +493,88 @@ static void log_lines(const std::string& s) {
 
 static int count_valid(int cls) { return (int)g_objs[cls].size(); }
 
+// ------------------------------------------------------------------ stage 1 helpers
+static bool obj_class_name(u64 o, char* out, size_t max) {
+    u64 isa;
+    if (!rd(o, &isa, 8) || !isa) return false;
+    return class_name_at(isa, out, max);
+}
+
+// walks from a node up through its parents and prints position / size / scale of every level
+static void dump_chain(const char* tag, u64 o) {
+    for (int d = 0; d < 14 && o; d++) {
+        char nm[96] = "?";
+        obj_class_name(o, nm, sizeof(nm));
+        double px = NAN, py = NAN, cw = NAN, ch = NAN, ax = NAN, ay = NAN;
+        float sx = NAN, sy = NAN, rot = NAN;
+        getpt(o, N_pos.off, px, py);
+        getpt(o, N_size.off, cw, ch);
+        getpt(o, N_anchor.off, ax, ay);
+        getf(o, N_scx.off, sx); getf(o, N_scy.off, sy); getf(o, N_rot.off, rot);
+        LOG("CHAIN %s d=%d %s@%lx pos=%.2f,%.2f size=%.2f,%.2f anchor=%.2f,%.2f scale=%.3f,%.3f rot=%.2f",
+            tag, d, nm, (unsigned long)o, px, py, cw, ch, ax, ay, sx, sy, rot);
+        u64 par = 0;
+        if (N_parent.off < 0 || !rd(o + N_parent.off, &par, 8) || par == o) break;
+        o = par;
+    }
+}
+
+struct Aim { bool ok; double ang, dist; int act, en, enough; };
+
+static Aim read_aim() {
+    Aim a; a.ok = false; a.ang = a.dist = 0; a.act = a.en = a.enough = 0;
+    for (u64 o : g_objs[C_LOCAL]) {
+        double ang, dist; int act, en, enough, sid;
+        if (!getd(o, L_angle.off, ang) || !getd(o, L_dist.off, dist)) continue;
+        if (!getb(o, L_active.off, act) || !getb(o, L_enabled.off, en) || !getb(o, L_enough.off, enough)) continue;
+        if (!geti(o, L_sid.off, sid)) continue;
+        if (!sane(ang, 7.0) || !sane(dist, 5000.0) || act > 1 || en > 1 || enough > 1 || sid < 0 || sid > 16) continue;
+        if (!a.ok || (en == 1 && a.en != 1)) { a.ok = true; a.ang = ang; a.dist = dist; a.act = act; a.en = en; a.enough = enough; }
+    }
+    return a;
+}
+
+struct Item { char kind; u64 o; };
+
+static bool item_valid(char kind, u64 o) {
+    double x, y; int vis, run;
+    if (!getpt(o, N_pos.off, x, y) || !sane(x, 5000.0) || !sane(y, 5000.0)) return false;
+    if (!getb(o, N_run.off, run) || !getb(o, N_vis.off, vis) || run != 1 || vis > 1) return false;
+    if (kind == 'P') { float r; if (!getf(o, P_radius.off, r) || r < 1.0f || r > 200.0f) return false; }
+    return true;
+}
+
+static std::vector<Item> build_items() {
+    std::vector<Item> v;
+    for (u64 o : g_objs[C_STRIKER]) if (item_valid('S', o)) { Item it; it.kind = 'S'; it.o = o; v.push_back(it); }
+    for (u64 o : g_objs[C_PUCK])    if (item_valid('P', o)) { Item it; it.kind = 'P'; it.o = o; v.push_back(it); }
+    return v;
+}
+
+static void read_xy(const std::vector<Item>& it, std::vector<double>& xy) {
+    xy.assign(it.size() * 2, NAN);
+    for (size_t i = 0; i < it.size(); i++) {
+        double x, y;
+        if (getpt(it[i].o, N_pos.off, x, y)) { xy[2 * i] = x; xy[2 * i + 1] = y; }
+    }
+}
+
+static bool pucks_moved(const std::vector<Item>& it, const std::vector<double>& a, const std::vector<double>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < it.size(); i++) {
+        if (it[i].kind != 'P') continue;
+        double dx = a[2 * i] - b[2 * i], dy = a[2 * i + 1] - b[2 * i + 1];
+        if (isfinite(dx) && isfinite(dy) && (fabs(dx) > 0.05 || fabs(dy) > 0.05)) return true;
+    }
+    return false;
+}
+
+static bool same_items(const std::vector<Item>& a, const std::vector<Item>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++) if (a[i].o != b[i].o) return false;
+    return true;
+}
+
 static void* worker(void*) {
     if (pipe2(g_pipe, O_NONBLOCK | O_CLOEXEC) != 0) { LOG("pipe2 failed"); return nullptr; }
     long t0 = now_ms();
@@ -491,43 +587,116 @@ static void* worker(void*) {
     find_game_lib();
     resolve_offsets();
 
-    long start = now_ms(), lastScan = 0, lastBeat = 0;
+    long start = now_ms(), lastScan = 0, lastBeat = 0, lastSnap = 0, lastChain = 0;
+    int chainDumps = 0, bursts = 0;
     std::string last;
+    bool aimActive = false; Aim lastAim; lastAim.ok = false; lastAim.ang = lastAim.dist = 0; lastAim.en = lastAim.enough = 0;
+    std::vector<Item> prevItems, bItems; std::vector<double> prevXY, xy, bPrev;
+    bool burst = false; long burstStart = 0, lastMove = 0; int burstLines = 0;
+
     while (now_ms() - start < kLifeMs) {
         long t = now_ms();
-        bool haveCore = !g_objs[C_LOCAL].empty() && !g_objs[C_FG].empty();
-        long wait = haveCore ? kScanSlowMs : kScanWaitMs;
-        if (t - lastScan > wait) {
-            long s0 = now_ms();
-            scan_heap();
-            lastScan = now_ms();
-            LOG("heap scan %ld ms: LOCAL=%d REMOTE=%d GUIDE=%d STRIKER=%d PUCK=%d", lastScan - s0,
-                count_valid(C_LOCAL), count_valid(C_REMOTE), count_valid(C_FG), count_valid(C_STRIKER), count_valid(C_PUCK));
-            LOG("state cls L=%lx R=%lx G=%lx S=%lx P=%lx | off L.ang=%d L.dist=%d R.ang=%d R.pow=%d G.max=%d G.ctl=%d N.pos=%d N.run=%d P.rad=%d",
-                (unsigned long)g_cls[C_LOCAL], (unsigned long)g_cls[C_REMOTE], (unsigned long)g_cls[C_FG],
-                (unsigned long)g_cls[C_STRIKER], (unsigned long)g_cls[C_PUCK],
-                L_angle.off, L_dist.off, R_angle.off, R_power.off, F_maxg.off, F_ctl.off, N_pos.off, N_run.off, P_radius.off);
+        if (!burst) {
+            bool haveCore = !g_objs[C_LOCAL].empty() && !g_objs[C_FG].empty();
+            long wait = haveCore ? kScanSlowMs : kScanWaitMs;
+            if (!aimActive && t - lastScan > wait) {
+                long s0 = now_ms();
+                scan_heap();
+                lastScan = now_ms();
+                LOG("heap scan %ld ms: LOCAL=%d REMOTE=%d GUIDE=%d STRIKER=%d PUCK=%d POCKET=%d", lastScan - s0,
+                    count_valid(C_LOCAL), count_valid(C_REMOTE), count_valid(C_FG), count_valid(C_STRIKER), count_valid(C_PUCK), count_valid(C_POCKET));
+                LOG("state cls L=%lx R=%lx G=%lx S=%lx P=%lx K=%lx | off L.ang=%d L.dist=%d N.pos=%d N.parent=%d N.csize=%d N.scx=%d P.rad=%d",
+                    (unsigned long)g_cls[C_LOCAL], (unsigned long)g_cls[C_REMOTE], (unsigned long)g_cls[C_FG],
+                    (unsigned long)g_cls[C_STRIKER], (unsigned long)g_cls[C_PUCK], (unsigned long)g_cls[C_POCKET],
+                    L_angle.off, L_dist.off, N_pos.off, N_parent.off, N_size.off, N_scx.off, P_radius.off);
+            }
+            for (int c = 0; c < C_COUNT; c++) {
+                std::vector<u64> keep;
+                for (u64 o : g_objs[c]) if (still_valid(c, o)) keep.push_back(o);
+                g_objs[c].swap(keep);
+            }
+            apply_guide_test();
         }
-        // drop freed objects
-        for (int c = 0; c < C_COUNT; c++) {
-            std::vector<u64> keep;
-            for (u64 o : g_objs[c]) if (still_valid(c, o)) keep.push_back(o);
-            g_objs[c].swap(keep);
+
+        // --- aim tracking: while the finger is down we poll fast, the release starts a shot recording
+        Aim a = read_aim();
+        bool release = false;
+        if (a.ok) {
+            if (a.act == 1) { lastAim = a; aimActive = true; }
+            else if (aimActive) {
+                aimActive = false; release = true;
+                LOG("AIM released: last ang=%.5f(%.2fdeg) dist=%.3f en=%d power_ok=%d",
+                    lastAim.ang, lastAim.ang * 180.0 / M_PI, lastAim.dist, lastAim.en, lastAim.enough);
+            }
         }
-        apply_guide_test();
-        std::string s = snapshot();
-        if (s != last || t - lastBeat > 10000) {
-            log_lines(s);
-            last = s; lastBeat = t;
+
+        // --- coins moving by themselves (opponent shot) also start a recording
+        bool puckMoved = false;
+        std::vector<Item> items;
+        if (!burst) {
+            items = build_items();
+            read_xy(items, xy);
+            if (same_items(items, prevItems)) puckMoved = pucks_moved(items, xy, prevXY);
+            prevItems = items; prevXY = xy;
         }
-        usleep(kTickMs * 1000);
+        if (!burst && (release || puckMoved) && bursts < 12 && !items.empty()) {
+            burst = true; bursts++; burstStart = t; lastMove = t; burstLines = 0;
+            bItems = items; bPrev = xy;
+            LOG("BURST %d start (%s) lastAim ang=%.5f dist=%.3f items=%d", bursts, release ? "aim release" : "coins moved",
+                lastAim.ang, lastAim.dist, (int)bItems.size());
+            for (size_t i = 0; i < bItems.size(); i++) {
+                float r = NAN; if (bItems[i].kind == 'P') getf(bItems[i].o, P_radius.off, r);
+                LOG("BURST obj %d %c@%lx r=%.1f start=%.2f,%.2f", (int)i, bItems[i].kind, (unsigned long)bItems[i].o, r, xy[2 * i], xy[2 * i + 1]);
+            }
+        }
+        if (burst) {
+            read_xy(bItems, xy);
+            if (pucks_moved(bItems, xy, bPrev)) lastMove = t;
+            bPrev = xy;
+            std::string line; char b[64];
+            snprintf(b, sizeof(b), "B %ld", t - burstStart); line += b;
+            for (size_t i = 0; i < bItems.size(); i++) {
+                if (isfinite(xy[2 * i]) && isfinite(xy[2 * i + 1])) snprintf(b, sizeof(b), " %d=%.2f,%.2f", (int)i, xy[2 * i], xy[2 * i + 1]);
+                else snprintf(b, sizeof(b), " %d=-", (int)i);
+                line += b;
+            }
+            LOG("%s", line.c_str());
+            burstLines++;
+            if ((t - burstStart > 800 && t - lastMove > 1500) || t - burstStart > 12000 || burstLines >= 700) {
+                burst = false;
+                LOG("BURST end lines=%d", burstLines);
+            }
+        } else if (!aimActive && t - lastSnap >= 500) {
+            lastSnap = t;
+            std::string s = snapshot();
+            if (s != last || t - lastBeat > 10000) {
+                log_lines(s);
+                last = s; lastBeat = t;
+            }
+            // parent chains (to find the board node and the point -> pixel scale), a few times only
+            if (chainDumps < 3 && t - lastChain > 90000) {
+                std::vector<Item> it = build_items();
+                u64 st = 0, pk = 0, pc = 0;
+                for (auto& x : it) { if (x.kind == 'S' && !st) st = x.o; if (x.kind == 'P' && !pk) pk = x.o; }
+                for (u64 o : g_objs[C_POCKET]) { double px, py; int vis, run;
+                    if (getpt(o, N_pos.off, px, py) && sane(px, 5000.0) && sane(py, 5000.0) && getb(o, N_vis.off, vis) && getb(o, N_run.off, run) && vis <= 1 && run <= 1) { pc = o; break; } }
+                if (st && pk) {
+                    LOG("CHAIN dump %d", chainDumps + 1);
+                    dump_chain("STRIKER", st);
+                    dump_chain("PUCK", pk);
+                    if (pc) dump_chain("POCKET", pc);
+                    chainDumps++; lastChain = t;
+                }
+            }
+        }
+        usleep(burst ? 16000 : (aimActive ? 40000 : 100000));
     }
     LOG("probe finished (30 min)");
     return nullptr;
 }
 
 __attribute__((constructor)) static void init() {
-    LOG("carprobe v3 loaded (test write kTestMaxGuides=%d)", kTestMaxGuides);
+    LOG("carprobe v4 loaded (stage 1 recon; test write kTestMaxGuides=%d)", kTestMaxGuides);
     pthread_t th;
     pthread_create(&th, nullptr, worker, nullptr);
     pthread_detach(th);
