@@ -7,25 +7,27 @@ permissions:
   contents: write
 
 jobs:
-  delete:
+  wipe:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Delete all files
+      - name: Delete all tracked files
         run: |
-          find . -mindepth 1 \
-            ! -path "./.git/*" \
-            ! -path "./.github/workflows/delete-all.yml" \
-            -delete
+          git rm -rf . || true
 
-      - name: Commit changes
+      - name: Remove remaining untracked files
+        run: |
+          git clean -fdx
+
+      - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -A
-          git commit -m "Delete all repository contents" || echo "Nothing to commit"
-          git push
+          git commit -m "Wipe repository" || exit 0
+          git push origin HEAD
