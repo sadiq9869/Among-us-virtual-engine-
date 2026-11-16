@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools" tools:ignore="MissingTranslation">
+    <string name="microg_title">microG</string>
+    <string name="microg_section">GOOGLE SERVICES (microG)</string>
+    <string name="microg_not_set_up">Not set up</string>
+    <string name="microg_not_set_up_detail">The download link or checksum is missing in MicroGConfig.kt (%s). The Install button stays off until it is filled in.</string>
+    <string name="microg_checking">Checking file…</string>
+    <string name="microg_waiting_wifi">Waiting for Wi-Fi</string>
+    <string name="microg_waiting_wifi_detail">The microG files are about 113 MB in total. They download by themselves on Wi-Fi.</string>
+    <string name="microg_download_mobile">Download on mobile data</string>
+    <string name="microg_downloading">Downloading %1$d%%</string>
+    <string name="microg_downloading_unknown">Downloading %1$s</string>
+    <string name="microg_downloading_detail">You can leave this screen. If the app closes, the download continues from where it stopped next time.</string>
+    <string name="microg_ready">Ready to install</string>
+    <string name="microg_ready_detail">microG and the Play Store helper will be installed in User %1$d.</string>
+    <string name="microg_install">Install microG</string>
+    <string name="microg_installing">Installing…</string>
+    <string name="microg_installed">microG installed</string>
+    <string name="microg_installed_detail">microG is installed in User %1$d.</string>
+    <string name="microg_other_present">Google services already here</string>
+    <string name="microg_other_present_detail">User %1$d already has Google services, so nothing was changed. To install this microG, first turn them off in Settings, GMS Manager. That clears their data.</string>
+    <string name="microg_failed">Problem</string>
+    <string name="microg_retry">Retry download</string>
+</resources>
