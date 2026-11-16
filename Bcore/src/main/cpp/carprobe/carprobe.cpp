@@ -1,4 +1,4 @@
-// carprobe.cpp  v4 = STAGE 1 RECON for the solid-line feature: parent chains, PocketNode positions, shot recording at 16 ms.
+// carprobe.cpp  v4.1 = STAGE 1 RECON for the solid-line feature: parent chains, PocketNode positions, shot recording at 16 ms.
 //   (v3 base: adds ONE test write: mMaxGuides of the LOCAL player's guide node; v2.1 + garbage filter for freed objects, _controlsLogic link, shows every valid object)  -  READ-ONLY probe for Carrom Pool (com.miniclip.carrom).
 // NO hooks and NO code patching. It READS memory (through a pipe, so a bad address gives an error code
 // instead of a crash) and prints values to logcat, tag CARPROBE1.
@@ -569,6 +569,15 @@ static bool pucks_moved(const std::vector<Item>& it, const std::vector<double>& 
     return false;
 }
 
+static bool any_moved(const std::vector<Item>& it, const std::vector<double>& a, const std::vector<double>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < it.size(); i++) {
+        double dx = a[2 * i] - b[2 * i], dy = a[2 * i + 1] - b[2 * i + 1];
+        if (isfinite(dx) && isfinite(dy) && (fabs(dx) > 0.05 || fabs(dy) > 0.05)) return true;
+    }
+    return false;
+}
+
 static bool same_items(const std::vector<Item>& a, const std::vector<Item>& b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++) if (a[i].o != b[i].o) return false;
@@ -651,7 +660,7 @@ static void* worker(void*) {
         }
         if (burst) {
             read_xy(bItems, xy);
-            if (pucks_moved(bItems, xy, bPrev)) lastMove = t;
+            if (any_moved(bItems, xy, bPrev)) lastMove = t;
             bPrev = xy;
             std::string line; char b[64];
             snprintf(b, sizeof(b), "B %ld", t - burstStart); line += b;
@@ -680,23 +689,23 @@ static void* worker(void*) {
                 for (auto& x : it) { if (x.kind == 'S' && !st) st = x.o; if (x.kind == 'P' && !pk) pk = x.o; }
                 for (u64 o : g_objs[C_POCKET]) { double px, py; int vis, run;
                     if (getpt(o, N_pos.off, px, py) && sane(px, 5000.0) && sane(py, 5000.0) && getb(o, N_vis.off, vis) && getb(o, N_run.off, run) && vis <= 1 && run <= 1) { pc = o; break; } }
-                if (st && pk) {
+                if (st && (pk || pc)) {
                     LOG("CHAIN dump %d", chainDumps + 1);
                     dump_chain("STRIKER", st);
-                    dump_chain("PUCK", pk);
+                    if (pk) dump_chain("PUCK", pk);
                     if (pc) dump_chain("POCKET", pc);
                     chainDumps++; lastChain = t;
                 }
             }
         }
-        usleep(burst ? 16000 : (aimActive ? 40000 : 100000));
+        usleep(burst ? 16000 : (aimActive ? 10000 : 100000));
     }
     LOG("probe finished (30 min)");
     return nullptr;
 }
 
 __attribute__((constructor)) static void init() {
-    LOG("carprobe v4 loaded (stage 1 recon; test write kTestMaxGuides=%d)", kTestMaxGuides);
+    LOG("carprobe v4.1 loaded (stage 1 recon; test write kTestMaxGuides=%d)", kTestMaxGuides);
     pthread_t th;
     pthread_create(&th, nullptr, worker, nullptr);
     pthread_detach(th);
