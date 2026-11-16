@@ -1,0 +1,31 @@
+name: Delete Everything
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Delete all files
+        run: |
+          find . -mindepth 1 \
+            ! -path "./.git/*" \
+            ! -path "./.github/workflows/delete-all.yml" \
+            -delete
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git commit -m "Delete all repository contents" || echo "Nothing to commit"
+          git push
