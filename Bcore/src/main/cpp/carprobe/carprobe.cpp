@@ -1,4 +1,4 @@
-// carprobe.cpp  v4.1 = STAGE 1 RECON for the solid-line feature: parent chains, PocketNode positions, shot recording at 16 ms.
+// carprobe.cpp  v4.2 = STAGE 1 RECON (burst lines now list only objects that MOVED) for the solid-line feature: parent chains, PocketNode positions, shot recording at 16 ms.
 //   (v3 base: adds ONE test write: mMaxGuides of the LOCAL player's guide node; v2.1 + garbage filter for freed objects, _controlsLogic link, shows every valid object)  -  READ-ONLY probe for Carrom Pool (com.miniclip.carrom).
 // NO hooks and NO code patching. It READS memory (through a pipe, so a bad address gives an error code
 // instead of a crash) and prints values to logcat, tag CARPROBE1.
@@ -600,7 +600,7 @@ static void* worker(void*) {
     int chainDumps = 0, bursts = 0;
     std::string last;
     bool aimActive = false; Aim lastAim; lastAim.ok = false; lastAim.ang = lastAim.dist = 0; lastAim.en = lastAim.enough = 0;
-    std::vector<Item> prevItems, bItems; std::vector<double> prevXY, xy, bPrev;
+    std::vector<Item> prevItems, bItems; std::vector<double> prevXY, xy, bPrev, bLogged;
     bool burst = false; long burstStart = 0, lastMove = 0; int burstLines = 0;
 
     while (now_ms() - start < kLifeMs) {
@@ -650,7 +650,7 @@ static void* worker(void*) {
         }
         if (!burst && (release || puckMoved) && bursts < 12 && !items.empty()) {
             burst = true; bursts++; burstStart = t; lastMove = t; burstLines = 0;
-            bItems = items; bPrev = xy;
+            bItems = items; bPrev = xy; bLogged = xy;
             LOG("BURST %d start (%s) lastAim ang=%.5f dist=%.3f items=%d", bursts, release ? "aim release" : "coins moved",
                 lastAim.ang, lastAim.dist, (int)bItems.size());
             for (size_t i = 0; i < bItems.size(); i++) {
@@ -662,14 +662,20 @@ static void* worker(void*) {
             read_xy(bItems, xy);
             if (any_moved(bItems, xy, bPrev)) lastMove = t;
             bPrev = xy;
+            // delta log: only objects whose position changed since the last logged value (all others stay as in "BURST obj ... start=")
             std::string line; char b[64];
-            snprintf(b, sizeof(b), "B %ld", t - burstStart); line += b;
             for (size_t i = 0; i < bItems.size(); i++) {
-                if (isfinite(xy[2 * i]) && isfinite(xy[2 * i + 1])) snprintf(b, sizeof(b), " %d=%.2f,%.2f", (int)i, xy[2 * i], xy[2 * i + 1]);
-                else snprintf(b, sizeof(b), " %d=-", (int)i);
+                double x = xy[2 * i], y = xy[2 * i + 1], lx = bLogged[2 * i], ly = bLogged[2 * i + 1];
+                bool fin = isfinite(x) && isfinite(y);
+                bool changed = fin ? (!isfinite(lx) || fabs(x - lx) > 0.004 || fabs(y - ly) > 0.004) : isfinite(lx);
+                if (!changed) continue;
+                if (fin) snprintf(b, sizeof(b), " %d=%.2f,%.2f", (int)i, x, y); else snprintf(b, sizeof(b), " %d=-", (int)i);
                 line += b;
+                bLogged[2 * i] = x; bLogged[2 * i + 1] = y;
             }
-            LOG("%s", line.c_str());
+            if (!line.empty()) {
+                LOG("B %ld%s", t - burstStart, line.c_str());
+            }
             burstLines++;
             if ((t - burstStart > 800 && t - lastMove > 1500) || t - burstStart > 12000 || burstLines >= 700) {
                 burst = false;
@@ -705,7 +711,7 @@ static void* worker(void*) {
 }
 
 __attribute__((constructor)) static void init() {
-    LOG("carprobe v4.1 loaded (stage 1 recon; test write kTestMaxGuides=%d)", kTestMaxGuides);
+    LOG("carprobe v4.2 loaded (stage 1 recon; test write kTestMaxGuides=%d)", kTestMaxGuides);
     pthread_t th;
     pthread_create(&th, nullptr, worker, nullptr);
     pthread_detach(th);
