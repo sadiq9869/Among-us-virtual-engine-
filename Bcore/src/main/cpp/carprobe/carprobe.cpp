@@ -1,6 +1,8 @@
-// carprobe.cpp  v2.1 (v1 + garbage filter for freed objects, _controlsLogic link, shows every valid object)  -  READ-ONLY probe for Carrom Pool (com.miniclip.carrom).
-// NO hooks, NO patching, NO writes into the game. It only READS memory (through a pipe, so a bad
-// address gives an error code instead of a crash) and prints values to logcat, tag CARPROBE1.
+// carprobe.cpp  v3 (adds ONE test write: mMaxGuides of the LOCAL player's guide node; v2.1 + garbage filter for freed objects, _controlsLogic link, shows every valid object)  -  READ-ONLY probe for Carrom Pool (com.miniclip.carrom).
+// NO hooks and NO code patching. It READS memory (through a pipe, so a bad address gives an error code
+// instead of a crash) and prints values to logcat, tag CARPROBE1.
+// v3 TEST ONLY: it also writes ONE int (mMaxGuides = kTestMaxGuides) into the guide node that belongs to the
+// local player (its _controlsLogic points to our ControlsLogicLocal object). Set kTestMaxGuides = 0 to disable.
 //
 // How it works (everything by NAME, no hardcoded offsets or addresses):
 //  1. finds the game library in memory by the name prefix "libgame-CARROM" (the "-Module-1492" part is ignored);
@@ -41,6 +43,7 @@ static const long  kScanWaitMs   = 6000;               // heap rescan interval w
 static const long  kScanSlowMs   = 25000;              // heap rescan interval when everything is found
 static const int   kMaxPerClass  = 200;                // max heap hits kept per class
 static const size_t CH = 16384;                        // read chunk
+static const int   kTestMaxGuides = 25;                // TEST: value written to mMaxGuides of the LOCAL guide (0 = no write at all)
 
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -90,6 +93,20 @@ static bool rd_str(u64 a, char* out, size_t max) {
     }
     out[i] = 0;
     return i > 0;
+}
+
+// safe write into our own process: data goes through the pipe, read() copies it to the target address.
+// A bad / read-only address makes read() return an error code, it does not crash.
+static bool wr(u64 a, const void* data, size_t n) {
+    if (n == 0 || n > 4096) return false;
+    if (write(g_pipe[1], data, n) != (ssize_t)n) return false;
+    ssize_t r = read(g_pipe[0], (void*)(uintptr_t)a, n);
+    if (r != (ssize_t)n) {
+        char tmp[256];
+        while (read(g_pipe[0], tmp, sizeof(tmp)) > 0) {}      // drain whatever is left in the pipe
+        return false;
+    }
+    return true;
 }
 
 static bool is_ident(const char* s) {
@@ -352,6 +369,29 @@ static bool still_valid(int cls, u64 o) {
     return true;
 }
 
+// ------------------------------------------------------------------ TEST write (only the local player's guide)
+static int g_patchLogs = 0;
+
+static void apply_guide_test() {
+    if (kTestMaxGuides <= 0 || F_maxg.off < 0 || F_ctl.off < 0 || N_run.off < 0) return;
+    for (u64 g : g_objs[C_FG]) {
+        int run, mg; u64 ctl;
+        if (!getb(g, N_run.off, run) || run != 1) continue;
+        if (!geti(g, F_maxg.off, mg) || mg < 1 || mg > 64) continue;
+        if (!rd(g + F_ctl.off, &ctl, 8) || !ctl) continue;
+        bool mine = false;
+        for (u64 l : g_objs[C_LOCAL]) if (l == ctl && still_valid(C_LOCAL, l)) { mine = true; break; }
+        if (!mine || mg == kTestMaxGuides) continue;
+        int v = kTestMaxGuides;
+        bool ok = wr(g + F_maxg.off, &v, 4);
+        int back = -1; geti(g, F_maxg.off, back);
+        if (g_patchLogs < 40) {
+            LOG("PATCH guide@%lx maxGuides %d -> %d  write=%s  readback=%d", (unsigned long)g, mg, v, ok ? "ok" : "FAILED", back);
+            g_patchLogs++;
+        }
+    }
+}
+
 // ------------------------------------------------------------------ snapshot
 // Freed objects keep their old isa word, so the heap scan also finds dead memory. Every object
 // below is therefore checked for plausible values (flags are 0/1, numbers in a sane range).
@@ -474,6 +514,7 @@ static void* worker(void*) {
             for (u64 o : g_objs[c]) if (still_valid(c, o)) keep.push_back(o);
             g_objs[c].swap(keep);
         }
+        apply_guide_test();
         std::string s = snapshot();
         if (s != last || t - lastBeat > 10000) {
             log_lines(s);
@@ -486,7 +527,7 @@ static void* worker(void*) {
 }
 
 __attribute__((constructor)) static void init() {
-    LOG("carprobe v2.1 loaded");
+    LOG("carprobe v3 loaded (test write kTestMaxGuides=%d)", kTestMaxGuides);
     pthread_t th;
     pthread_create(&th, nullptr, worker, nullptr);
     pthread_detach(th);
