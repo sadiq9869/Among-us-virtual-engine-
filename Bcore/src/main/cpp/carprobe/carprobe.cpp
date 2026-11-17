@@ -1,4 +1,11 @@
-// carprobe.cpp  v4.2 = STAGE 1 RECON (burst lines now list only objects that MOVED) for the solid-line feature: parent chains, PocketNode positions, shot recording at 16 ms.
+// carprobe.cpp  v5 = STAGE 2: SOLID PREDICTION LINE (simulation + JNI for the Kotlin overlay) on top of the v4.2 probe.
+//   NEW in v5: table/root transform read from the node parent chain at runtime, shot simulation (striker path, first coin hit,
+//   coin path with wall bounces, short striker deflection), JNI object top.niunaijun.blackboxa.menu.NativeCarrom
+//   (setEnabled / setOptions / lines / statusText). Still READ-ONLY: no hooks, no code patches, no game-memory writes
+//   (the old kTestMaxGuides test write stays disabled). The probe no longer stops after 30 min (the overlay needs it).
+//   Coin-coin collisions and pockets are NOT simulated (not measured yet). Physics numbers below are MEASURED from build 19.6.1
+//   (Freestyle Offline only) and UNCALIBRATED. NOT built / NOT tested when written.
+// (older header) v4.2 = STAGE 1 RECON (burst lines now list only objects that MOVED) for the solid-line feature: parent chains, PocketNode positions, shot recording at 16 ms.
 //   (v3 base: adds ONE test write: mMaxGuides of the LOCAL player's guide node; v2.1 + garbage filter for freed objects, _controlsLogic link, shows every valid object)  -  READ-ONLY probe for Carrom Pool (com.miniclip.carrom).
 // NO hooks and NO code patching. It READS memory (through a pipe, so a bad address gives an error code
 // instead of a crash) and prints values to logcat, tag CARPROBE1.
@@ -31,6 +38,9 @@
 #include <string>
 #include <map>
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <jni.h>
 
 #define TAG "CARPROBE1"
 #define LOG(...) do { __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__); usleep(1200); } while (0)
@@ -38,7 +48,7 @@
 // ------------------------------------------------------------------ config
 static const char* kLibPrefix   = "libgame-CARROM";   // name prefix of the game's own library
 static const long  kStartDelayMs = 20000;              // wait after the library appears
-static const long  kLifeMs       = 30L * 60 * 1000;    // probe stops itself after 30 min
+static const long  kLifeMs       = 0;                  // v5: 0 = the worker never stops (the overlay needs it); old value was 30 min
 static const long  kTickMs       = 500;                // value read interval
 static const long  kScanWaitMs   = 6000;               // heap rescan interval while objects are missing
 static const long  kScanSlowMs   = 25000;              // heap rescan interval when everything is found
@@ -271,6 +281,7 @@ static Iv F_maxg = {"mMaxGuides", -1}, F_scale = {"_tableScale", -1}, F_vrot = {
 // CCNode parts (found through StrikerNode / PuckNode / ControlsForegroundNode super chain)
 static Iv N_pos = {"_position", -1}, N_vis = {"_visible", -1}, N_run = {"_isRunning", -1}, N_size = {"_contentSize", -1};
 static Iv P_radius = {"_radius", -1};
+static Iv N_ignore = {"_ignoreAnchorPointForPosition", -1};   // optional: if the game has no ivar of this name it is treated as false
 static Iv N_parent = {"_parent", -1}, N_anchor = {"_anchorPoint", -1}, N_scx = {"_scaleX", -1}, N_scy = {"_scaleY", -1}, N_rot = {"_rotationX", -1};
 
 static void resolve_offsets() {
@@ -285,7 +296,7 @@ static void resolve_offsets() {
         {&F_ctl, C_FG}, {&F_maxg, C_FG}, {&F_scale, C_FG}, {&F_vrot, C_FG}, {&F_safe, C_FG},
         {&N_pos, C_STRIKER}, {&N_vis, C_STRIKER}, {&N_run, C_STRIKER}, {&N_size, C_STRIKER},
         {&P_radius, C_PUCK},
-        {&N_parent, C_STRIKER}, {&N_anchor, C_STRIKER}, {&N_scx, C_STRIKER}, {&N_scy, C_STRIKER}, {&N_rot, C_STRIKER},
+        {&N_ignore, C_STRIKER}, {&N_parent, C_STRIKER}, {&N_anchor, C_STRIKER}, {&N_scx, C_STRIKER}, {&N_scy, C_STRIKER}, {&N_rot, C_STRIKER},
     };
     for (auto& e : t) {
         e.iv->off = g_cls[e.cls] ? ivar_off(g_cls[e.cls], e.iv->name) : -1;
@@ -519,17 +530,30 @@ static void dump_chain(const char* tag, u64 o) {
     }
 }
 
-struct Aim { bool ok; double ang, dist; int act, en, enough; };
+struct Aim { bool ok; double ang, dist; int act, en, enough; bool hasCenter; double cx, cy; u64 obj; };
 
+// picks the LOCAL aim object: finger down + enabled beats the rest; an object that a running guide node points to gets a bonus (ghost filter)
 static Aim read_aim() {
-    Aim a; a.ok = false; a.ang = a.dist = 0; a.act = a.en = a.enough = 0;
+    Aim a; a.ok = false; a.ang = a.dist = 0; a.act = a.en = a.enough = 0; a.hasCenter = false; a.cx = a.cy = 0; a.obj = 0;
+    int bestScore = -1;
     for (u64 o : g_objs[C_LOCAL]) {
         double ang, dist; int act, en, enough, sid;
         if (!getd(o, L_angle.off, ang) || !getd(o, L_dist.off, dist)) continue;
         if (!getb(o, L_active.off, act) || !getb(o, L_enabled.off, en) || !getb(o, L_enough.off, enough)) continue;
         if (!geti(o, L_sid.off, sid)) continue;
         if (!sane(ang, 7.0) || !sane(dist, 5000.0) || act > 1 || en > 1 || enough > 1 || sid < 0 || sid > 16) continue;
-        if (!a.ok || (en == 1 && a.en != 1)) { a.ok = true; a.ang = ang; a.dist = dist; a.act = act; a.en = en; a.enough = enough; }
+        int score = (act == 1 ? 2 : 0) + (en == 1 ? 1 : 0);
+        for (u64 g : g_objs[C_FG]) {
+            u64 ctl; int run;
+            if (F_ctl.off >= 0 && N_run.off >= 0 && rd(g + F_ctl.off, &ctl, 8) && ctl == o && getb(g, N_run.off, run) && run == 1) { score += 4; break; }
+        }
+        if (score > bestScore) {
+            bestScore = score;
+            a.ok = true; a.ang = ang; a.dist = dist; a.act = act; a.en = en; a.enough = enough; a.obj = o;
+            double cx, cy;
+            a.hasCenter = getpt(o, L_center.off, cx, cy) && sane(cx, 5000.0) && sane(cy, 5000.0);
+            if (a.hasCenter) { a.cx = cx; a.cy = cy; }
+        }
     }
     return a;
 }
@@ -584,6 +608,321 @@ static bool same_items(const std::vector<Item>& a, const std::vector<Item>& b) {
     return true;
 }
 
+// ================================================================== STAGE 2: PREDICTION (simulation, no game writes)
+// ---- settings (set from Kotlin through JNI)
+static std::atomic<int> g_enabled{0};       // prediction on/off (the Kotlin button)
+static std::atomic<int> g_fricPct{100};     // friction multiplier in percent (tuning slider)
+static std::atomic<int> g_maxBounces{3};    // wall bounces drawn per path
+static std::atomic<int> g_deflect{1};       // draw the short striker remainder after the hit
+static std::atomic<int> g_recon{1};         // 1 = keep the old shot-recording logs (BURST lines) for tuning
+
+// ---- PHYSICS NUMBERS. Source: game 19.6.1 (versionCode 1492), [MEASURED] from the user's CARPROBE1 logs, Freestyle Offline only.
+// All UNCALIBRATED. Units = the game's table points, time = 1 frame (60 Hz).
+static const double kMinDrag       = 30.3;     // no shot at or below this drag length            (report 6.3)
+static const double kV0Slope       = 0.198;    // launch speed per frame = slope * dist + offset   (report 6.3)
+static const double kV0Offset      = -5.99;
+static const double kV0Cap         = 17.4;     // launch speed cap per frame                       (report 6.3)
+static const double kFricHigh      = 0.17;     // speed lost per frame when speed > kFricSwitch    (report 6.4)
+static const double kFricSwitch    = 4.75;     // regime switch ("~4.5 .. ~5")                     (report 6.4)
+static const double kFricLowBase   = 0.064;    // low-speed loss = base + slope * speed            (report 6.4)
+static const double kFricLowSlope  = 0.0065;
+static const double kStrikerRadius = 17.4;     // +-1                                              (report 6.2)
+static const double kBoardHalf     = 254.1;    // centre limit = kBoardHalf - radius: striker 236.7, coin 241.0 (report 6.2)
+static const double kStrikerWallE  = 0.98;     // speed kept after a wall bounce (striker)         (report 6.5)
+static const double kCoinWallE     = 0.73;     // normal speed kept after a wall bounce (coin)     (report 6.5; tangential part kept = ASSUMPTION)
+static const double kRestitution   = 1.0;      // striker - coin                                   (report 6.6)
+static const double kMassRatio     = 1.7;      // striker mass / coin mass                         (report 6.6)
+static const double kAimTol        = 3.0;      // LOCAL._center must be this close to a table striker
+static const int    kMaxFrames     = 700;
+static const double kStopSpeed     = 0.05;
+static const double kDeflectMaxLen = 120.0;    // the short striker remainder is cut at this length
+static const double kBoardBound    = 260.0;    // coins outside +-this are ignored (garbage / flying in)
+
+struct V2 { double x, y; };
+struct Xf { double a, b, c, d, tx, ty; };                 // x' = a x + c y + tx ; y' = b x + d y + ty   (Cocos: y points up)
+static Xf xf_id() { Xf m; m.a = 1; m.b = 0; m.c = 0; m.d = 1; m.tx = 0; m.ty = 0; return m; }
+static V2 xf_apply(const Xf& m, double x, double y) { V2 r; r.x = m.a * x + m.c * y + m.tx; r.y = m.b * x + m.d * y + m.ty; return r; }
+static Xf xf_compose(const Xf& o, const Xf& i) {            // o after i
+    Xf r;
+    r.a = o.a * i.a + o.c * i.b;   r.b = o.b * i.a + o.d * i.b;
+    r.c = o.a * i.c + o.c * i.d;   r.d = o.b * i.c + o.d * i.d;
+    r.tx = o.a * i.tx + o.c * i.ty + o.tx;
+    r.ty = o.b * i.tx + o.d * i.ty + o.ty;
+    return r;
+}
+static bool xf_close(const Xf& p, const Xf& q) {
+    return fabs(p.a - q.a) < 1e-4 && fabs(p.b - q.b) < 1e-4 && fabs(p.c - q.c) < 1e-4 && fabs(p.d - q.d) < 1e-4 &&
+           fabs(p.tx - q.tx) < 0.02 && fabs(p.ty - q.ty) < 0.02;
+}
+
+// ---- class name of an object, cached by class pointer
+static std::map<u64, std::string> g_nameCache;
+static std::string obj_cname(u64 o) {
+    u64 isa;
+    if (!rd(o, &isa, 8) || !isa) return std::string();
+    auto it = g_nameCache.find(isa);
+    if (it != g_nameCache.end()) return it->second;
+    char nm[96];
+    std::string r;
+    if (class_name_at(isa, nm, sizeof(nm))) r = nm;
+    g_nameCache[isa] = r;
+    return r;
+}
+
+// Cocos nodeToParent transform of one node (position, anchor, content size, scale, rotation; skew ignored).
+static bool node_to_parent(u64 n, Xf& out) {
+    double px, py, ax, ay, w, h; float sx, sy, rot; int ig = 0;
+    if (!getpt(n, N_pos.off, px, py) || !getpt(n, N_anchor.off, ax, ay) || !getpt(n, N_size.off, w, h)) return false;
+    if (!getf(n, N_scx.off, sx) || !getf(n, N_scy.off, sy) || !getf(n, N_rot.off, rot)) return false;
+    if (!sane(px, 1e5) || !sane(py, 1e5) || !sane(ax, 100.0) || !sane(ay, 100.0) || !sane(w, 1e5) || !sane(h, 1e5)) return false;
+    if (!(fabs(sx) < 1000.0f) || !(fabs(sy) < 1000.0f) || !(fabs(rot) < 100000.0f)) return false;
+    if (N_ignore.off >= 0) { if (!getb(n, N_ignore.off, ig) || ig > 1) ig = 0; }
+    double apx = ax * w, apy = ay * h;                          // anchorPointInPoints
+    double r = -(double)rot * M_PI / 180.0, c = cos(r), s = sin(r);
+    out.a = c * sx;  out.b = s * sx;  out.c = -s * sy;  out.d = c * sy;
+    double x0 = px + (ig ? apx : 0.0), y0 = py + (ig ? apy : 0.0);
+    out.tx = x0 - (out.a * apx + out.c * apy);
+    out.ty = y0 - (out.b * apx + out.d * apy);
+    return true;
+}
+
+struct Chain { bool ok; u64 table; Xf toRoot; double rootW, rootH; };
+
+// Walks from obj's parent up to the node named "RootNode" (its own transform is NOT applied: its local space = design space).
+// toRoot maps a point given in obj's _position space (= the space of obj's parent) into design points (y up).
+static Chain walk_chain(u64 obj) {
+    Chain c; c.ok = false; c.table = 0; c.toRoot = xf_id(); c.rootW = c.rootH = 0;
+    u64 n;
+    if (N_parent.off < 0 || !rd(obj + N_parent.off, &n, 8) || !n) return c;
+    Xf m = xf_id();
+    for (int d = 0; d < 24 && n; d++) {
+        std::string nm = obj_cname(n);
+        if (nm.empty()) return c;
+        if (nm == "RootNode") {
+            double w, h;
+            if (!getpt(n, N_size.off, w, h) || !(w > 1.0) || !(h > 1.0) || w > 1e5 || h > 1e5) return c;
+            c.rootW = w; c.rootH = h; c.toRoot = m; c.ok = (c.table != 0);
+            return c;
+        }
+        if (nm == "TableNode" && !c.table) c.table = n;
+        Xf t;
+        if (!node_to_parent(n, t)) return c;
+        m = xf_compose(t, m);
+        u64 par;
+        if (!rd(n + N_parent.off, &par, 8) || par == n) return c;
+        n = par;
+    }
+    return c;
+}
+
+// ---- the world the prediction works on (cached, refreshed every ~400 ms while aiming)
+struct Coin { u64 o; double x, y, r; };
+struct World {
+    bool ok; u64 localObj; u64 striker; u64 table; Xf toRoot; double rootW, rootH; std::vector<Coin> coins; long at; std::string why;
+};
+static World g_world;
+
+static bool read_pos(u64 o, double& x, double& y) { return getpt(o, N_pos.off, x, y) && sane(x, 5000.0) && sane(y, 5000.0); }
+
+static void refresh_world(u64 localObj, double cx, double cy, long t) {
+    World w; w.ok = false; w.localObj = localObj; w.striker = 0; w.table = 0; w.toRoot = xf_id(); w.rootW = w.rootH = 0; w.at = t;
+    if (N_pos.off < 0 || N_parent.off < 0 || N_anchor.off < 0 || N_size.off < 0 || N_scx.off < 0 || N_scy.off < 0 || N_rot.off < 0) {
+        w.why = "CCNode ivar missing (pos/parent/anchor/size/scale/rot)"; g_world = w; return;
+    }
+    // 1. the striker that belongs to the aim: a StrikerNode under a TableNode whose position equals LOCAL._center
+    double best = 1e18; Chain bc; bc.ok = false; bc.table = 0;
+    for (u64 o : g_objs[C_STRIKER]) {
+        if (!item_valid('S', o)) continue;
+        double x, y;
+        if (!read_pos(o, x, y)) continue;
+        Chain ch = walk_chain(o);
+        if (!ch.ok) continue;
+        double d = hypot(x - cx, y - cy);
+        if (d < best) { best = d; w.striker = o; bc = ch; }
+    }
+    if (!w.striker) { w.why = "no StrikerNode under a TableNode"; g_world = w; return; }
+    if (best > kAimTol) { char b[96]; snprintf(b, sizeof(b), "aim centre is %.1f away from the nearest table striker", best); w.why = b; g_world = w; return; }
+    w.table = bc.table; w.toRoot = bc.toRoot; w.rootW = bc.rootW; w.rootH = bc.rootH;
+    // 2. coins: live PuckNodes in the same table and the same coordinate space as the striker
+    int rejChain = 0;
+    for (u64 o : g_objs[C_PUCK]) {
+        if (!item_valid('P', o)) continue;
+        int vis; if (!getb(o, N_vis.off, vis) || vis != 1) continue;
+        double x, y; float r;
+        if (!read_pos(o, x, y) || fabs(x) > kBoardBound || fabs(y) > kBoardBound) continue;
+        if (!getf(o, P_radius.off, r) || r < 1.0f || r > 60.0f) continue;
+        Chain ch = walk_chain(o);
+        if (!ch.ok || ch.table != w.table || !xf_close(ch.toRoot, w.toRoot)) { rejChain++; continue; }
+        Coin c; c.o = o; c.x = x; c.y = y; c.r = r;
+        w.coins.push_back(c);
+    }
+    w.ok = true;
+    char b[64]; snprintf(b, sizeof(b), "ok (rejected pucks: %d)", rejChain); w.why = b;
+    g_world = w;
+}
+
+// ---- simulation
+struct Body { double x, y, vx, vy, r; bool striker; };
+
+static double friction_loss(double v, double scale) {
+    return ((v > kFricSwitch) ? kFricHigh : (kFricLowBase + kFricLowSlope * v)) * scale;
+}
+
+// Moves one body frame by frame. Stops at: speed 0, wall bounce number maxBounces+1, length limit, or (if targets) the first contact with a coin.
+// Returns the index of the coin hit or -1. pts = polyline (start, every wall contact, end). b ends at the stop / contact position.
+static int sim_path(Body& b, const std::vector<Coin>* targets, int maxBounces, double fricScale, double maxLen,
+                    std::vector<V2>& pts, int& bounces) {
+    pts.clear(); pts.push_back(V2{b.x, b.y});
+    bounces = 0;
+    const double lim = kBoardHalf - b.r;
+    const double e = b.striker ? kStrikerWallE : kCoinWallE;
+    double len = 0;
+    for (int f = 0; f < kMaxFrames; f++) {
+        if (hypot(b.vx, b.vy) < kStopSpeed) break;
+        double rem = 1.0;
+        for (int ev = 0; ev < 8 && rem > 1e-9; ev++) {
+            double dx = b.vx * rem, dy = b.vy * rem;
+            double tBest = 1.0; int kind = 0, ci = -1;
+            if (dx > 1e-12 && b.x + dx > lim)        { double t = (lim - b.x) / dx;  if (t < tBest) { tBest = t; kind = 1; } }
+            else if (dx < -1e-12 && b.x + dx < -lim) { double t = (-lim - b.x) / dx; if (t < tBest) { tBest = t; kind = 1; } }
+            if (dy > 1e-12 && b.y + dy > lim)        { double t = (lim - b.y) / dy;  if (t < tBest) { tBest = t; kind = 2; } }
+            else if (dy < -1e-12 && b.y + dy < -lim) { double t = (-lim - b.y) / dy; if (t < tBest) { tBest = t; kind = 2; } }
+            if (targets) {
+                double aa = dx * dx + dy * dy;
+                for (size_t i = 0; i < targets->size() && aa > 1e-18; i++) {
+                    const Coin& c = (*targets)[i];
+                    double px = b.x - c.x, py = b.y - c.y, R = b.r + c.r;
+                    double bb = px * dx + py * dy, cc = px * px + py * py - R * R;
+                    double t;
+                    if (cc <= 0) { if (bb >= 0) continue; t = 0; }               // already touching: counts only if moving closer
+                    else {
+                        double disc = bb * bb - aa * cc;
+                        if (disc < 0) continue;
+                        t = (-bb - sqrt(disc)) / aa;
+                        if (t < 0) continue;
+                    }
+                    if (t <= tBest) { tBest = t; kind = 3; ci = (int)i; }
+                }
+            }
+            b.x += dx * tBest; b.y += dy * tBest; len += hypot(dx, dy) * tBest;
+            rem *= (1.0 - tBest);
+            if (kind == 3) { pts.push_back(V2{b.x, b.y}); return ci; }
+            if (kind == 1 || kind == 2) {
+                if (kind == 1) { b.x = (b.vx > 0) ? lim : -lim; } else { b.y = (b.vy > 0) ? lim : -lim; }
+                pts.push_back(V2{b.x, b.y});
+                if (kind == 1) b.vx = -b.vx; else b.vy = -b.vy;
+                if (b.striker) { b.vx *= e; b.vy *= e; }
+                else if (kind == 1) b.vx *= e; else b.vy *= e;
+                bounces++;
+                if (bounces > maxBounces) return -1;
+            }
+            if (kind == 0) break;
+        }
+        if (len > maxLen) break;
+        double sp = hypot(b.vx, b.vy);
+        double ns = sp - friction_loss(sp, fricScale);
+        if (ns <= 0) break;
+        b.vx *= ns / sp; b.vy *= ns / sp;
+    }
+    pts.push_back(V2{b.x, b.y});
+    return -1;
+}
+
+// ---- prediction output (read by JNI): [designW, designH, nPaths, {type, nPoints, x0,y0,x1,y1...}...]  design points, y up
+// type 0 = striker path (white), 1 = hit coin path (red), 2 = striker remainder after the hit (thin white)
+static std::mutex g_predMx;
+static std::vector<float> g_predData;
+static char g_predStatus[400] = "Prediction: waiting for the game";
+static char g_predLastLog[300] = "";
+
+static void pred_set(const std::vector<float>& d, const char* st) {
+    std::lock_guard<std::mutex> lk(g_predMx);
+    g_predData = d;
+    snprintf(g_predStatus, sizeof(g_predStatus), "%s", st);
+}
+
+static void put_path(std::vector<float>& out, int type, const std::vector<V2>& pts, const Xf& m) {
+    out.push_back((float)type); out.push_back((float)pts.size());
+    for (const V2& p : pts) { V2 q = xf_apply(m, p.x, p.y); out.push_back((float)q.x); out.push_back((float)q.y); }
+}
+
+static double launch_speed(double dist) {
+    double v = kV0Slope * dist + kV0Offset;
+    if (v > kV0Cap) v = kV0Cap;
+    return v;
+}
+
+static long g_lastPredAt = 0;
+static bool g_wasAiming = false;
+
+static void pred_tick(const Aim& a, long t) {
+    if (!g_enabled.load()) { if (g_wasAiming) { std::vector<float> e; pred_set(e, "Prediction: OFF"); g_wasAiming = false; } return; }
+    if (!a.ok || a.act != 1) {
+        if (g_wasAiming) { std::vector<float> e; pred_set(e, a.ok ? "Prediction: waiting for aim" : "Prediction: aim objects not found yet"); g_wasAiming = false; }
+        else if (!a.ok) { std::vector<float> e; pred_set(e, "Prediction: aim objects not found yet (heap scan every few seconds)"); }
+        return;
+    }
+    if (t - g_lastPredAt < 25) return;
+    g_lastPredAt = t;
+    char st[400];
+    bool newAim = !g_wasAiming;
+    g_wasAiming = true;
+    if (!a.hasCenter) { std::vector<float> e; pred_set(e, "Prediction: LOCAL._center unreadable"); return; }
+    if (newAim || !g_world.ok || g_world.localObj != a.obj || t - g_world.at > 400) refresh_world(a.obj, a.cx, a.cy, t);
+    const World& w = g_world;
+    if (!w.ok) { std::vector<float> e; snprintf(st, sizeof(st), "Prediction: %s", w.why.c_str()); pred_set(e, st); return; }
+    double sx, sy;
+    if (!read_pos(w.striker, sx, sy)) { std::vector<float> e; pred_set(e, "Prediction: striker position unreadable"); return; }
+    if (a.dist <= kMinDrag) {
+        std::vector<float> e; snprintf(st, sizeof(st), "Prediction: drag %.1f too short (needs > %.1f)", a.dist, kMinDrag); pred_set(e, st); return;
+    }
+    double v0 = launch_speed(a.dist);
+    double fs = g_fricPct.load() / 100.0;
+    int mb = g_maxBounces.load();
+    Body s; s.x = sx; s.y = sy; s.vx = cos(a.ang) * v0; s.vy = sin(a.ang) * v0; s.r = kStrikerRadius; s.striker = true;
+    std::vector<V2> sp, cp, dp; int sb = 0, cb = 0, db = 0;
+    int hit = sim_path(s, &w.coins, mb, fs, 1e9, sp, sb);
+    std::vector<float> out;
+    out.push_back((float)w.rootW); out.push_back((float)w.rootH);
+    int nPaths = 1;
+    size_t idxN = out.size(); out.push_back(0.f);
+    put_path(out, 0, sp, w.toRoot);
+    char hitTxt[120] = "no coin hit";
+    if (hit >= 0) {
+        const Coin& c = w.coins[hit];
+        double nx = c.x - s.x, ny = c.y - s.y, nl = hypot(nx, ny);
+        if (nl > 1e-9) {
+            nx /= nl; ny /= nl;
+            double vn = s.vx * nx + s.vy * ny;
+            double tx = s.vx - vn * nx, ty = s.vy - vn * ny;
+            double ms = kMassRatio, mc = 1.0, e = kRestitution;
+            double svn = (ms - e * mc) / (ms + mc) * vn;
+            double cvn = (1.0 + e) * ms / (ms + mc) * vn;
+            if (vn > 0) {
+                Body cb2; cb2.x = c.x; cb2.y = c.y; cb2.vx = cvn * nx; cb2.vy = cvn * ny; cb2.r = c.r; cb2.striker = false;
+                sim_path(cb2, nullptr, mb, fs, 1e9, cp, cb);
+                put_path(out, 1, cp, w.toRoot); nPaths++;
+                if (g_deflect.load()) {
+                    Body s2; s2.x = s.x; s2.y = s.y; s2.vx = tx + svn * nx; s2.vy = ty + svn * ny; s2.r = kStrikerRadius; s2.striker = true;
+                    sim_path(s2, nullptr, mb, fs, kDeflectMaxLen, dp, db);
+                    if (dp.size() >= 2) { put_path(out, 2, dp, w.toRoot); nPaths++; }
+                }
+                snprintf(hitTxt, sizeof(hitTxt), "hit coin %d at (%.1f,%.1f) coin v0 %.2f stops (%.1f,%.1f)", hit, c.x, c.y, cvn, cb2.x, cb2.y);
+            } else snprintf(hitTxt, sizeof(hitTxt), "grazing contact, no push");
+        }
+    }
+    out[idxN] = (float)nPaths;
+    V2 origin = xf_apply(w.toRoot, 0, 0);
+    snprintf(st, sizeof(st), "Prediction ON | ang %.1f deg  drag %.1f  v0 %.2f/frame | coins %d | striker bounces %d | %s | table origin in design (%.1f,%.1f) root %.0fx%.0f",
+             a.ang * 180.0 / M_PI, a.dist, v0, (int)w.coins.size(), sb, hitTxt, origin.x, origin.y, w.rootW, w.rootH);
+    pred_set(out, st);
+    {
+        std::lock_guard<std::mutex> lk(g_predMx);
+        snprintf(g_predLastLog, sizeof(g_predLastLog), "ang=%.4f dist=%.2f v0=%.3f start=%.2f,%.2f strikerEnd=%.1f,%.1f %s", a.ang, a.dist, v0, sx, sy,
+                 sp.empty() ? 0.0 : sp.back().x, sp.empty() ? 0.0 : sp.back().y, hitTxt);
+    }
+}
+
 static void* worker(void*) {
     if (pipe2(g_pipe, O_NONBLOCK | O_CLOEXEC) != 0) { LOG("pipe2 failed"); return nullptr; }
     long t0 = now_ms();
@@ -603,12 +942,12 @@ static void* worker(void*) {
     std::vector<Item> prevItems, bItems; std::vector<double> prevXY, xy, bPrev, bLogged;
     bool burst = false; long burstStart = 0, lastMove = 0; int burstLines = 0;
 
-    while (now_ms() - start < kLifeMs) {
+    while (kLifeMs == 0 || now_ms() - start < kLifeMs) {
         long t = now_ms();
         if (!burst) {
             bool haveCore = !g_objs[C_LOCAL].empty() && !g_objs[C_FG].empty();
             long wait = haveCore ? kScanSlowMs : kScanWaitMs;
-            if (!aimActive && t - lastScan > wait) {
+            if (!aimActive && (g_enabled.load() || g_recon.load()) && t - lastScan > wait) {
                 long s0 = now_ms();
                 scan_heap();
                 lastScan = now_ms();
@@ -636,19 +975,26 @@ static void* worker(void*) {
                 aimActive = false; release = true;
                 LOG("AIM released: last ang=%.5f(%.2fdeg) dist=%.3f en=%d power_ok=%d",
                     lastAim.ang, lastAim.ang * 180.0 / M_PI, lastAim.dist, lastAim.en, lastAim.enough);
+                if (g_enabled.load()) {
+                    char pl[300];
+                    { std::lock_guard<std::mutex> lk(g_predMx); snprintf(pl, sizeof(pl), "%s", g_predLastLog); }
+                    LOG("PRED last: %s", pl);
+                }
             }
         }
+
+        pred_tick(a, t);
 
         // --- coins moving by themselves (opponent shot) also start a recording
         bool puckMoved = false;
         std::vector<Item> items;
-        if (!burst) {
+        if (!burst && g_recon.load()) {
             items = build_items();
             read_xy(items, xy);
             if (same_items(items, prevItems)) puckMoved = pucks_moved(items, xy, prevXY);
             prevItems = items; prevXY = xy;
         }
-        if (!burst && (release || puckMoved) && bursts < 12 && !items.empty()) {
+        if (!burst && g_recon.load() && (release || puckMoved) && bursts < 24 && !items.empty()) {
             burst = true; bursts++; burstStart = t; lastMove = t; burstLines = 0;
             bItems = items; bPrev = xy; bLogged = xy;
             LOG("BURST %d start (%s) lastAim ang=%.5f dist=%.3f items=%d", bursts, release ? "aim release" : "coins moved",
@@ -681,7 +1027,7 @@ static void* worker(void*) {
                 burst = false;
                 LOG("BURST end lines=%d", burstLines);
             }
-        } else if (!aimActive && t - lastSnap >= 500) {
+        } else if (!aimActive && g_recon.load() && t - lastSnap >= 500) {
             lastSnap = t;
             std::string s = snapshot();
             if (s != last || t - lastBeat > 10000) {
@@ -706,13 +1052,51 @@ static void* worker(void*) {
         }
         usleep(burst ? 16000 : (aimActive ? 10000 : 100000));
     }
-    LOG("probe finished (30 min)");
+    LOG("probe finished");
     return nullptr;
 }
 
 __attribute__((constructor)) static void init() {
-    LOG("carprobe v4.2 loaded (stage 1 recon; test write kTestMaxGuides=%d)", kTestMaxGuides);
+    LOG("carprobe v5 loaded (stage 2 prediction; test write kTestMaxGuides=%d)", kTestMaxGuides);
     pthread_t th;
     pthread_create(&th, nullptr, worker, nullptr);
     pthread_detach(th);
 }
+
+// ================================================================== JNI (Kotlin object top.niunaijun.blackboxa.menu.NativeCarrom)
+// The function names must match that object's package, name and method names exactly.
+extern "C" {
+
+JNIEXPORT void JNICALL Java_top_niunaijun_blackboxa_menu_NativeCarrom_setEnabled(JNIEnv*, jobject, jint on) {
+    g_enabled.store(on != 0 ? 1 : 0);
+    if (!on) { std::vector<float> e; pred_set(e, "Prediction: OFF"); }
+}
+
+// frictionPercent 50..150, maxBounces 0..5, deflection 0/1, recon 0/1 (values outside the range are clamped)
+JNIEXPORT void JNICALL Java_top_niunaijun_blackboxa_menu_NativeCarrom_setOptions(JNIEnv*, jobject, jint frictionPercent, jint maxBounces, jint deflection, jint recon) {
+    int f = frictionPercent < 50 ? 50 : (frictionPercent > 150 ? 150 : frictionPercent);
+    int b = maxBounces < 0 ? 0 : (maxBounces > 5 ? 5 : maxBounces);
+    g_fricPct.store(f);
+    g_maxBounces.store(b);
+    g_deflect.store(deflection != 0 ? 1 : 0);
+    g_recon.store(recon != 0 ? 1 : 0);
+}
+
+// [designW, designH, nPaths, {type, nPoints, x,y,...}...] in design points (y up); empty array = nothing to draw
+JNIEXPORT jfloatArray JNICALL Java_top_niunaijun_blackboxa_menu_NativeCarrom_lines(JNIEnv* env, jobject) {
+    std::vector<float> copy;
+    { std::lock_guard<std::mutex> lk(g_predMx); copy = g_predData; }
+    if (copy.size() > 100000) copy.clear();
+    jfloatArray arr = env->NewFloatArray((jsize)copy.size());
+    if (!arr) return nullptr;
+    if (!copy.empty()) env->SetFloatArrayRegion(arr, 0, (jsize)copy.size(), copy.data());
+    return arr;
+}
+
+JNIEXPORT jstring JNICALL Java_top_niunaijun_blackboxa_menu_NativeCarrom_statusText(JNIEnv* env, jobject) {
+    char b[400];
+    { std::lock_guard<std::mutex> lk(g_predMx); snprintf(b, sizeof(b), "%s", g_predStatus); }
+    return env->NewStringUTF(b);
+}
+
+}  // extern "C"
