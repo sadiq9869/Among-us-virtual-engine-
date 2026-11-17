@@ -1,11 +1,22 @@
-// carprobe.cpp  v5 = STAGE 2: SOLID PREDICTION LINE (simulation + JNI for the Kotlin overlay) on top of the v4.2 probe.
-//   NEW in v5: table/root transform read from the node parent chain at runtime, shot simulation (striker path, first coin hit,
-//   coin path with wall bounces, short striker deflection), JNI object top.niunaijun.blackboxa.menu.NativeCarrom
-//   (setEnabled / setOptions / lines / statusText). Still READ-ONLY: no hooks, no code patches, no game-memory writes
-//   (the old kTestMaxGuides test write stays disabled). The probe no longer stops after 30 min (the overlay needs it).
-//   Coin-coin collisions and pockets are NOT simulated (not measured yet). Physics numbers below are MEASURED from build 19.6.1
-//   (Freestyle Offline only) and UNCALIBRATED. NOT built / NOT tested when written.
-// (older header) v4.2 = STAGE 1 RECON (burst lines now list only objects that MOVED) for the solid-line feature: parent chains, PocketNode positions, shot recording at 16 ms.
+// carprobe.cpp  v5.2 = v5.1 prediction (round-2 physics, coin-coin, pockets, foul) + READ-ONLY DUMP MODE.
+//   NEW in v5.2: DUMP MODE. Once per game start, the first time a match is found (coins + aim objects on the heap), the probe
+//   (1) finds ALL Objective-C classes of the game library by scanning its data segments for class structs (no runtime API needed),
+//   (2) lists every ivar whose name looks physics-related (friction, restitution, mass, velocity, damping, angular, impulse ...),
+//   (3) dumps ALL ivars (name, type, offset) of TableLogic, PuckModel, StrikerModel, TableShape, TablePolygon, PuckLogic, PuckNode,
+//       StrikerNode, TableNode, ControlsLogic* and of every class that owns an ivar called friction / spinFriction / mass /
+//       restitution / physicsSpeedFactor,
+//   (4) best-effort method list of those classes (method entry layout is NOT confirmed: names may print as "?"),
+//   (5) reads the live values of all ivars of the found instances (idle), and after each of the first 3 shots prints only the
+//       numeric ivars that CHANGED (60 / 250 / 600 ms after release) = velocity / spin / state fields.
+//   All log lines of this mode start with "DUMP". Nothing is written to game memory, no hooks.
+//   NOT built here by an AI beyond a host syntax check; NOT run in the game.
+// (older header v5.1) round-2 physics, multi-body simulation with coin-coin collisions, pockets, foul marker, "PRED status" diagnostics.
+// (older header v5) STAGE 2: SOLID PREDICTION LINE (simulation + JNI for the Kotlin overlay) on top of the v4.2 probe.
+//   table/root transform read from the node parent chain at runtime, JNI object top.niunaijun.blackboxa.menu.NativeCarrom
+//   (setEnabled / setOptions / lines / statusText). READ-ONLY: no hooks, no code patches, no game-memory writes
+//   (the old kTestMaxGuides test write stays disabled). The probe never stops (the overlay needs it).
+//   Physics numbers below are MEASURED from build 19.6.1 (Freestyle Offline only) and UNCALIBRATED.
+// (older header) v4.2 = STAGE 1 RECON (burst lines list only objects that MOVED): parent chains, PocketNode positions, shot recording at 16 ms.
 //   (v3 base: adds ONE test write: mMaxGuides of the LOCAL player's guide node; v2.1 + garbage filter for freed objects, _controlsLogic link, shows every valid object)  -  READ-ONLY probe for Carrom Pool (com.miniclip.carrom).
 // NO hooks and NO code patching. It READS memory (through a pipe, so a bad address gives an error code
 // instead of a crash) and prints values to logcat, tag CARPROBE1.
@@ -21,7 +32,6 @@
 //  4. scans the process heap for objects whose first word (isa) equals the class address;
 //  5. prints angle / power / position values of those objects while you play.
 // Build-dependent values: NONE hardcoded. Only the names below (class + ivar names, from v19.6.1).
-// NOT built / NOT tested when written.
 #include <android/log.h>
 #include <dlfcn.h>
 #include <link.h>
@@ -37,6 +47,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -55,6 +66,11 @@ static const long  kScanSlowMs   = 25000;              // heap rescan interval w
 static const int   kMaxPerClass  = 200;                // max heap hits kept per class
 static const size_t CH = 16384;                        // read chunk
 static const int   kTestMaxGuides = 0;                 // TEST: value written to mMaxGuides of the LOCAL guide (0 = no write at all)
+static const int   kDumpEnabled  = 1;                  // v5.2: 1 = run the one-time DUMP mode when the first match is found
+static const int   kDumpMaxObjsPerClass = 24;          // live instances printed per dumped class
+static const int   kDumpMaxObjsTotal    = 150;
+static const int   kDumpMaxHits         = 300;         // physics-looking ivar names printed
+static const int   kDumpMaxMethods      = 200;         // per class
 
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -1033,6 +1049,387 @@ static void pred_tick(const Aim& a, long t) {
     }
 }
 
+// ================================================================== v5.2 DUMP MODE (read-only)
+// Goal: find out where the game keeps friction / spinFriction / mass / restitution / physicsSpeedFactor (if they are ObjC ivars at all)
+// and which ivars of the model objects change while a shot is running. Everything is read through rd(); nothing is written.
+// All class addresses that live in HEAP memory are stored XOR-ed with kObf, otherwise the heap scan would find our own copies.
+
+struct IvInfo { std::string cls, name, type; int off; };
+struct DumpObj { u64 o; std::vector<std::string> idle; };            // idle = numeric value text per ivar ("" = not numeric)
+struct DumpCls { std::string name; u64 clsX; std::vector<IvInfo> ivs; std::vector<DumpObj> objs; };
+static std::vector<DumpCls> g_dc;
+static bool g_dumpDone = false;
+static bool g_dumpReady = false;
+
+static const char* kDumpClasses[] = {
+    "TableLogic", "PuckModel", "StrikerModel", "TableShape", "TablePolygon", "PuckLogic",
+    "PuckNode", "StrikerNode", "TableNode", "ControlsLogic", "ControlsLogicLocal", "ControlsForegroundNode",
+    "GameplayMultiPlayerView", "GameplayMultiPlayerFreestyleOfflineView"
+};
+// substrings (lower case) of ivar names that are listed as "DUMP hit"
+static const char* kInterest[] = {
+    "fric", "restit", "mass", "veloc", "damp", "angular", "impuls", "bounce", "elastic", "speedfactor", "physic", "spinrate", "spinspeed"
+};
+// exact (lower case) ivar names whose owner class is dumped completely
+static const char* kExact[] = {
+    "_friction", "friction", "spinfriction", "_spinfriction", "physicsspeedfactor", "_physicsspeedfactor",
+    "_mass", "mass", "_restitution", "restitution"
+};
+
+static std::string lower_s(const std::string& s) {
+    std::string r = s;
+    for (char& c : r) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    return r;
+}
+
+static bool in_lib(u64 p) {
+    for (const Seg& s : g_segs) if (p >= s.start && p < s.start + s.size) return true;
+    return false;
+}
+
+static std::string class_name_s(u64 c) {
+    char nm[96];
+    if (class_name_at(c, nm, sizeof(nm))) return std::string(nm);
+    return std::string("?");
+}
+
+// Finds every ObjC class struct of the game library by pattern (name pointer inside the library, info flags = class (not meta), plausible instance size).
+static std::vector<u64> enum_classes() {
+    std::vector<u64> out;
+    std::set<u64> seen;
+    for (const Seg& s : g_segs) {
+        if (!(s.flags & PF_R) || (s.flags & PF_X)) continue;
+        u64 a0 = (s.start + 7) & ~(u64)7;
+        u64 end = s.start + s.size;
+        for (u64 a = a0; a + 64 <= end; a += CH) {
+            size_t n = (size_t)std::min<u64>(CH + 64, end - a);
+            n &= ~(size_t)7;
+            if (n < 64 || !rd(a, g_scanbuf, n)) continue;
+            size_t lim = std::min<size_t>(CH, n - 64);
+            for (size_t i = 0; i <= lim; i += 8) {
+                u64 w[8];
+                memcpy(w, g_scanbuf + i, 64);
+                u64 info = w[4], isz = w[5];
+                if (!w[0] || !(info & 1) || (info & 2) || info >= 65536) continue;
+                if (isz < 8 || isz > 100000) continue;
+                if (!in_lib(w[2])) continue;
+                u64 c = a + i;
+                if (seen.count(c)) continue;
+                char nm[96];
+                if (!rd_str(w[2], nm, sizeof(nm)) || !is_ident(nm)) continue;
+                seen.insert(c);
+                out.push_back(c);
+            }
+        }
+    }
+    return out;
+}
+
+// ivars declared by this class only (no super classes)
+static std::vector<IvInfo> class_ivars_own(u64 c, const std::string& cname) {
+    std::vector<IvInfo> v;
+    u64 list;
+    if (!rd(c + 48, &list, 8) || !list) return v;
+    u32 cnt;
+    if (!rd(list, &cnt, 4) || cnt == 0 || cnt > 400) return v;
+    std::vector<uint8_t> raw(8 + 24ull * cnt);
+    if (!rd(list, raw.data(), raw.size())) return v;
+    for (u32 i = 0; i < cnt; i++) {
+        const uint8_t* e = raw.data() + 8 + 24ull * i;
+        u64 np, tp; u32 off;
+        memcpy(&np, e, 8); memcpy(&tp, e + 8, 8); memcpy(&off, e + 16, 4);
+        char nm[96], ty[100];
+        if (!rd_str(np, nm, sizeof(nm))) continue;
+        if (!rd_str(tp, ty, sizeof(ty))) ty[0] = 0;
+        IvInfo iv; iv.cls = cname; iv.name = nm; iv.type = ty; iv.off = (int)off;
+        v.push_back(iv);
+    }
+    return v;
+}
+
+// ivars of the class and its super classes (stops at CC* / NS* base classes: cocos nodes are not interesting here)
+static std::vector<IvInfo> all_ivars(u64 c) {
+    std::vector<IvInfo> v;
+    for (int d = 0; d < 6 && c; d++) {
+        std::string nm = class_name_s(c);
+        if (d > 0 && (nm == "?" || nm.compare(0, 2, "CC") == 0 || nm.compare(0, 2, "NS") == 0)) break;
+        std::vector<IvInfo> own = class_ivars_own(c, nm);
+        v.insert(v.end(), own.begin(), own.end());
+        c = super_of(c);
+    }
+    return v;
+}
+
+static int prim_size(char c) {
+    switch (c) {
+        case 'f': case 'i': case 'I': case 'l': case 'L': return 4;
+        case 'd': case 'q': case 'Q': return 8;
+        case 's': case 'S': return 2;
+        case 'c': case 'C': case 'B': return 1;
+        default: return 0;
+    }
+}
+
+static void fmt_prim(const uint8_t* p, char c, char* o, size_t n) {
+    switch (c) {
+        case 'f': { float v; memcpy(&v, p, 4); snprintf(o, n, "%.5g", (double)v); break; }
+        case 'd': { double v; memcpy(&v, p, 8); snprintf(o, n, "%.7g", v); break; }
+        case 'i': case 'l': { int32_t v; memcpy(&v, p, 4); snprintf(o, n, "%d", (int)v); break; }
+        case 'I': case 'L': { uint32_t v; memcpy(&v, p, 4); snprintf(o, n, "%u", (unsigned)v); break; }
+        case 's': { int16_t v; memcpy(&v, p, 2); snprintf(o, n, "%d", (int)v); break; }
+        case 'S': { uint16_t v; memcpy(&v, p, 2); snprintf(o, n, "%u", (unsigned)v); break; }
+        case 'c': { int8_t v = (int8_t)p[0]; snprintf(o, n, "%d", (int)v); break; }
+        case 'C': case 'B': snprintf(o, n, "%u", (unsigned)p[0]); break;
+        case 'q': { int64_t v; memcpy(&v, p, 8); snprintf(o, n, "%lld", (long long)v); break; }
+        case 'Q': { uint64_t v; memcpy(&v, p, 8); snprintf(o, n, "%llu", (unsigned long long)v); break; }
+        default: snprintf(o, n, "?"); break;
+    }
+}
+
+// Formats one ivar of a live object by its type encoding. numericOnly = only numbers and flat structs of numbers (for the idle/changed comparison).
+static bool fmt_value(u64 obj, const IvInfo& iv, bool numericOnly, std::string& out) {
+    if (iv.off < 0) return false;
+    const char* t = iv.type.c_str();
+    while (*t && strchr("rnNoORV", *t)) t++;
+    char c = *t;
+    char b[200];
+    int ps = prim_size(c);
+    if (ps) {
+        uint8_t buf[8];
+        if (!rd(obj + (u64)iv.off, buf, (size_t)ps)) return false;
+        fmt_prim(buf, c, b, sizeof(b));
+        out = b;
+        return true;
+    }
+    if (c == '@' || c == '^' || c == '*' || c == ':' || c == '#') {
+        if (numericOnly) return false;
+        u64 p;
+        if (!rd(obj + (u64)iv.off, &p, 8)) return false;
+        if (c == '@' && p) {
+            std::string cn = obj_cname(p);
+            snprintf(b, sizeof(b), "0x%lx(%s)", (unsigned long)p, cn.empty() ? "?" : cn.c_str());
+        } else snprintf(b, sizeof(b), "0x%lx", (unsigned long)p);
+        out = b;
+        return true;
+    }
+    if (c == '{') {
+        const char* q = strchr(t, '=');
+        char kinds[16]; int offs[16]; int nf = 0, cur = 0;
+        bool ok = (q != nullptr);
+        if (ok) q++;
+        while (ok && *q && *q != '}') {
+            if (*q == '"') { q++; while (*q && *q != '"') q++; if (*q) q++; continue; }
+            int s = prim_size(*q);
+            if (!s || nf >= 16) { ok = false; break; }
+            cur = (cur + s - 1) / s * s;
+            kinds[nf] = *q; offs[nf] = cur; nf++; cur += s; q++;
+        }
+        if (ok && *q == '}' && nf > 0 && cur <= 64) {
+            uint8_t buf[64];
+            if (!rd(obj + (u64)iv.off, buf, (size_t)cur)) return false;
+            std::string s = "(";
+            for (int k = 0; k < nf; k++) {
+                fmt_prim(buf + offs[k], kinds[k], b, sizeof(b));
+                if (k) s += ",";
+                s += b;
+            }
+            s += ")";
+            out = s;
+            return true;
+        }
+    }
+    if (numericOnly) return false;
+    uint8_t raw[16];
+    if (!rd(obj + (u64)iv.off, raw, 16)) return false;
+    std::string s = "raw=";
+    for (int k = 0; k < 16; k++) { snprintf(b, sizeof(b), "%02x", raw[k]); s += b; }
+    out = s;
+    return true;
+}
+
+static void log_chunked(const std::string& head, const std::vector<std::string>& items) {
+    std::string line = head;
+    for (const std::string& it : items) {
+        if (line.size() + it.size() > 700 && line.size() > head.size()) {
+            LOG("%s", line.c_str());
+            line = head + " (cont)";
+        }
+        line += " ";
+        line += it;
+    }
+    if (line.size() > head.size()) LOG("%s", line.c_str());
+}
+
+static bool is_sel(const char* s) {
+    size_t n = strlen(s);
+    if (n < 1 || n > 119) return false;
+    for (size_t i = 0; i < n; i++) if ((unsigned char)s[i] < 0x21 || (unsigned char)s[i] > 0x7e) return false;
+    return true;
+}
+
+// BEST EFFORT, layout of a method entry is not confirmed: word0 is tried as a name string, then as a pointer to one; word2 is printed as RVA (probably the IMP).
+static void dump_methods(u64 c, const std::string& cn) {
+    u64 ml;
+    if (!rd(c + 56, &ml, 8)) return;
+    int n = 0;
+    for (int li = 0; ml && li < 6; li++) {
+        u64 next; u32 cnt;
+        if (!rd(ml, &next, 8) || !rd(ml + 8, &cnt, 4) || cnt > 2000) break;
+        for (u32 i = 0; i < cnt && n < kDumpMaxMethods; i++) {
+            u64 e[3];
+            if (!rd(ml + 16 + 24ull * i, e, 24)) break;
+            char nm[120]; nm[0] = 0;
+            bool ok = rd_str(e[0], nm, sizeof(nm)) && is_sel(nm);
+            if (!ok) {
+                u64 p2;
+                ok = rd(e[0], &p2, 8) && rd_str(p2, nm, sizeof(nm)) && is_sel(nm);
+            }
+            LOG("DUMP m %s.%s w2_rva=0x%lx", cn.c_str(), ok ? nm : "?", (unsigned long)(e[2] - g_bias));
+            n++;
+        }
+        ml = next;
+    }
+}
+
+// heap scan for instances of several classes (wantX = class addresses XOR kObf). Hits inside our scan buffer and inside this thread's stack are dropped.
+static void scan_heap_x(const std::vector<u64>& wantX, std::vector<std::vector<u64>>& out) {
+    out.assign(wantX.size(), std::vector<u64>());
+    u64 stLo = 0, stHi = 0;
+    pthread_attr_t at;
+    if (pthread_getattr_np(pthread_self(), &at) == 0) {
+        void* sa = nullptr; size_t ss = 0;
+        if (pthread_attr_getstack(&at, &sa, &ss) == 0) { stLo = (u64)(uintptr_t)sa; stHi = stLo + ss; }
+        pthread_attr_destroy(&at);
+    }
+    std::vector<Reg> regs = heap_regions();
+    u64 bufLo = (u64)(uintptr_t)g_scanbuf, bufHi = bufLo + sizeof(g_scanbuf);
+    long chunks = 0;
+    for (const Reg& r : regs) {
+        for (u64 a = r.s; a < r.e; a += CH) {
+            size_t n = (size_t)std::min<u64>(CH, r.e - a);
+            if (!rd(a, g_scanbuf, n)) continue;
+            for (size_t i = 0; i + 8 <= n; i += 8) {
+                u64 w; memcpy(&w, g_scanbuf + i, 8);
+                u64 x = w ^ kObf;
+                for (size_t k = 0; k < wantX.size(); k++) {
+                    if (w != (wantX[k] ^ kObf)) continue;
+                    u64 addr = a + i;
+                    if (addr >= bufLo && addr < bufHi) continue;
+                    if (stHi && addr >= stLo && addr < stHi) continue;
+                    if ((int)out[k].size() < kDumpMaxObjsPerClass) out[k].push_back(addr);
+                }
+            }
+            if ((++chunks & 511) == 0) usleep(1500);
+        }
+    }
+}
+
+static void run_dump() {
+    long t0 = now_ms();
+    std::map<std::string, u64> byNameX;            // class name -> class address XOR kObf
+    std::set<std::string> extra;
+    {
+        std::vector<u64> all = enum_classes();
+        LOG("DUMP begin: %d classes found by structure scan in %ld ms (lib bias 0x%lx)", (int)all.size(), now_ms() - t0, (unsigned long)g_bias);
+        if (all.empty()) { LOG("DUMP end: no class structs found (layout assumption failed)"); return; }
+        int hits = 0;
+        for (u64 c : all) {
+            std::string cn = class_name_s(c);
+            if (cn == "?") continue;
+            byNameX[cn] = c ^ kObf;
+            std::vector<IvInfo> iv = class_ivars_own(c, cn);
+            for (const IvInfo& x : iv) {
+                std::string l = lower_s(x.name);
+                bool hit = false;
+                for (const char* tk : kInterest) if (l.find(tk) != std::string::npos) { hit = true; break; }
+                for (const char* ex : kExact) if (l == ex) { if (extra.size() < 12) extra.insert(cn); hit = true; }
+                if (!hit) continue;
+                if (hits < kDumpMaxHits) LOG("DUMP hit %s.%s type=%s off=%d", cn.c_str(), x.name.c_str(), x.type.c_str(), x.off);
+                hits++;
+            }
+        }
+        LOG("DUMP hits total %d (printed up to %d); classes owning friction/mass/restitution/speedFactor ivars: %d", hits, kDumpMaxHits, (int)extra.size());
+        for (const std::string& e : extra) LOG("DUMP owner %s", e.c_str());
+    }
+    // list of classes to dump completely
+    std::vector<std::string> names;
+    for (const char* n : kDumpClasses) names.push_back(n);
+    for (const std::string& e : extra) if (std::find(names.begin(), names.end(), e) == names.end()) names.push_back(e);
+    g_dc.clear();
+    for (const std::string& nm : names) {
+        auto it = byNameX.find(nm);
+        if (it == byNameX.end()) { LOG("DUMP class %s NOT FOUND (not an ObjC class of this library, or a C++ class)", nm.c_str()); continue; }
+        u64 c = it->second ^ kObf;
+        u64 isz = 0, sup = 0;
+        rd(c + 40, &isz, 8);
+        sup = super_of(c);
+        LOG("DUMP class %s size=%lu super=%s", nm.c_str(), (unsigned long)isz, sup ? class_name_s(sup).c_str() : "none");
+        DumpCls d; d.name = nm; d.clsX = c ^ kObf; d.ivs = all_ivars(c);
+        for (const IvInfo& iv : d.ivs) LOG("DUMP iv %s.%s type=%s off=%d", iv.cls.c_str(), iv.name.c_str(), iv.type.c_str(), iv.off);
+        dump_methods(c, nm);
+        g_dc.push_back(d);
+    }
+    byNameX.clear();
+    // live instances
+    std::vector<u64> wantX;
+    for (const DumpCls& d : g_dc) wantX.push_back(d.clsX);
+    std::vector<std::vector<u64>> hitsPer;
+    long s0 = now_ms();
+    scan_heap_x(wantX, hitsPer);
+    LOG("DUMP heap scan %ld ms", now_ms() - s0);
+    int total = 0;
+    for (size_t k = 0; k < g_dc.size(); k++) {
+        DumpCls& d = g_dc[k];
+        int n = 0;
+        for (u64 o : hitsPer[k]) {
+            if (total >= kDumpMaxObjsTotal) break;
+            DumpObj ob; ob.o = o;
+            std::vector<std::string> items;
+            for (const IvInfo& iv : d.ivs) {
+                std::string full, num;
+                if (fmt_value(o, iv, false, full)) items.push_back(iv.name + "=" + full);
+                if (!fmt_value(o, iv, true, num)) num.clear();
+                ob.idle.push_back(num);
+            }
+            char head[96];
+            snprintf(head, sizeof(head), "DUMP obj %s@%lx", d.name.c_str(), (unsigned long)o);
+            log_chunked(head, items);
+            d.objs.push_back(ob);
+            n++; total++;
+        }
+        LOG("DUMP class %s: %d live instances shown", d.name.c_str(), n);
+    }
+    g_dumpReady = true;
+    LOG("DUMP end: %ld ms, %d objects; changed numeric ivars follow after the next shots (DUMP dyn)", now_ms() - t0, total);
+}
+
+// prints only numeric ivars whose value differs from the idle snapshot
+static void dump_dyn(long dt, int shot) {
+    int lines = 0;
+    LOG("DUMP dyn shot=%d t=+%ldms", shot, dt);
+    for (DumpCls& d : g_dc) {
+        for (DumpObj& ob : d.objs) {
+            if (lines >= 120) return;
+            u64 isa;
+            if (!rd(ob.o, &isa, 8) || (isa ^ kObf) != d.clsX) continue;       // object is gone
+            std::vector<std::string> items;
+            for (size_t i = 0; i < d.ivs.size() && i < ob.idle.size(); i++) {
+                if (ob.idle[i].empty()) continue;
+                std::string now;
+                if (!fmt_value(ob.o, d.ivs[i], true, now)) continue;
+                if (now != ob.idle[i]) items.push_back(d.ivs[i].name + "=" + ob.idle[i] + "->" + now);
+            }
+            if (items.empty()) continue;
+            char head[112];
+            snprintf(head, sizeof(head), "DUMP dyn s%d +%ld %s@%lx", shot, dt, d.name.c_str(), (unsigned long)ob.o);
+            log_chunked(head, items);
+            lines++;
+        }
+    }
+}
+
+static const long kDynDelay[3] = {60, 250, 600};   // ms after the release of the shot
+
 static void* worker(void*) {
     if (pipe2(g_pipe, O_NONBLOCK | O_CLOEXEC) != 0) { LOG("pipe2 failed"); return nullptr; }
     long t0 = now_ms();
@@ -1051,6 +1448,7 @@ static void* worker(void*) {
     bool aimActive = false; Aim lastAim; lastAim.ok = false; lastAim.ang = lastAim.dist = 0; lastAim.en = lastAim.enough = 0;
     std::vector<Item> prevItems, bItems; std::vector<double> prevXY, xy, bPrev, bLogged;
     bool burst = false; long burstStart = 0, lastMove = 0; int burstLines = 0;
+    int dynShots = 0, dynStep = -1; long dynT0 = 0;
 
     while (kLifeMs == 0 || now_ms() - start < kLifeMs) {
         long t = now_ms();
@@ -1067,6 +1465,11 @@ static void* worker(void*) {
                     (unsigned long)g_cls[C_LOCAL], (unsigned long)g_cls[C_REMOTE], (unsigned long)g_cls[C_FG],
                     (unsigned long)g_cls[C_STRIKER], (unsigned long)g_cls[C_PUCK], (unsigned long)g_cls[C_POCKET],
                     L_angle.off, L_dist.off, N_pos.off, N_parent.off, N_size.off, N_scx.off, P_radius.off);
+                // v5.2: one-time dump the first time a match is on the heap (coins + aim objects)
+                if (kDumpEnabled && !g_dumpDone && count_valid(C_PUCK) > 0 && count_valid(C_LOCAL) > 0) {
+                    g_dumpDone = true;
+                    run_dump();
+                }
             }
             for (int c = 0; c < C_COUNT; c++) {
                 std::vector<u64> keep;
@@ -1085,6 +1488,7 @@ static void* worker(void*) {
                 aimActive = false; release = true;
                 LOG("AIM released: last ang=%.5f(%.2fdeg) dist=%.3f en=%d power_ok=%d",
                     lastAim.ang, lastAim.ang * 180.0 / M_PI, lastAim.dist, lastAim.en, lastAim.enough);
+                if (g_dumpReady && dynShots < 3) { dynShots++; dynStep = 0; dynT0 = now_ms(); }
                 if (g_enabled.load()) {
                     char pl[900];
                     { std::lock_guard<std::mutex> lk(g_predMx); snprintf(pl, sizeof(pl), "%s", g_predLastLog); }
@@ -1094,6 +1498,16 @@ static void* worker(void*) {
         }
 
         pred_tick(a, t);
+
+        // v5.2: changed ivars of the dumped model objects at +60 / +250 / +600 ms after each of the first 3 shots
+        if (dynStep >= 0) {
+            long dt = now_ms() - dynT0;
+            if (dt >= kDynDelay[dynStep]) {
+                dump_dyn(dt, dynShots);
+                dynStep++;
+                if (dynStep >= 3) dynStep = -1;
+            }
+        }
 
         // --- coins moving by themselves (opponent shot) also start a recording
         bool puckMoved = false;
@@ -1167,7 +1581,7 @@ static void* worker(void*) {
 }
 
 __attribute__((constructor)) static void init() {
-    LOG("carprobe v5 loaded (stage 2 prediction; test write kTestMaxGuides=%d)", kTestMaxGuides);
+    LOG("carprobe v5.2 loaded (prediction + dump mode %s; test write kTestMaxGuides=%d)", kDumpEnabled ? "ON" : "off", kTestMaxGuides);
     pthread_t th;
     pthread_create(&th, nullptr, worker, nullptr);
     pthread_detach(th);
