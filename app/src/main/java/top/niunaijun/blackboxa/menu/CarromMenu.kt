@@ -37,7 +37,9 @@ object NativeCarrom {
     external fun setEnabled(on: Int)
     // frictionPercent 50..150, maxBounces 0..5, deflection 0/1, recon 0/1 (shot-recording logs for tuning)
     external fun setOptions(frictionPercent: Int, maxBounces: Int, deflection: Int, recon: Int)
-    // [designW, designH, nPaths, {type, nPoints, x, y, ...}...] in design points, y up. type 0 striker, 1 coin, 2 striker remainder.
+    // [designW, designH, nPaths, {type, nPoints, x, y, ...}...] in design points, y up.
+    // type 0 striker (white), 1 coin hit by the striker (red), 2 striker remainder (thin white), 5 coin moved by another coin (orange),
+    // 3 ring "coin potted" (2 points: centre, point on the ring), 4 ring "striker potted = foul".
     external fun lines(): FloatArray
     external fun statusText(): String
 }
@@ -60,6 +62,9 @@ class CarromLineView(context: Context) : View(context) {
     private val white = Paint(Paint.ANTI_ALIAS_FLAG)
     private val red = Paint(Paint.ANTI_ALIAS_FLAG)
     private val thin = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val orange = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val ringOk = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val ringFoul = Paint(Paint.ANTI_ALIAS_FLAG)
     private val path = Path()
 
     init {
@@ -67,7 +72,7 @@ class CarromLineView(context: Context) : View(context) {
         isFocusable = false
         isFocusableInTouchMode = false
         setWillNotDraw(false)
-        for (p in listOf(shadow, white, red, thin)) {
+        for (p in listOf(shadow, white, red, thin, orange, ringOk, ringFoul)) {
             p.style = Paint.Style.STROKE
             p.strokeJoin = Paint.Join.ROUND
             p.strokeCap = Paint.Cap.ROUND
@@ -80,6 +85,12 @@ class CarromLineView(context: Context) : View(context) {
         red.strokeWidth = 4f * density
         thin.color = Color.argb(215, 255, 255, 255)
         thin.strokeWidth = 2.5f * density
+        orange.color = Color.rgb(255, 150, 30)
+        orange.strokeWidth = 3.5f * density
+        ringOk.color = Color.rgb(60, 220, 110)
+        ringOk.strokeWidth = 3.5f * density
+        ringFoul.color = Color.rgb(255, 60, 60)
+        ringFoul.strokeWidth = 4.5f * density
     }
 
     override fun onTouchEvent(event: MotionEvent?): Boolean = false
@@ -119,6 +130,10 @@ class CarromLineView(context: Context) : View(context) {
             i += 2
             if (n < 2 || i + 2 * n > d.size) break
             path.reset()
+            var rx0 = 0f
+            var ry0 = 0f
+            var rx1 = 0f
+            var ry1 = 0f
             for (j in 0 until n) {
                 val x = d[i + 2 * j]
                 val y = d[i + 2 * j + 1]
@@ -126,11 +141,17 @@ class CarromLineView(context: Context) : View(context) {
                 var py = top + (designH - y) / designH * h
                 px = cx + (px - cx) * cs + calX
                 py = cy + (py - cy) * cs + calY
-                if (j == 0) path.moveTo(px, py) else path.lineTo(px, py)
+                if (j == 0) { path.moveTo(px, py); rx0 = px; ry0 = py } else path.lineTo(px, py)
+                if (j == 1) { rx1 = px; ry1 = py }
             }
             i += 2 * n
-            canvas.drawPath(path, shadow)
-            canvas.drawPath(path, when (type) { 1 -> red; 2 -> thin; else -> white })
+            if (type == 3 || type == 4) {
+                val rad = Math.hypot((rx1 - rx0).toDouble(), (ry1 - ry0).toDouble()).toFloat()
+                canvas.drawCircle(rx0, ry0, rad, if (type == 4) ringFoul else ringOk)
+            } else {
+                canvas.drawPath(path, shadow)
+                canvas.drawPath(path, when (type) { 1 -> red; 2 -> thin; 5 -> orange; else -> white })
+            }
         }
     }
 }
