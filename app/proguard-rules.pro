@@ -42,3 +42,6 @@
     @top.niunaijun.blackreflection.annotation.BConstructor.* <methods>;
     @top.niunaijun.blackreflection.annotation.BConstructorNotProcess.* <methods>;
 }
+# Carrom prediction overlay: JNI object looked up by name from libcarprobe.so
+-keep class top.niunaijun.blackboxa.menu.NativeCarrom { *; }
+-keep class top.niunaijun.blackboxa.menu.NativeMenu { *; }
