@@ -194,6 +194,13 @@ class BlackBoxLoader {
                                                 Log.e(TAG, "GameMenu init failed: ${t}")
                                             }
                                         }
+                                        if (packageName == "com.miniclip.carrom") {
+                                            try {
+                                                top.niunaijun.blackboxa.menu.CarromMenu.init(application)
+                                            } catch (t: Throwable) {
+                                                Log.e(TAG, "CarromMenu init failed: ${t}")
+                                            }
+                                        }
                                     } catch (e: Exception) {
                                         Log.e(
                                                 TAG,
