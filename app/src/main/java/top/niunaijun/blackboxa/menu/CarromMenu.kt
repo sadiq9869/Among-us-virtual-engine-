@@ -2,6 +2,8 @@ package top.niunaijun.blackboxa.menu
 
 import android.app.Activity
 import android.app.Application
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
@@ -24,6 +26,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
+import android.widget.Toast
 
 /**
  * JNI bridge to libcarprobe.so (Bcore/src/main/cpp/carprobe/carprobe.cpp, v5).
@@ -217,6 +220,40 @@ object CarromMenu {
         }
         walk(v)
         return best
+    }
+
+    // Copies the probe's shot lines (BURST / AIM released / PRED) from this process's own logcat to the clipboard,
+    // so they can be pasted into the chat without adb. Keeps the last 500 lines, at most 200000 characters.
+    private fun copyShotLog(activity: Activity) {
+        Thread {
+            val msg: String = try {
+                val p = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "raw", "-s", "CARPROBE1:V"))
+                val raw = p.inputStream.bufferedReader().readLines()
+                p.destroy()
+                val keep = raw.filter {
+                    it.startsWith("BURST") || it.startsWith("B ") || it.startsWith("AIM released") || it.startsWith("PRED")
+                }
+                val tail = if (keep.size > 500) keep.takeLast(500) else keep
+                val joined = tail.joinToString("\n")
+                val text = if (joined.length > 200000) joined.takeLast(200000) else joined
+                if (tail.isEmpty()) {
+                    "No shot lines in logcat yet (take a shot first)"
+                } else {
+                    ui.post {
+                        try {
+                            val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            cm.setPrimaryClip(ClipData.newPlainText("carrom shot log", text))
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "clipboard failed: $t")
+                        }
+                    }
+                    "Copied ${tail.size} lines - paste them in the chat"
+                }
+            } catch (t: Throwable) {
+                "Copy failed: $t"
+            }
+            ui.post { Toast.makeText(activity, msg, Toast.LENGTH_LONG).show() }
+        }.start()
     }
 
     fun init(application: Application?) {
@@ -417,6 +454,14 @@ object CarromMenu {
         calRow("X offset", { calX }, 2, { calX = (calX + it).coerceIn(-600, 600) }, " px")
         calRow("Y offset", { calY }, 2, { calY = (calY + it).coerceIn(-600, 600) }, " px")
         calRow("Scale", { calScale }, 1, { calScale = (calScale + it).coerceIn(50, 150) }, " %")
+
+        val copyBtn = Button(activity)
+        copyBtn.text = "Copy shot log (paste in chat)"
+        styleButton(activity, copyBtn)
+        copyBtn.setOnClickListener { copyShotLog(activity) }
+        val copyLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        copyLp.topMargin = dp(activity, 8)
+        panel.addView(copyBtn, copyLp)
 
         val closeBtn = Button(activity)
         closeBtn.text = "Close"
