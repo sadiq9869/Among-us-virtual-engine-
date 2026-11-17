@@ -617,25 +617,31 @@ static std::atomic<int> g_deflect{1};       // draw the short striker remainder 
 static std::atomic<int> g_recon{1};         // 1 = keep the old shot-recording logs (BURST lines) for tuning
 
 // ---- PHYSICS NUMBERS. Source: game 19.6.1 (versionCode 1492), [MEASURED] from the user's CARPROBE1 logs, Freestyle Offline only.
-// All UNCALIBRATED. Units = the game's table points, time = 1 frame (60 Hz).
-static const double kMinDrag       = 30.3;     // no shot at or below this drag length            (report 6.3)
-static const double kV0Slope       = 0.198;    // launch speed per frame = slope * dist + offset   (report 6.3)
-static const double kV0Offset      = -5.99;
-static const double kV0Cap         = 17.4;     // launch speed cap per frame                       (report 6.3)
-static const double kFricHigh      = 0.17;     // speed lost per frame when speed > kFricSwitch    (report 6.4)
-static const double kFricSwitch    = 4.75;     // regime switch ("~4.5 .. ~5")                     (report 6.4)
-static const double kFricLowBase   = 0.064;    // low-speed loss = base + slope * speed            (report 6.4)
-static const double kFricLowSlope  = 0.0065;
-static const double kStrikerRadius = 17.4;     // +-1                                              (report 6.2)
-static const double kBoardHalf     = 254.1;    // centre limit = kBoardHalf - radius: striker 236.7, coin 241.0 (report 6.2)
-static const double kStrikerWallE  = 0.98;     // speed kept after a wall bounce (striker)         (report 6.5)
-static const double kCoinWallE     = 0.73;     // normal speed kept after a wall bounce (coin)     (report 6.5; tangential part kept = ASSUMPTION)
-static const double kRestitution   = 1.0;      // striker - coin                                   (report 6.6)
-static const double kMassRatio     = 1.7;      // striker mass / coin mass                         (report 6.6)
+// Round 2 (v5.1): re-fitted on three recorded shots (BURST 10, 11, 12). Units = the game's table points, time = 1 physics step (60 Hz).
+static const double kMinDrag       = 30.3;     // no shot at or below this drag length            (round 1)
+static const double kV0Slope       = 0.198;    // first-step speed = slope * dist + offset         (round 2: 3 shots, residual < 0.05; round 1 offset was -5.99, ~0.65 too low)
+static const double kV0Offset      = -5.34;
+static const double kV0Cap         = 18.08;    // first-step speed cap, reached at dist ~118       (round 2: BURST 11)
+static const double kFricHigh      = 0.17;     // speed lost per step while speed > kFricSwitch    (round 2: striker + coin, many samples)
+static const double kFricSwitch    = 4.0;      // regime switch, +-0.15                            (round 2: BURST 10 striker slide)
+static const double kFricLow       = 0.0715;   // speed lost per step at low speed, constant       (round 2: BURST 10 striker slide 4.0 -> 0)
+static const double kStrikerRadius = 17.4;     // +-1                                              (round 1)
+static const double kBoardHalf     = 254.1;    // centre limit = kBoardHalf - radius: striker 236.7, coin 241.0 (round 1; coin bounce re-confirmed round 2)
+static const double kStrikerWallE  = 0.98;     // speed kept after a wall bounce (striker)         (round 1; re-confirmed round 2)
+static const double kCoinWallE     = 0.73;     // normal speed kept after a wall bounce, tangential part kept (round 2 BURST 10: 237.29 predicted 237.26)
+static const double kRestStrikerCoin = 1.0;    // striker - coin restitution                       (round 1)
+static const double kRestCoinCoin    = 1.0;    // coin - coin restitution, equal masses            (round 2: BURST 10, normal part 12.8 -> 12.65 measured)
+static const double kStrikerMass   = 1.7;      // striker mass / coin mass                         (round 1; re-checked round 2: coin 1.259 x, striker 0.259 x)
+static const double kCoinMass      = 1.0;
+// Pockets (round 2, ONLY 3 events: 2 coins, 1 striker). A body is captured when the position at the START of a step is closer to the
+// pocket centre than this. Real interval: coin 11.0 .. 17.4, striker 3.7 .. 5.8 (the mid points are used). UNCERTAIN, tune with more events.
+static const double kPocketEnterCoin    = 14.0;
+static const double kPocketEnterStriker = 4.7;
+static const double kPocketRing         = 22.0;   // drawn ring radius around a pocket that catches something (display only)
 static const double kAimTol        = 3.0;      // LOCAL._center must be this close to a table striker
 static const int    kMaxFrames     = 700;
 static const double kStopSpeed     = 0.05;
-static const double kDeflectMaxLen = 120.0;    // the short striker remainder is cut at this length
+static const double kDeflectMaxLen = 120.0;    // the short striker remainder after the hit is cut at this length
 static const double kBoardBound    = 260.0;    // coins outside +-this are ignored (garbage / flying in)
 
 struct V2 { double x, y; };
@@ -718,7 +724,7 @@ static Chain walk_chain(u64 obj) {
 // ---- the world the prediction works on (cached, refreshed every ~400 ms while aiming)
 struct Coin { u64 o; double x, y, r; };
 struct World {
-    bool ok; u64 localObj; u64 striker; u64 table; Xf toRoot; double rootW, rootH; std::vector<Coin> coins; long at; std::string why;
+    bool ok; u64 localObj; u64 striker; u64 table; Xf toRoot; double rootW, rootH; std::vector<Coin> coins; std::vector<V2> pockets; long at; std::string why;
 };
 static World g_world;
 
@@ -756,94 +762,197 @@ static void refresh_world(u64 localObj, double cx, double cy, long t) {
         Coin c; c.o = o; c.x = x; c.y = y; c.r = r;
         w.coins.push_back(c);
     }
+    // 3. pockets: PocketNodes in the same table and coordinate space (duplicates within 1 unit are dropped)
+    for (u64 o : g_objs[C_POCKET]) {
+        int vis, run; double x, y;
+        if (!getb(o, N_vis.off, vis) || !getb(o, N_run.off, run) || vis != 1 || run != 1) continue;
+        if (!read_pos(o, x, y) || fabs(x) > kBoardBound || fabs(y) > kBoardBound) continue;
+        Chain ch = walk_chain(o);
+        if (!ch.ok || ch.table != w.table || !xf_close(ch.toRoot, w.toRoot)) continue;
+        bool dup = false;
+        for (const V2& p : w.pockets) if (hypot(p.x - x, p.y - y) < 1.0) dup = true;
+        if (!dup) w.pockets.push_back(V2{x, y});
+    }
     w.ok = true;
-    char b[64]; snprintf(b, sizeof(b), "ok (rejected pucks: %d)", rejChain); w.why = b;
+    char b[96]; snprintf(b, sizeof(b), "ok (rejected pucks: %d, pockets: %d)", rejChain, (int)w.pockets.size()); w.why = b;
     g_world = w;
 }
 
-// ---- simulation
-struct Body { double x, y, vx, vy, r; bool striker; };
+// ---- simulation: every body on the table (striker + all coins) frame by frame, exact time of impact inside a frame
+struct SBody {
+    double x, y, vx, vy, r, m;
+    bool striker, alive, draw, moved, hitByStriker;
+    int pocket, bounces, coinIdx;      // coinIdx = index in World::coins, -1 for the striker
+    size_t hitIdx;                     // striker: index in pts of its first collision point (0 = none)
+    double afterHitLen;
+    std::vector<V2> pts;               // polyline: start, wall contacts, collisions, end
+};
 
-static double friction_loss(double v, double scale) {
-    return ((v > kFricSwitch) ? kFricHigh : (kFricLowBase + kFricLowSlope * v)) * scale;
+static SBody mk_body(double x, double y, double r, double m, bool striker, int coinIdx) {
+    SBody b;
+    b.x = x; b.y = y; b.vx = 0; b.vy = 0; b.r = r; b.m = m;
+    b.striker = striker; b.alive = true; b.draw = true; b.moved = false; b.hitByStriker = false;
+    b.pocket = -1; b.bounces = 0; b.coinIdx = coinIdx; b.hitIdx = 0; b.afterHitLen = 0;
+    b.pts.push_back(V2{x, y});
+    return b;
 }
 
-// Moves one body frame by frame. Stops at: speed 0, wall bounce number maxBounces+1, length limit, or (if targets) the first contact with a coin.
-// Returns the index of the coin hit or -1. pts = polyline (start, every wall contact, end). b ends at the stop / contact position.
-static int sim_path(Body& b, const std::vector<Coin>* targets, int maxBounces, double fricScale, double maxLen,
-                    std::vector<V2>& pts, int& bounces) {
-    pts.clear(); pts.push_back(V2{b.x, b.y});
-    bounces = 0;
-    const double lim = kBoardHalf - b.r;
-    const double e = b.striker ? kStrikerWallE : kCoinWallE;
-    double len = 0;
+static double speed_of(const SBody& b) { return hypot(b.vx, b.vy); }
+static double friction_loss(double v, double scale) { return ((v > kFricSwitch) ? kFricHigh : kFricLow) * scale; }
+static void sb_point(SBody& b) { if (b.draw && b.pts.size() < 400) b.pts.push_back(V2{b.x, b.y}); }
+
+// B[0] is the striker with its launch velocity set, B[1..] are the coins at rest. Returns the coinIdx the striker touched first (-1 = none).
+static int simulate(std::vector<SBody>& B, const std::vector<V2>& pockets, int maxBounces, double fs, bool deflect) {
+    int firstHit = -1;
     for (int f = 0; f < kMaxFrames; f++) {
-        if (hypot(b.vx, b.vy) < kStopSpeed) break;
+        // pocket capture is decided from the position at the START of the step (measured: the drag begins on the step that starts inside)
+        for (SBody& a : B) {
+            if (!a.alive) continue;
+            double R = a.striker ? kPocketEnterStriker : kPocketEnterCoin;
+            for (size_t p = 0; p < pockets.size(); p++) {
+                if (hypot(a.x - pockets[p].x, a.y - pockets[p].y) < R) {
+                    a.alive = false; a.pocket = (int)p; a.vx = a.vy = 0; sb_point(a);
+                    break;
+                }
+            }
+        }
+        bool any = false;
+        for (const SBody& a : B) if (a.alive && speed_of(a) > 1e-9) { any = true; break; }
+        if (!any) break;
+
         double rem = 1.0;
-        for (int ev = 0; ev < 8 && rem > 1e-9; ev++) {
-            double dx = b.vx * rem, dy = b.vy * rem;
-            double tBest = 1.0; int kind = 0, ci = -1;
-            if (dx > 1e-12 && b.x + dx > lim)        { double t = (lim - b.x) / dx;  if (t < tBest) { tBest = t; kind = 1; } }
-            else if (dx < -1e-12 && b.x + dx < -lim) { double t = (-lim - b.x) / dx; if (t < tBest) { tBest = t; kind = 1; } }
-            if (dy > 1e-12 && b.y + dy > lim)        { double t = (lim - b.y) / dy;  if (t < tBest) { tBest = t; kind = 2; } }
-            else if (dy < -1e-12 && b.y + dy < -lim) { double t = (-lim - b.y) / dy; if (t < tBest) { tBest = t; kind = 2; } }
-            if (targets) {
-                double aa = dx * dx + dy * dy;
-                for (size_t i = 0; i < targets->size() && aa > 1e-18; i++) {
-                    const Coin& c = (*targets)[i];
-                    double px = b.x - c.x, py = b.y - c.y, R = b.r + c.r;
-                    double bb = px * dx + py * dy, cc = px * px + py * py - R * R;
+        for (int ev = 0; ev < 64 && rem > 1e-9; ev++) {
+            double tBest = 1.0; int kind = 0, ei = -1, ej = -1;
+            for (size_t i = 0; i < B.size(); i++) {
+                const SBody& a = B[i];
+                if (!a.alive) continue;
+                double dx = a.vx * rem, dy = a.vy * rem;
+                if (fabs(dx) < 1e-12 && fabs(dy) < 1e-12) continue;
+                double lim = kBoardHalf - a.r;
+                if (dx > 1e-12 && a.x + dx > lim)        { double t = std::max(0.0, (lim - a.x) / dx);  if (t < tBest) { tBest = t; kind = 1; ei = (int)i; } }
+                else if (dx < -1e-12 && a.x + dx < -lim) { double t = std::max(0.0, (-lim - a.x) / dx); if (t < tBest) { tBest = t; kind = 1; ei = (int)i; } }
+                if (dy > 1e-12 && a.y + dy > lim)        { double t = std::max(0.0, (lim - a.y) / dy);  if (t < tBest) { tBest = t; kind = 2; ei = (int)i; } }
+                else if (dy < -1e-12 && a.y + dy < -lim) { double t = std::max(0.0, (-lim - a.y) / dy); if (t < tBest) { tBest = t; kind = 2; ei = (int)i; } }
+                for (size_t j = 0; j < B.size(); j++) {
+                    if (j == i) continue;
+                    const SBody& c = B[j];
+                    if (!c.alive) continue;
+                    bool cMoving = (fabs(c.vx) + fabs(c.vy)) > 1e-12;
+                    if (cMoving && j < i) continue;                 // that pair is handled from c's side
+                    double ex = dx - c.vx * rem, ey = dy - c.vy * rem;
+                    double px = a.x - c.x, py = a.y - c.y, R = a.r + c.r;
+                    double aa = ex * ex + ey * ey, bb = px * ex + py * ey, cc = px * px + py * py - R * R;
+                    if (aa < 1e-18) continue;
                     double t;
-                    if (cc <= 0) { if (bb >= 0) continue; t = 0; }               // already touching: counts only if moving closer
+                    if (cc <= 0) { if (bb >= 0) continue; t = 0; }  // already touching: counts only if moving closer
                     else {
+                        if (bb >= 0) continue;
                         double disc = bb * bb - aa * cc;
                         if (disc < 0) continue;
                         t = (-bb - sqrt(disc)) / aa;
                         if (t < 0) continue;
                     }
-                    if (t <= tBest) { tBest = t; kind = 3; ci = (int)i; }
+                    if (t < tBest) { tBest = t; kind = 3; ei = (int)i; ej = (int)j; }
                 }
             }
-            b.x += dx * tBest; b.y += dy * tBest; len += hypot(dx, dy) * tBest;
-            rem *= (1.0 - tBest);
-            if (kind == 3) { pts.push_back(V2{b.x, b.y}); return ci; }
-            if (kind == 1 || kind == 2) {
-                if (kind == 1) { b.x = (b.vx > 0) ? lim : -lim; } else { b.y = (b.vy > 0) ? lim : -lim; }
-                pts.push_back(V2{b.x, b.y});
-                if (kind == 1) b.vx = -b.vx; else b.vy = -b.vy;
-                if (b.striker) { b.vx *= e; b.vy *= e; }
-                else if (kind == 1) b.vx *= e; else b.vy *= e;
-                bounces++;
-                if (bounces > maxBounces) return -1;
+            for (SBody& a : B) {
+                if (!a.alive) continue;
+                double mx = a.vx * rem * tBest, my = a.vy * rem * tBest;
+                a.x += mx; a.y += my;
+                if (mx != 0.0 || my != 0.0) a.moved = true;
+                if (a.striker && a.hitIdx) a.afterHitLen += hypot(mx, my);
             }
+            rem *= (1.0 - tBest);
+            if (B[0].alive && B[0].hitIdx && B[0].draw && B[0].afterHitLen > kDeflectMaxLen) { sb_point(B[0]); B[0].draw = false; }
             if (kind == 0) break;
+
+            if (kind == 1 || kind == 2) {
+                SBody& a = B[ei];
+                double lim = kBoardHalf - a.r;
+                if (kind == 1) { a.x = (a.vx > 0) ? lim : -lim; a.vx = -a.vx; }
+                else           { a.y = (a.vy > 0) ? lim : -lim; a.vy = -a.vy; }
+                if (a.striker) { a.vx *= kStrikerWallE; a.vy *= kStrikerWallE; }
+                else if (kind == 1) a.vx *= kCoinWallE;
+                else a.vy *= kCoinWallE;
+                a.bounces++;
+                sb_point(a);
+                if (a.bounces > maxBounces) a.draw = false;
+            } else {
+                SBody& a = B[ei];
+                SBody& c = B[ej];
+                double nx = c.x - a.x, ny = c.y - a.y, nl = hypot(nx, ny);
+                if (nl < 1e-9) break;
+                nx /= nl; ny /= nl;
+                double vn = (a.vx - c.vx) * nx + (a.vy - c.vy) * ny;
+                if (vn > 0) {
+                    double e = (a.striker || c.striker) ? kRestStrikerCoin : kRestCoinCoin;
+                    double j = (1.0 + e) * vn / (1.0 / a.m + 1.0 / c.m);
+                    a.vx -= j / a.m * nx; a.vy -= j / a.m * ny;
+                    c.vx += j / c.m * nx; c.vy += j / c.m * ny;
+                    sb_point(a); sb_point(c);
+                    SBody* st = a.striker ? &a : (c.striker ? &c : nullptr);
+                    if (st && !st->hitIdx && st->draw) {
+                        st->hitIdx = st->pts.size() - 1;
+                        if (!deflect) st->draw = false;
+                    }
+                    if (st) {
+                        SBody& co = a.striker ? c : a;
+                        if (firstHit < 0) firstHit = co.coinIdx;
+                        co.hitByStriker = true;
+                    }
+                }
+            }
         }
-        if (len > maxLen) break;
-        double sp = hypot(b.vx, b.vy);
-        double ns = sp - friction_loss(sp, fricScale);
-        if (ns <= 0) break;
-        b.vx *= ns / sp; b.vy *= ns / sp;
+        // friction at the end of the step
+        for (SBody& a : B) {
+            if (!a.alive) continue;
+            double sp = speed_of(a);
+            if (sp < 1e-9) continue;
+            double ns = sp - friction_loss(sp, fs);
+            if (ns < kStopSpeed) { a.vx = a.vy = 0; }
+            else { a.vx *= ns / sp; a.vy *= ns / sp; }
+        }
     }
-    pts.push_back(V2{b.x, b.y});
-    return -1;
+    for (SBody& a : B) if (a.alive && a.moved) sb_point(a);
+    return firstHit;
 }
 
 // ---- prediction output (read by JNI): [designW, designH, nPaths, {type, nPoints, x0,y0,x1,y1...}...]  design points, y up
-// type 0 = striker path (white), 1 = hit coin path (red), 2 = striker remainder after the hit (thin white)
+// type 0 = striker path (white), 1 = coin hit by the striker (red), 2 = striker remainder after the hit (thin white),
+// 3 = ring marker "coin potted" (2 points: pocket centre, point on the ring), 4 = ring marker "striker potted = FOUL", 5 = coin moved by another coin (orange)
 static std::mutex g_predMx;
 static std::vector<float> g_predData;
 static char g_predStatus[400] = "Prediction: waiting for the game";
-static char g_predLastLog[300] = "";
+static char g_predLastLog[900] = "";
 
+// every status that is not the running "Prediction ON ..." line is also written to logcat once per change (tag CARPROBE1, "PRED status"),
+// so a missing line can be diagnosed from adb without opening the panel
 static void pred_set(const std::vector<float>& d, const char* st) {
-    std::lock_guard<std::mutex> lk(g_predMx);
-    g_predData = d;
-    snprintf(g_predStatus, sizeof(g_predStatus), "%s", st);
+    static char lastLogged[400] = "";
+    bool doLog = false;
+    {
+        std::lock_guard<std::mutex> lk(g_predMx);
+        g_predData = d;
+        snprintf(g_predStatus, sizeof(g_predStatus), "%s", st);
+        if (strncmp(st, "Prediction ON", 13) != 0) {
+            if (strcmp(st, lastLogged) != 0) { snprintf(lastLogged, sizeof(lastLogged), "%s", st); doLog = true; }
+        } else if (lastLogged[0]) {
+            lastLogged[0] = 0;
+            doLog = true;
+        }
+    }
+    if (doLog) LOG("PRED status: %s", st);
 }
 
 static void put_path(std::vector<float>& out, int type, const std::vector<V2>& pts, const Xf& m) {
     out.push_back((float)type); out.push_back((float)pts.size());
     for (const V2& p : pts) { V2 q = xf_apply(m, p.x, p.y); out.push_back((float)q.x); out.push_back((float)q.y); }
+}
+
+static void put_ring(std::vector<float>& out, int type, const V2& c, double rad, const Xf& m) {
+    out.push_back((float)type); out.push_back(2.f);
+    V2 p = xf_apply(m, c.x, c.y), q = xf_apply(m, c.x + rad, c.y);
+    out.push_back((float)p.x); out.push_back((float)p.y); out.push_back((float)q.x); out.push_back((float)q.y);
 }
 
 static double launch_speed(double dist) {
@@ -879,47 +988,48 @@ static void pred_tick(const Aim& a, long t) {
     double v0 = launch_speed(a.dist);
     double fs = g_fricPct.load() / 100.0;
     int mb = g_maxBounces.load();
-    Body s; s.x = sx; s.y = sy; s.vx = cos(a.ang) * v0; s.vy = sin(a.ang) * v0; s.r = kStrikerRadius; s.striker = true;
-    std::vector<V2> sp, cp, dp; int sb = 0, cb = 0, db = 0;
-    int hit = sim_path(s, &w.coins, mb, fs, 1e9, sp, sb);
+    std::vector<SBody> B;
+    B.reserve(w.coins.size() + 1);
+    B.push_back(mk_body(sx, sy, kStrikerRadius, kStrikerMass, true, -1));
+    B[0].vx = cos(a.ang) * v0; B[0].vy = sin(a.ang) * v0;
+    for (size_t i = 0; i < w.coins.size(); i++) B.push_back(mk_body(w.coins[i].x, w.coins[i].y, w.coins[i].r, kCoinMass, false, (int)i));
+    int first = simulate(B, w.pockets, mb, fs, g_deflect.load() != 0);
+
     std::vector<float> out;
     out.push_back((float)w.rootW); out.push_back((float)w.rootH);
-    int nPaths = 1;
     size_t idxN = out.size(); out.push_back(0.f);
-    put_path(out, 0, sp, w.toRoot);
-    char hitTxt[120] = "no coin hit";
-    if (hit >= 0) {
-        const Coin& c = w.coins[hit];
-        double nx = c.x - s.x, ny = c.y - s.y, nl = hypot(nx, ny);
-        if (nl > 1e-9) {
-            nx /= nl; ny /= nl;
-            double vn = s.vx * nx + s.vy * ny;
-            double tx = s.vx - vn * nx, ty = s.vy - vn * ny;
-            double ms = kMassRatio, mc = 1.0, e = kRestitution;
-            double svn = (ms - e * mc) / (ms + mc) * vn;
-            double cvn = (1.0 + e) * ms / (ms + mc) * vn;
-            if (vn > 0) {
-                Body cb2; cb2.x = c.x; cb2.y = c.y; cb2.vx = cvn * nx; cb2.vy = cvn * ny; cb2.r = c.r; cb2.striker = false;
-                sim_path(cb2, nullptr, mb, fs, 1e9, cp, cb);
-                put_path(out, 1, cp, w.toRoot); nPaths++;
-                if (g_deflect.load()) {
-                    Body s2; s2.x = s.x; s2.y = s.y; s2.vx = tx + svn * nx; s2.vy = ty + svn * ny; s2.r = kStrikerRadius; s2.striker = true;
-                    sim_path(s2, nullptr, mb, fs, kDeflectMaxLen, dp, db);
-                    if (dp.size() >= 2) { put_path(out, 2, dp, w.toRoot); nPaths++; }
-                }
-                snprintf(hitTxt, sizeof(hitTxt), "hit coin %d at (%.1f,%.1f) coin v0 %.2f stops (%.1f,%.1f)", hit, c.x, c.y, cvn, cb2.x, cb2.y);
-            } else snprintf(hitTxt, sizeof(hitTxt), "grazing contact, no push");
+    int nPaths = 0;
+    const SBody& s0 = B[0];
+    size_t hi = s0.hitIdx;
+    { std::vector<V2> mainPts(s0.pts.begin(), s0.pts.begin() + (hi ? hi + 1 : s0.pts.size())); put_path(out, 0, mainPts, w.toRoot); nPaths++; }
+    if (hi && s0.pts.size() - hi >= 2) { std::vector<V2> d(s0.pts.begin() + hi, s0.pts.end()); put_path(out, 2, d, w.toRoot); nPaths++; }
+    int movedCoins = 0, potted = 0;
+    char coinLog[640]; coinLog[0] = 0;
+    for (size_t i = 1; i < B.size(); i++) {
+        const SBody& c = B[i];
+        if (c.moved && c.pts.size() >= 2) {
+            put_path(out, c.hitByStriker ? 1 : 5, c.pts, w.toRoot); nPaths++;
+            movedCoins++;
+            size_t l = strlen(coinLog);
+            if (l < 500) snprintf(coinLog + l, sizeof(coinLog) - l, " c%d(%.1f,%.1f)->(%.1f,%.1f)%s", c.coinIdx, c.pts.front().x, c.pts.front().y, c.x, c.y, c.pocket >= 0 ? "[POT]" : "");
         }
+        if (c.pocket >= 0) { put_ring(out, 3, w.pockets[c.pocket], kPocketRing, w.toRoot); nPaths++; potted++; }
     }
+    bool foul = (s0.pocket >= 0);
+    if (foul) { put_ring(out, 4, w.pockets[s0.pocket], kPocketRing, w.toRoot); nPaths++; }
     out[idxN] = (float)nPaths;
+
+    char hitTxt[120] = "striker hits no coin";
+    if (first >= 0) snprintf(hitTxt, sizeof(hitTxt), "first hit coin %d at (%.1f,%.1f)", first, w.coins[first].x, w.coins[first].y);
     V2 origin = xf_apply(w.toRoot, 0, 0);
-    snprintf(st, sizeof(st), "Prediction ON | ang %.1f deg  drag %.1f  v0 %.2f/frame | coins %d | striker bounces %d | %s | table origin in design (%.1f,%.1f) root %.0fx%.0f",
-             a.ang * 180.0 / M_PI, a.dist, v0, (int)w.coins.size(), sb, hitTxt, origin.x, origin.y, w.rootW, w.rootH);
+    snprintf(st, sizeof(st), "Prediction ON | ang %.1f deg  drag %.1f  v0 %.2f/step | coins %d pockets %d | %s | coins moved %d potted %d%s | table origin in design (%.1f,%.1f) root %.0fx%.0f",
+             a.ang * 180.0 / M_PI, a.dist, v0, (int)w.coins.size(), (int)w.pockets.size(), hitTxt, movedCoins, potted, foul ? " | FOUL: striker potted" : "",
+             origin.x, origin.y, w.rootW, w.rootH);
     pred_set(out, st);
     {
         std::lock_guard<std::mutex> lk(g_predMx);
-        snprintf(g_predLastLog, sizeof(g_predLastLog), "ang=%.4f dist=%.2f v0=%.3f start=%.2f,%.2f strikerEnd=%.1f,%.1f %s", a.ang, a.dist, v0, sx, sy,
-                 sp.empty() ? 0.0 : sp.back().x, sp.empty() ? 0.0 : sp.back().y, hitTxt);
+        snprintf(g_predLastLog, sizeof(g_predLastLog), "ang=%.4f dist=%.2f v0=%.3f start=%.2f,%.2f striker_end=%.1f,%.1f%s | %s |%s", a.ang, a.dist, v0, sx, sy,
+                 s0.x, s0.y, foul ? "[POT=FOUL]" : "", hitTxt, coinLog);
     }
 }
 
@@ -976,7 +1086,7 @@ static void* worker(void*) {
                 LOG("AIM released: last ang=%.5f(%.2fdeg) dist=%.3f en=%d power_ok=%d",
                     lastAim.ang, lastAim.ang * 180.0 / M_PI, lastAim.dist, lastAim.en, lastAim.enough);
                 if (g_enabled.load()) {
-                    char pl[300];
+                    char pl[900];
                     { std::lock_guard<std::mutex> lk(g_predMx); snprintf(pl, sizeof(pl), "%s", g_predLastLog); }
                     LOG("PRED last: %s", pl);
                 }
