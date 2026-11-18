@@ -1,4 +1,4 @@
-// carprobe.cpp  v5.3 = v5.2 + LOGIC SCAN (read-only scan of the C++ TableLogic object, see the v5.3 block; ObjC dump now off by default).
+// carprobe.cpp  v5.4 = v5.2 + LOGIC SCAN with HEAP-WIDE body search (see the v5.4 block; ObjC dump now off by default).
 // (older header v5.2) = v5.1 prediction (round-2 physics, coin-coin, pockets, foul) + READ-ONLY DUMP MODE.
 //   NEW in v5.2: DUMP MODE. Once per game start, the first time a match is found (coins + aim objects on the heap), the probe
 //   (1) finds ALL Objective-C classes of the game library by scanning its data segments for class structs (no runtime API needed),
@@ -1428,21 +1428,25 @@ static void dump_dyn(long dt, int shot) {
     }
 }
 
-// ================================================================== v5.3 LOGIC SCAN (read-only)
-// The physics lives in the C++ object TableLogic (TableNode._tableLogic is a unique_ptr to it, confirmed by the v5.2 dump).
-// Its layout is UNKNOWN. This mode only reads memory: it follows heap pointers from TableLogic (BFS, depth <= kLnMaxDepth),
-// keeps a copy of every block it finds, then
-//   (1) looks for the constants we measured (friction 0.17 / 0.0715, wall 0.73 / 0.98, radii, board size ...) as float or double,
-//   (2) looks for the live (x,y) of every coin / striker (same numbers as the cocos node positions, optionally scaled) = the physics bodies,
-//   (3) after each of the first kDynShots shots prints which 8-byte slots CHANGED (+60/+250/+600 ms) = velocity / spin / state fields.
-// All lines start with "LSCAN". Nothing is written to the game, no hooks. Not built or run in the game by an AI.
+// ================================================================== v5.4 LOGIC SCAN (read-only)
+// What the v5.3 log showed (user's phone, build 1492): TableNode._tableLogic is a valid heap block, the pointer walk filled all 600 nodes, and NO (x,y) of a coin
+// was found in them (pos hits 0). The 2048-byte blocks run past the real object into neighbouring heap data (changes above ~576 bytes in n0 looked like junk),
+// so the dyn output was mostly noise. One real slot: n0+488 (double) grew 0.0028 -> 0.016 within ms (timer / accumulator? GUESS).
+// v5.4 therefore searches the WHOLE writable heap for the live coin positions (like a Cheat Engine exact-value scan), groups the hits into arrays (struct stride),
+// prints the bytes around the first bodies (constants, radius, mass ... next to the position), and after each shot prints what changed in a small window around EVERY body.
+// Position forms tried: float or double pairs (x,y) with a gap of 4/8/12 (float) or 8/16 (double) bytes, physics = (table + shift) * scale, scales 1, 0.1, 0.01, 1/32,
+// shifts 0 first, then +-254.1 if nothing is found. Everything is read through rd(); nothing is written, no hooks. Not run in the game by an AI.
 static const int    kLogicScan   = 1;
 static const int    kLnMaxNodes  = 600;
 static const int    kLnMaxDepth  = 3;
-static const int    kLnMaxHits   = 250;
-static const int    kLnTries     = 6;       // scan attempts (one per heap scan) until a live TableNode is found
+static const int    kLnMaxHits   = 120;
+static const int    kLnTries     = 6;
 static const int    kDynShots    = 4;
 static const size_t kLnBlock     = 2048;
+static const size_t kLnN0Max     = 576;      // v5.3 log: slots of n0 above this changed like neighbouring heap junk; only limits the n0 dyn print
+static const int    kHMaxHits    = 6000;
+static const int    kWatchMax    = 24;       // bodies watched after the heap-wide search
+static const size_t kWBefore     = 128, kWAfter = 384;
 
 struct LNode { u64 addr; int depth; int from; int fromOff; u64 vt; std::vector<uint8_t> raw; };
 static std::vector<LNode> g_ln;
@@ -1451,7 +1455,6 @@ static bool g_lnDone = false, g_lnReady = false;
 static int g_lnTries = 0;
 
 struct LTarget { const char* name; double v, tol; };
-// every value comes from the round-2 measurements in the PHYSICS NUMBERS block; the *60 forms cover "per second" storage
 static const LTarget kLT[] = {
     {"fricHigh 0.17/step", 0.17, 0.004}, {"fricLow 0.0715/step", 0.0715, 0.002},
     {"fricHigh*60 10.2/s", 10.2, 0.1}, {"fricLow*60 4.29/s", 4.29, 0.05},
@@ -1484,38 +1487,56 @@ static bool ln_read_node(u64 p, std::vector<uint8_t>& out) {
 static float  ln_f(const std::vector<uint8_t>& r, size_t o) { float v; memcpy(&v, &r[o], 4); return v; }
 static double ln_d(const std::vector<uint8_t>& r, size_t o) { double v; memcpy(&v, &r[o], 8); return v; }
 
-static void ln_consts(const LNode& n, int ni, int& hits) {
-    for (size_t o = 0; o + 4 <= n.raw.size(); o += 4) {
-        float f = ln_f(n.raw, o);
-        double d = (o % 8 == 0 && o + 8 <= n.raw.size()) ? ln_d(n.raw, o) : NAN;
+// C++ class name of a vtable through RTTI (vtable[-1] = type_info, type_info+8 = mangled name). Empty if the library has no RTTI there.
+static std::string ln_rtti(u64 vtRva) {
+    if (!vtRva) return std::string();
+    u64 vt = g_bias + vtRva, ti = 0, np = 0;
+    char nm[160];
+    if (!rd(vt - 8, &ti, 8) || !in_lib(ti)) return std::string();
+    if (!rd(ti + 8, &np, 8)) return std::string();
+    np &= ~(1ull << 63);
+    if (!in_lib(np) || !rd_str(np, nm, sizeof(nm))) return std::string();
+    for (const char* c = nm; *c; c++) if ((unsigned char)*c < 0x21 || (unsigned char)*c > 0x7e) return std::string();
+    return std::string(nm);
+}
+
+// constants inside a raw buffer; rel = byte offset minus base (so a window around a body prints offsets relative to its x)
+static void consts_in(const std::vector<uint8_t>& raw, const char* tag, long base, int& hits, int maxHits) {
+    for (size_t o = 0; o + 4 <= raw.size(); o += 4) {
+        float f = ln_f(raw, o);
+        double d = (o % 8 == 0 && o + 8 <= raw.size()) ? ln_d(raw, o) : NAN;
         for (const LTarget& t : kLT) {
             bool mf = isfinite(f) && fabs((double)f - t.v) <= t.tol;
             bool md = isfinite(d) && fabs(d - t.v) <= t.tol;
             if (!mf && !md) continue;
-            if (hits >= kLnMaxHits) return;
+            if (hits >= maxHits) return;
             char ctx[260]; ctx[0] = 0;
             size_t c0 = o >= 8 ? o - 8 : 0;
-            for (size_t k = c0; k + 4 <= n.raw.size() && k < o + 16; k += 4) {
+            for (size_t k = c0; k + 4 <= raw.size() && k < o + 16; k += 4) {
                 size_t l = strlen(ctx);
-                if (l < 220) snprintf(ctx + l, sizeof(ctx) - l, "%s%.5g", k == o ? " [" : " ", (double)ln_f(n.raw, k));
+                if (l < 220) snprintf(ctx + l, sizeof(ctx) - l, "%s%.5g", k == o ? " [" : " ", (double)ln_f(raw, k));
                 if (k == o) { l = strlen(ctx); if (l < 240) snprintf(ctx + l, sizeof(ctx) - l, "]"); }
             }
-            LOG("LSCAN const n%d@%lx +%zu %s as %s v=%.6g | f32 around:%s", ni, (unsigned long)n.addr, o, t.name,
-                mf ? "float" : "double", mf ? (double)f : d, ctx);
+            LOG("LSCAN const %s rel%+ld %s as %s v=%.6g | f32 around:%s", tag, (long)o - base, t.name, mf ? "float" : "double", mf ? (double)f : d, ctx);
             hits++;
         }
     }
 }
 
-struct LBody { char kind; int idx; double x, y; };
+// bodies: x / y are stored XOR-ed so the search does not find our own copies
+struct LBody { char kind; int idx; u64 obj; u64 xo, yo; };
+static void lb_set(LBody& b, double x, double y) { memcpy(&b.xo, &x, 8); memcpy(&b.yo, &y, 8); b.xo ^= kObf; b.yo ^= kObf; }
+static double lb_x(const LBody& b) { u64 v = b.xo ^ kObf; double d; memcpy(&d, &v, 8); return d; }
+static double lb_y(const LBody& b) { u64 v = b.yo ^ kObf; double d; memcpy(&d, &v, 8); return d; }
+
 struct LHit { int node; size_t off; int type; double s; size_t gap; int body; };
-// physics space = table space * s   (s = 1 means the physics uses the same numbers as the cocos nodes)
 static const double kLS[] = { 1.0, 0.1, 0.01, 1.0 / 32, 1.0 / 30, 1.0 / 50, 1.0 / 64, 1.0 / 60, 2.0, 10.0, 32.0, 100.0, 0.5, 0.25, 1.0 / 16, 1.0 / 8 };
 
+// (x,y) of the bodies inside the pointer-walk blocks (same idea as the heap-wide search, only on g_ln)
 static void ln_positions(const std::vector<LBody>& bodies, std::vector<LHit>& hits) {
     typedef std::pair<double, int> PD;
     std::vector<PD> sx;
-    for (size_t i = 0; i < bodies.size(); i++) sx.push_back(PD(bodies[i].x, (int)i));
+    for (size_t i = 0; i < bodies.size(); i++) sx.push_back(PD(lb_x(bodies[i]), (int)i));
     std::sort(sx.begin(), sx.end());
     const double tol = 0.02;
     static const size_t gapsF[3] = {4, 8, 12}, gapsD[2] = {8, 16};
@@ -1537,7 +1558,7 @@ static void ln_positions(const std::vector<LBody>& bodies, std::vector<LHit>& hi
                             size_t gap = type ? gapsD[gi] : gapsF[gi];
                             if (o + gap + sz > r.size()) continue;
                             double yv = type ? ln_d(r, o + gap) : (double)ln_f(r, o + gap);
-                            if (!isfinite(yv) || fabs(yv / s - b.y) > tol) continue;
+                            if (!isfinite(yv) || fabs(yv / s - lb_y(b)) > tol) continue;
                             LHit h; h.node = (int)ni; h.off = o; h.type = type; h.s = s; h.gap = gap; h.body = it->second;
                             if (hits.size() < 3000) hits.push_back(h);
                         }
@@ -1556,22 +1577,173 @@ static bool ln_hit_less(const LHit& a, const LHit& b) {
     return a.off < b.off;
 }
 
-static void ln_context(const LNode& n, size_t o, const char* what) {
-    size_t a = o >= 32 ? o - 32 : 0, e = std::min(n.raw.size(), o + 96);
-    std::string f32, f64;
-    char b[48];
-    for (size_t k = a; k + 4 <= e; k += 4) { snprintf(b, sizeof(b), " %zu:%.5g", k, (double)ln_f(n.raw, k)); f32 += b; }
-    for (size_t k = (a + 7) & ~(size_t)7; k + 8 <= e; k += 8) { snprintf(b, sizeof(b), " %zu:%.7g", k, ln_d(n.raw, k)); f64 += b; }
-    LOG("LSCAN ctx %s n@%lx f32:%s", what, (unsigned long)n.addr, f32.c_str());
-    LOG("LSCAN ctx %s n@%lx f64:%s", what, (unsigned long)n.addr, f64.c_str());
+// ---------------------------------------------------------------- heap-wide search
+struct HHit { u64 addr; int body; int type; int sc; int sh; size_t gap; };
+static const double kHScale[] = {1.0, 0.1, 0.01, 1.0 / 32};
+static const int kHScaleN = 4;
+static const double kHShift[] = {0.0, 254.1, -254.1};
+typedef std::pair<u64, u64> Rng;
+
+static bool in_ranges(u64 a, const std::vector<Rng>& ex) {
+    for (const Rng& r : ex) if (a >= r.first && a < r.second) return true;
+    return false;
 }
 
+// shift indices [shLo, shHi). Physics value = (table value + shift) * scale. Hits inside the ranges in ex (node objects, our own buffers) are dropped.
+static void heap_find_positions(const std::vector<LBody>& bodies, int shLo, int shHi, std::vector<HHit>& out, const std::vector<Rng>& ex) {
+    typedef std::pair<double, int> PD;
+    std::vector<PD> sx;
+    for (size_t i = 0; i < bodies.size(); i++) sx.push_back(PD(lb_x(bodies[i]), (int)i));
+    std::sort(sx.begin(), sx.end());
+    const double tol = 0.02;
+    static const size_t gapsF[3] = {4, 8, 12}, gapsD[2] = {8, 16};
+    std::vector<Reg> regs = heap_regions();
+    u64 bufLo = (u64)(uintptr_t)g_scanbuf, bufHi = bufLo + sizeof(g_scanbuf);
+    long chunks = 0;
+    for (const Reg& r : regs) {
+        for (u64 a = r.s; a < r.e; a += CH) {
+            size_t n = (size_t)std::min<u64>(CH + 32, r.e - a);
+            n &= ~(size_t)3;
+            if (n < 16 || !rd(a, g_scanbuf, n)) continue;
+            size_t lim = std::min<size_t>(CH, n);
+            for (size_t i = 0; i + 4 <= lim; i += 4) {
+                for (int type = 0; type < 2; type++) {
+                    size_t sz = type ? 8 : 4;
+                    if (type && (i & 7)) continue;
+                    if (i + sz > n) continue;
+                    double v;
+                    if (type) memcpy(&v, g_scanbuf + i, 8); else { float f; memcpy(&f, g_scanbuf + i, 4); v = (double)f; }
+                    if (!isfinite(v) || fabs(v) < 1e-9) continue;
+                    for (int sc = 0; sc < kHScaleN; sc++) {
+                        for (int sh = shLo; sh < shHi; sh++) {
+                            double xt = v / kHScale[sc] - kHShift[sh];
+                            if (xt < -400.0 || xt > 400.0) continue;
+                            std::vector<PD>::iterator it = std::lower_bound(sx.begin(), sx.end(), PD(xt - tol, -1));
+                            for (; it != sx.end() && it->first <= xt + tol; ++it) {
+                                const LBody& b = bodies[it->second];
+                                int ng = type ? 2 : 3;
+                                for (int gi = 0; gi < ng; gi++) {
+                                    size_t gap = type ? gapsD[gi] : gapsF[gi];
+                                    if (i + gap + sz > n) continue;
+                                    double yv;
+                                    if (type) memcpy(&yv, g_scanbuf + i + gap, 8); else { float f; memcpy(&f, g_scanbuf + i + gap, 4); yv = (double)f; }
+                                    if (!isfinite(yv) || fabs(yv / kHScale[sc] - kHShift[sh] - lb_y(b)) > tol) continue;
+                                    u64 addr = a + i;
+                                    if (addr >= bufLo && addr < bufHi) continue;
+                                    if (in_ranges(addr, ex)) continue;
+                                    HHit h; h.addr = addr; h.body = it->second; h.type = type; h.sc = sc; h.sh = sh; h.gap = gap;
+                                    if ((int)out.size() < kHMaxHits) out.push_back(h);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if ((++chunks & 127) == 0) usleep(1500);
+        }
+    }
+}
+
+struct HG { int type, sc, sh; size_t gap; std::vector<HHit> h; std::set<int> bodies; };
+static bool hg_more(const HG& a, const HG& b) { return a.bodies.size() > b.bodies.size(); }
+static bool hh_less(const HHit& a, const HHit& b) { return a.addr < b.addr; }
+
+// groups the hits by (type, scale, shift, gap); the best group (most different bodies, at least 3) is the body array. Returns its hits sorted by address.
+static bool h_pick_best(const std::vector<HHit>& hits, std::vector<HHit>& best) {
+    std::vector<HG> gs;
+    for (const HHit& h : hits) {
+        size_t gi = gs.size();
+        for (size_t k = 0; k < gs.size(); k++) if (gs[k].type == h.type && gs[k].sc == h.sc && gs[k].sh == h.sh && gs[k].gap == h.gap) { gi = k; break; }
+        if (gi == gs.size()) { HG n; n.type = h.type; n.sc = h.sc; n.sh = h.sh; n.gap = h.gap; gs.push_back(n); }
+        gs[gi].h.push_back(h); gs[gi].bodies.insert(h.body);
+    }
+    std::sort(gs.begin(), gs.end(), hg_more);
+    for (size_t k = 0; k < gs.size() && k < 6; k++)
+        LOG("LSCAN hgrp %s scale=%g shift=%g gap=%zu hits=%d bodies=%d", gs[k].type ? "f64" : "f32", kHScale[gs[k].sc], kHShift[gs[k].sh], gs[k].gap, (int)gs[k].h.size(), (int)gs[k].bodies.size());
+    if (gs.empty() || gs[0].bodies.size() < 3) return false;
+    best = gs[0].h;
+    std::sort(best.begin(), best.end(), hh_less);
+    std::vector<std::string> items; char b[64];
+    std::map<long, int> hist;
+    for (size_t i = 0; i < best.size() && i < 120; i++) {
+        snprintf(b, sizeof(b), "%lx(b%d)", (unsigned long)best[i].addr, best[i].body); items.push_back(b);
+        if (i) { long d = (long)(best[i].addr - best[i - 1].addr); if (d > 0 && d <= 4096) hist[d]++; }
+    }
+    log_chunked("LSCAN harr best group, address order:", items);
+    std::string hs;
+    for (auto& kv : hist) { if (kv.second >= 2) { snprintf(b, sizeof(b), " %ld(x%d)", kv.first, kv.second); hs += b; } }
+    LOG("LSCAN hstride (address diffs between neighbouring hits, repeated >=2):%s", hs.empty() ? " none" : hs.c_str());
+    return true;
+}
+
+// ---------------------------------------------------------------- watch windows around each found body
+struct Watch { u64 addr; int body; char kind; size_t before; std::vector<uint8_t> raw; };
+static std::vector<Watch> g_w;
+static bool g_wReady = false;
+
+static bool w_read(Watch& w, std::vector<uint8_t>& out) {
+    out.resize(w.raw.size());
+    return rd(w.addr - w.before, out.data(), out.size());
+}
+
+static bool w_init(Watch& w) {
+    static const size_t geo[4][2] = {{kWBefore, kWAfter}, {0, kWAfter}, {0, 128}, {0, 16}};
+    for (int g = 0; g < 4; g++) {
+        w.before = geo[g][0]; w.raw.assign(geo[g][0] + geo[g][1], 0);
+        std::vector<uint8_t> t;
+        if (w_read(w, t)) { w.raw.swap(t); return true; }
+    }
+    return false;
+}
+
+static void w_snapshot() {
+    for (Watch& w : g_w) { std::vector<uint8_t> t; if (w_read(w, t)) w.raw.swap(t); }
+}
+
+static void w_dyn(long dt, int shot) {
+    LOG("LSCAN wdyn shot=%d t=+%ldms (windows around each body; rel = bytes from the matched x)", shot, dt);
+    int lines = 0;
+    for (const Watch& w : g_w) {
+        if (lines >= 100) break;
+        std::vector<uint8_t> now(w.raw.size());
+        if (!rd(w.addr - w.before, now.data(), now.size())) continue;
+        std::vector<std::string> items;
+        int changed = 0;
+        for (size_t q = 0; q + 8 <= w.raw.size(); q += 8) {
+            if (memcmp(&w.raw[q], &now[q], 8) == 0) continue;
+            changed++;
+            if (items.size() >= 30) continue;
+            char b[200];
+            snprintf(b, sizeof(b), "rel%+ld d:%.7g->%.7g f:%.5g,%.5g->%.5g,%.5g", (long)q - (long)w.before, ln_d(w.raw, q), ln_d(now, q),
+                     (double)ln_f(w.raw, q), (double)ln_f(w.raw, q + 4), (double)ln_f(now, q), (double)ln_f(now, q + 4));
+            items.push_back(b);
+        }
+        if (!changed) continue;
+        char head[140];
+        snprintf(head, sizeof(head), "LSCAN wdyn s%d +%ld b%d(%c)@%lx changed=%d:", shot, dt, w.body, w.kind, (unsigned long)w.addr, changed);
+        log_chunked(head, items);
+        lines++;
+    }
+}
+
+static void w_context(const Watch& w) {
+    std::vector<std::string> f32, f64;
+    char b[64];
+    for (size_t k = 0; k + 4 <= w.raw.size(); k += 4) { snprintf(b, sizeof(b), "r%+ld:%.5g", (long)k - (long)w.before, (double)ln_f(w.raw, k)); f32.push_back(b); }
+    for (size_t k = 0; k + 8 <= w.raw.size(); k += 8) { snprintf(b, sizeof(b), "r%+ld:%.7g", (long)k - (long)w.before, ln_d(w.raw, k)); f64.push_back(b); }
+    char head[100];
+    snprintf(head, sizeof(head), "LSCAN wctx b%d(%c)@%lx f32:", w.body, w.kind, (unsigned long)w.addr);
+    log_chunked(head, f32);
+    snprintf(head, sizeof(head), "LSCAN wctx b%d(%c)@%lx f64:", w.body, w.kind, (unsigned long)w.addr);
+    log_chunked(head, f64);
+}
+
+// ---------------------------------------------------------------- main scan
 static bool run_logic_scan() {
     long t0 = now_ms();
     u64 tcls = find_class("TableNode");
     int off = tcls ? ivar_off(tcls, "_tableLogic") : -1;
     if (off < 0) { LOG("LSCAN: TableNode._tableLogic ivar not found"); return false; }
-    // the live table = the TableNode above a valid striker (same filter as the prediction)
     u64 table = 0; Xf rootXf = xf_id();
     for (u64 s : g_objs[C_STRIKER]) {
         if (!item_valid('S', s)) continue;
@@ -1589,11 +1761,23 @@ static bool run_logic_scan() {
             if (!read_pos(o, x, y) || fabs(x) > kBoardBound || fabs(y) > kBoardBound) continue;
             Chain ch = walk_chain(o);
             if (!ch.ok || ch.table != table || !xf_close(ch.toRoot, rootXf)) continue;
-            LBody b; b.kind = k == 0 ? 'S' : 'P'; b.idx = (int)bodies.size(); b.x = x; b.y = y;
             if (fabs(x) < 8.0 || fabs(y) < 8.0) continue;          // centre coin / baseline values would match zeros and small numbers everywhere
+            LBody b; b.kind = k == 0 ? 'S' : 'P'; b.idx = (int)bodies.size(); b.obj = o; lb_set(b, x, y);
             bodies.push_back(b);
             if (k == 0) nS++; else nP++;
         }
+    }
+    // everything must be at rest while we search
+    for (int k = 0; k < 20; k++) {
+        usleep(150000);
+        bool moved = false;
+        for (LBody& b : bodies) {
+            double x, y;
+            if (!read_pos(b.obj, x, y)) continue;
+            if (fabs(x - lb_x(b)) > 0.01 || fabs(y - lb_y(b)) > 0.01) { moved = true; lb_set(b, x, y); }
+        }
+        if (!moved) break;
+        if (k == 19) { LOG("LSCAN: coins keep moving, will retry"); return false; }
     }
     g_lnRegs = heap_regions();
     std::sort(g_lnRegs.begin(), g_lnRegs.end(), [](const Reg& a, const Reg& b) { return a.s < b.s; });
@@ -1615,11 +1799,11 @@ static bool run_logic_scan() {
             u64 p; memcpy(&p, &raw[o], 8);
             if (!ln_region_end(p) || seen.count(p)) continue;
             seen.insert(p);
-            if (!obj_cname(p).empty()) continue;                       // ObjC / cocos object: not physics data
+            if (!obj_cname(p).empty()) continue;
             LNode n; n.addr = p; n.depth = d + 1; n.from = (int)i; n.fromOff = (int)o; n.vt = 0;
             if (!ln_read_node(p, n.raw)) continue;
             u64 w0; memcpy(&w0, &n.raw[0], 8);
-            if (in_lib(w0)) n.vt = w0 - g_bias;                         // C++ object with a vtable: RVA of the vtable (identifies the class)
+            if (in_lib(w0)) n.vt = w0 - g_bias;
             g_ln.push_back(n);
         }
     }
@@ -1627,48 +1811,68 @@ static bool run_logic_scan() {
         (unsigned long)logic, off, (int)g_ln.size(), (int)bodies.size(), nS, nP, (unsigned long)g_bias);
     for (size_t i = 0; i < g_ln.size(); i++) {
         const LNode& n = g_ln[i];
-        if (n.depth <= 1)
-            LOG("LSCAN node n%zu@%lx depth=%d from=n%d+%d vt_rva=0x%lx size=%zu", i, (unsigned long)n.addr, n.depth, n.from, n.fromOff, (unsigned long)n.vt, n.raw.size());
+        if (n.depth <= 1) {
+            std::string rt = ln_rtti(n.vt);
+            LOG("LSCAN node n%zu@%lx depth=%d from=n%d+%d vt_rva=0x%lx rtti=%s", i, (unsigned long)n.addr, n.depth, n.from, n.fromOff, (unsigned long)n.vt, rt.empty() ? "-" : rt.c_str());
+        }
     }
     int ch = 0;
-    for (size_t i = 0; i < g_ln.size(); i++) ln_consts(g_ln[i], (int)i, ch);
-    LOG("LSCAN const hits: %d (max %d)", ch, kLnMaxHits);
-    std::vector<LHit> hits;
-    ln_positions(bodies, hits);
-    std::sort(hits.begin(), hits.end(), ln_hit_less);
-    LOG("LSCAN pos hits: %d (coin/striker x,y found in the logic blocks, scale s: physics = table * s)", (int)hits.size());
-    for (size_t i = 0; i < hits.size() && i < 200; i++) {
-        const LHit& h = hits[i];
-        const LBody& b = bodies[h.body];
-        const LNode& n = g_ln[h.node];
-        double rx = h.type ? ln_d(n.raw, h.off) : (double)ln_f(n.raw, h.off);
-        double ry = h.type ? ln_d(n.raw, h.off + h.gap) : (double)ln_f(n.raw, h.off + h.gap);
-        LOG("LSCAN pos %c%d n%d@%lx +%zu %s s=%g gap=%zu raw=(%.5g,%.5g) table=(%.3f,%.3f) nodeDepth=%d vt_rva=0x%lx", b.kind, b.idx, h.node,
-            (unsigned long)n.addr, h.off, h.type ? "f64" : "f32", h.s, h.gap, rx, ry, b.x, b.y, n.depth, (unsigned long)n.vt);
+    for (size_t i = 0; i < g_ln.size(); i++) { char tg[24]; snprintf(tg, sizeof(tg), "n%zu", i); consts_in(g_ln[i].raw, tg, 0, ch, kLnMaxHits); }
+    LOG("LSCAN const hits in the pointer-walk blocks: %d (max %d; noisy, blocks run past the real objects)", ch, kLnMaxHits);
+    {
+        std::vector<LHit> hits;
+        ln_positions(bodies, hits);
+        LOG("LSCAN pos hits in the pointer-walk blocks: %d", (int)hits.size());
     }
-    // arrays: consecutive hits of the same node / type / scale / gap and the offset differences between them (= struct stride)
-    for (size_t i = 0; i < hits.size();) {
-        size_t j = i;
-        std::string offs, diffs; char bb[40];
-        while (j < hits.size() && hits[j].node == hits[i].node && hits[j].type == hits[i].type && hits[j].s == hits[i].s && hits[j].gap == hits[i].gap) {
-            snprintf(bb, sizeof(bb), " %zu(b%d)", hits[j].off, hits[j].body); offs += bb;
-            if (j > i) { snprintf(bb, sizeof(bb), " %zd", (ssize_t)hits[j].off - (ssize_t)hits[j - 1].off); diffs += bb; }
-            j++;
+    // ---- heap-wide search
+    std::vector<Rng> ex;
+    for (const LBody& b : bodies) ex.push_back(Rng(b.obj, b.obj + 1400));
+    for (const LNode& n : g_ln) ex.push_back(Rng((u64)(uintptr_t)n.raw.data(), (u64)(uintptr_t)n.raw.data() + n.raw.size()));
+    if (!g_world.coins.empty()) ex.push_back(Rng((u64)(uintptr_t)g_world.coins.data(), (u64)(uintptr_t)g_world.coins.data() + g_world.coins.size() * sizeof(Coin)));
+    {
+        pthread_attr_t at;
+        if (pthread_getattr_np(pthread_self(), &at) == 0) {
+            void* sa = nullptr; size_t ss = 0;
+            if (pthread_attr_getstack(&at, &sa, &ss) == 0) ex.push_back(Rng((u64)(uintptr_t)sa, (u64)(uintptr_t)sa + ss));
+            pthread_attr_destroy(&at);
         }
-        if (j - i >= 2) LOG("LSCAN arr n%d %s s=%g gap=%zu offs:%s | diffs:%s", hits[i].node, hits[i].type ? "f64" : "f32", hits[i].s, hits[i].gap, offs.c_str(), diffs.c_str());
-        i = j;
     }
-    // raw context around the first hit of up to 3 different bodies
-    std::set<int> shown;
-    for (const LHit& h : hits) {
-        if (shown.size() >= 3) break;
-        if (shown.count(h.body)) continue;
-        shown.insert(h.body);
-        char w[40]; snprintf(w, sizeof(w), "%c%d@+%zu", bodies[h.body].kind, bodies[h.body].idx, h.off);
-        ln_context(g_ln[h.node], h.off, w);
+    long h0 = now_ms();
+    std::vector<HHit> hh;
+    heap_find_positions(bodies, 0, 1, hh, ex);
+    LOG("LSCAN heap search shift 0: %d hits in %ld ms", (int)hh.size(), now_ms() - h0);
+    std::vector<HHit> best;
+    bool found = h_pick_best(hh, best);
+    if (!found) {
+        h0 = now_ms();
+        std::vector<HHit> h2;
+        heap_find_positions(bodies, 1, 3, h2, ex);
+        LOG("LSCAN heap search shift +-254.1: %d hits in %ld ms", (int)h2.size(), now_ms() - h0);
+        hh.insert(hh.end(), h2.begin(), h2.end());
+        found = h_pick_best(hh, best);
+    }
+    // were the coins still while we searched?
+    bool still = true;
+    for (const LBody& b : bodies) { double x, y; if (read_pos(b.obj, x, y) && (fabs(x - lb_x(b)) > 0.01 || fabs(y - lb_y(b)) > 0.01)) still = false; }
+    if (!still) LOG("LSCAN warning: a coin moved during the search, hits may be incomplete");
+    g_w.clear();
+    if (found) {
+        for (const HHit& h : best) {
+            if ((int)g_w.size() >= kWatchMax) break;
+            Watch w; w.addr = h.addr; w.body = h.body; w.kind = bodies[h.body].kind; w.before = 0;
+            if (w_init(w)) g_w.push_back(w);
+        }
+        LOG("LSCAN watching %d windows (%zu bytes before / %zu after the matched x where readable)", (int)g_w.size(), kWBefore, kWAfter);
+        int wc = 0;
+        for (const Watch& w : g_w) { char tg[40]; snprintf(tg, sizeof(tg), "b%d@%lx", w.body, (unsigned long)w.addr); consts_in(w.raw, tg, (long)w.before, wc, 80); }
+        LOG("LSCAN const hits next to bodies: %d", wc);
+        for (size_t i = 0; i < g_w.size() && i < 2; i++) w_context(g_w[i]);
+        g_wReady = !g_w.empty();
+    } else {
+        LOG("LSCAN: no body array found by position (scales 1, 0.1, 0.01, 1/32; shifts 0, +-254.1). Next: other origin / fixed point, or follow the dyn output.");
     }
     g_lnReady = true;
-    LOG("LSCAN end: %ld ms. Changed 8-byte slots follow after the next %d shots (LSCAN dyn).", now_ms() - t0, kDynShots);
+    LOG("LSCAN end: %ld ms. Changed slots follow after the next %d shots (LSCAN wdyn / LSCAN dyn).", now_ms() - t0, kDynShots);
     return true;
 }
 
@@ -1678,32 +1882,30 @@ static void ln_snapshot() {
         std::vector<uint8_t> b(n.raw.size());
         if (rd(n.addr, b.data(), b.size())) n.raw.swap(b);
     }
+    w_snapshot();
 }
 
+// only node 0 below kLnN0Max (the TableLogic block itself); the other pointer-walk blocks are mostly neighbouring heap data
 static void ln_dyn(long dt, int shot) {
-    int lines = 0;
-    LOG("LSCAN dyn shot=%d t=+%ldms", shot, dt);
-    for (size_t i = 0; i < g_ln.size() && lines < 150; i++) {
-        const LNode& n = g_ln[i];
-        std::vector<uint8_t> now(n.raw.size());
-        if (!rd(n.addr, now.data(), now.size())) continue;
-        std::vector<std::string> items;
-        int changed = 0;
-        for (size_t q = 0; q + 8 <= n.raw.size(); q += 8) {
-            if (memcmp(&n.raw[q], &now[q], 8) == 0) continue;
-            changed++;
-            if (items.size() >= 40) continue;
-            double d0 = ln_d(n.raw, q), d1 = ln_d(now, q);
-            char b[220];
-            snprintf(b, sizeof(b), "q%zu d:%.7g->%.7g f:%.5g,%.5g->%.5g,%.5g", q, d0, d1,
-                     (double)ln_f(n.raw, q), (double)ln_f(n.raw, q + 4), (double)ln_f(now, q), (double)ln_f(now, q + 4));
-            items.push_back(b);
-        }
-        if (!changed) continue;
-        char head[140];
-        snprintf(head, sizeof(head), "LSCAN dyn s%d +%ld n%zu@%lx depth=%d changed=%d:", shot, dt, i, (unsigned long)n.addr, n.depth, changed);
+    LOG("LSCAN dyn shot=%d t=+%ldms (TableLogic block, first %zu bytes)", shot, dt, kLnN0Max);
+    if (g_ln.empty()) return;
+    const LNode& n = g_ln[0];
+    std::vector<uint8_t> now(n.raw.size());
+    if (!rd(n.addr, now.data(), now.size())) return;
+    std::vector<std::string> items;
+    int changed = 0;
+    for (size_t q = 0; q + 8 <= n.raw.size() && q < kLnN0Max; q += 8) {
+        if (memcmp(&n.raw[q], &now[q], 8) == 0) continue;
+        changed++;
+        char b[220];
+        snprintf(b, sizeof(b), "q%zu d:%.7g->%.7g f:%.5g,%.5g->%.5g,%.5g", q, ln_d(n.raw, q), ln_d(now, q),
+                 (double)ln_f(n.raw, q), (double)ln_f(n.raw, q + 4), (double)ln_f(now, q), (double)ln_f(now, q + 4));
+        items.push_back(b);
+    }
+    if (changed) {
+        char head[120];
+        snprintf(head, sizeof(head), "LSCAN dyn s%d +%ld n0@%lx changed=%d:", shot, dt, (unsigned long)n.addr, changed);
         log_chunked(head, items);
-        lines++;
     }
 }
 
@@ -1787,7 +1989,7 @@ static void* worker(void*) {
         if (dynStep >= 0) {
             long dt = now_ms() - dynT0;
             if (dt >= kDynDelay[dynStep]) {
-                if (g_lnReady) ln_dyn(dt, dynShots); else dump_dyn(dt, dynShots);
+                if (g_lnReady) { ln_dyn(dt, dynShots); if (g_wReady) w_dyn(dt, dynShots); } else dump_dyn(dt, dynShots);
                 dynStep++;
                 if (dynStep >= 3) dynStep = -1;
             }
@@ -1865,7 +2067,7 @@ static void* worker(void*) {
 }
 
 __attribute__((constructor)) static void init() {
-    LOG("carprobe v5.3 loaded (prediction + logic scan %s, ObjC dump %s; test write kTestMaxGuides=%d)", kLogicScan ? "ON" : "off", kDumpEnabled ? "ON" : "off", kTestMaxGuides);
+    LOG("carprobe v5.4 loaded (prediction + logic scan %s, ObjC dump %s; test write kTestMaxGuides=%d)", kLogicScan ? "ON" : "off", kDumpEnabled ? "ON" : "off", kTestMaxGuides);
     pthread_t th;
     pthread_create(&th, nullptr, worker, nullptr);
     pthread_detach(th);
