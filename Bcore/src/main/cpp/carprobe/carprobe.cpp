@@ -1,4 +1,4 @@
-// carprobe.cpp  v5.4 = v5.2 + LOGIC SCAN with HEAP-WIDE body search (see the v5.4 block; ObjC dump now off by default).
+// carprobe.cpp  v5.5 = v5.2 + LOGIC SCAN: heap-wide body search, exact-value search, RTTI names, PuckNode pointer watches (see the v5.4 block; ObjC dump off by default).
 // (older header v5.2) = v5.1 prediction (round-2 physics, coin-coin, pockets, foul) + READ-ONLY DUMP MODE.
 //   NEW in v5.2: DUMP MODE. Once per game start, the first time a match is found (coins + aim objects on the heap), the probe
 //   (1) finds ALL Objective-C classes of the game library by scanning its data segments for class structs (no runtime API needed),
@@ -1445,6 +1445,7 @@ static const int    kDynShots    = 4;
 static const size_t kLnBlock     = 2048;
 static const size_t kLnN0Max     = 576;      // v5.3 log: slots of n0 above this changed like neighbouring heap junk; only limits the n0 dyn print
 static const int    kHMaxHits    = 6000;
+static const int    kHShiftPass  = 0;        // v5.4 log: shifts +-254.1 found nothing on the phone (6 s); 1 = run that second pass again
 static const int    kWatchMax    = 24;       // bodies watched after the heap-wide search
 static const size_t kWBefore     = 128, kWAfter = 384;
 
@@ -1686,9 +1687,9 @@ static bool w_read(Watch& w, std::vector<uint8_t>& out) {
     return rd(w.addr - w.before, out.data(), out.size());
 }
 
-static bool w_init(Watch& w) {
+static bool w_init(Watch& w, bool withBefore) {
     static const size_t geo[4][2] = {{kWBefore, kWAfter}, {0, kWAfter}, {0, 128}, {0, 16}};
-    for (int g = 0; g < 4; g++) {
+    for (int g = withBefore ? 0 : 1; g < 4; g++) {
         w.before = geo[g][0]; w.raw.assign(geo[g][0] + geo[g][1], 0);
         std::vector<uint8_t> t;
         if (w_read(w, t)) { w.raw.swap(t); return true; }
@@ -1726,16 +1727,129 @@ static void w_dyn(long dt, int shot) {
     }
 }
 
-static void w_context(const Watch& w) {
+static void ctx_rows(const char* tag, const std::vector<uint8_t>& raw, long before, size_t maxBytes) {
     std::vector<std::string> f32, f64;
     char b[64];
-    for (size_t k = 0; k + 4 <= w.raw.size(); k += 4) { snprintf(b, sizeof(b), "r%+ld:%.5g", (long)k - (long)w.before, (double)ln_f(w.raw, k)); f32.push_back(b); }
-    for (size_t k = 0; k + 8 <= w.raw.size(); k += 8) { snprintf(b, sizeof(b), "r%+ld:%.7g", (long)k - (long)w.before, ln_d(w.raw, k)); f64.push_back(b); }
-    char head[100];
-    snprintf(head, sizeof(head), "LSCAN wctx b%d(%c)@%lx f32:", w.body, w.kind, (unsigned long)w.addr);
+    size_t n = std::min(raw.size(), maxBytes);
+    for (size_t k = 0; k + 4 <= n; k += 4) { snprintf(b, sizeof(b), "r%+ld:%.5g", (long)k - before, (double)ln_f(raw, k)); f32.push_back(b); }
+    for (size_t k = 0; k + 8 <= n; k += 8) { snprintf(b, sizeof(b), "r%+ld:%.7g", (long)k - before, ln_d(raw, k)); f64.push_back(b); }
+    char head[140];
+    snprintf(head, sizeof(head), "LSCAN %s f32:", tag);
     log_chunked(head, f32);
-    snprintf(head, sizeof(head), "LSCAN wctx b%d(%c)@%lx f64:", w.body, w.kind, (unsigned long)w.addr);
+    snprintf(head, sizeof(head), "LSCAN %s f64:", tag);
     log_chunked(head, f64);
+}
+
+static void w_context(const Watch& w) {
+    char tag[100];
+    snprintf(tag, sizeof(tag), "wctx b%d(%c)@%lx", w.body, w.kind, (unsigned long)w.addr);
+    ctx_rows(tag, w.raw, (long)w.before, w.raw.size());
+}
+
+// what a heap pointer points to: C++ object (class name through RTTI), ObjC object, or plain heap data
+static std::string ptr_desc(u64 p) {
+    if (!ln_region_end(p)) return std::string();
+    u64 w0 = 0;
+    if (!rd(p, &w0, 8)) return "heap(unreadable)";
+    if (in_lib(w0)) { std::string r = ln_rtti(w0 - g_bias); return "vt:" + (r.empty() ? std::string("no-rtti") : r.substr(0, 110)); }
+    std::string c = obj_cname(p);
+    if (!c.empty()) return "objc:" + c;
+    return "heap";
+}
+
+// the link from the cocos node to the game's own model: pointer-looking words in the node's OWN ivar area (PuckNode / StrikerNode, after the CCNode part)
+static void node_ptr_scan(const std::vector<LBody>& bodies) {
+    std::set<u64> have;
+    for (const Watch& w : g_w) have.insert(w.addr);
+    for (int k = 0; k < 2; k++) {
+        u64 cls = g_cls[k == 0 ? C_PUCK : C_STRIKER];
+        char kind = k == 0 ? 'P' : 'S';
+        if (!cls) continue;
+        std::string cn = class_name_s(cls);
+        std::vector<IvInfo> own = class_ivars_own(cls, cn);
+        u64 isz = 0;
+        rd(cls + 40, &isz, 8);
+        int minOff = 1 << 30;
+        for (const IvInfo& iv : own) {
+            LOG("LSCAN ivown %s.%s type=%s off=%d", cn.c_str(), iv.name.c_str(), iv.type.substr(0, 90).c_str(), iv.off);
+            minOff = std::min(minOff, iv.off);
+        }
+        if (minOff == (1 << 30) || isz > 4096) continue;
+        int shown = 0;
+        for (const LBody& b : bodies) {
+            if (b.kind != kind || shown >= 3) continue;
+            shown++;
+            std::vector<std::string> items;
+            for (u64 off = (u64)minOff & ~7ull; off + 8 <= isz; off += 8) {
+                u64 p;
+                if (!rd(b.obj + off, &p, 8)) continue;
+                std::string d = ptr_desc(p);
+                if (d.empty()) continue;
+                char t[320];
+                snprintf(t, sizeof(t), "+%lu:%lx(%s)", (unsigned long)off, (unsigned long)p, d.c_str());
+                items.push_back(t);
+                bool skip = d.compare(0, 5, "objc:") == 0 || d.find("shared_ptr_pointer") != std::string::npos || have.count(p);
+                if (!skip && (int)g_w.size() < kWatchMax + 12) {
+                    Watch w; w.addr = p; w.body = b.idx; w.kind = kind; w.before = 0;
+                    if (w_init(w, false)) { g_w.push_back(w); have.insert(p); }
+                }
+            }
+            char head[100];
+            snprintf(head, sizeof(head), "LSCAN pw %c%d obj@%lx own-area pointers:", kind, b.idx, (unsigned long)b.obj);
+            log_chunked(head, items);
+        }
+    }
+}
+
+// exact-value search (no tolerance, no pairing): double bits equal to the node's x or y, and float(x) / float(y) bits. A double copied from the node matches in all 64 bits.
+struct XHit { u64 addr; int body; int axis; int type; };
+static bool xh_less(const XHit& a, const XHit& b) { return a.addr < b.addr; }
+static void heap_find_exact(const std::vector<LBody>& bodies, std::vector<XHit>& out, std::vector<Rng> ex) {
+    typedef std::pair<u64, int> PU;
+    std::vector<PU> d64, f32;
+    for (size_t i = 0; i < bodies.size(); i++) {
+        double c[2] = {lb_x(bodies[i]), lb_y(bodies[i])};
+        for (int ax = 0; ax < 2; ax++) {
+            u64 bits; memcpy(&bits, &c[ax], 8);
+            d64.push_back(PU(bits, (int)i * 2 + ax));
+            float f = (float)c[ax]; uint32_t fb; memcpy(&fb, &f, 4);
+            f32.push_back(PU((u64)fb, (int)i * 2 + ax));
+        }
+    }
+    std::sort(d64.begin(), d64.end()); std::sort(f32.begin(), f32.end());
+    ex.push_back(Rng((u64)(uintptr_t)d64.data(), (u64)(uintptr_t)d64.data() + d64.size() * sizeof(PU)));
+    ex.push_back(Rng((u64)(uintptr_t)f32.data(), (u64)(uintptr_t)f32.data() + f32.size() * sizeof(PU)));
+    std::vector<Reg> regs = heap_regions();
+    u64 bufLo = (u64)(uintptr_t)g_scanbuf, bufHi = bufLo + sizeof(g_scanbuf);
+    long chunks = 0;
+    for (const Reg& r : regs) {
+        for (u64 a = r.s; a < r.e; a += CH) {
+            size_t n = (size_t)std::min<u64>(CH, r.e - a) & ~(size_t)3;
+            if (n < 8 || !rd(a, g_scanbuf, n)) continue;
+            for (size_t i = 0; i + 4 <= n; i += 4) {
+                uint32_t w32; memcpy(&w32, g_scanbuf + i, 4);
+                if (w32 == 0) { if (i + 8 > n || (i & 7)) continue; }
+                u64 addr = a + i;
+                if (addr >= bufLo && addr < bufHi) continue;
+                std::vector<PU>::iterator it = std::lower_bound(f32.begin(), f32.end(), PU((u64)w32, -1));
+                for (; it != f32.end() && it->first == (u64)w32; ++it) {
+                    if (in_ranges(addr, ex)) continue;
+                    XHit h; h.addr = addr; h.body = it->second / 2; h.axis = it->second % 2; h.type = 0;
+                    if ((int)out.size() < 4000) out.push_back(h);
+                }
+                if ((i & 7) == 0 && i + 8 <= n) {
+                    u64 w64; memcpy(&w64, g_scanbuf + i, 8);
+                    std::vector<PU>::iterator jt = std::lower_bound(d64.begin(), d64.end(), PU(w64, -1));
+                    for (; jt != d64.end() && jt->first == w64; ++jt) {
+                        if (in_ranges(addr, ex)) continue;
+                        XHit h; h.addr = addr; h.body = jt->second / 2; h.axis = jt->second % 2; h.type = 1;
+                        if ((int)out.size() < 4000) out.push_back(h);
+                    }
+                }
+            }
+            if ((++chunks & 127) == 0) usleep(1500);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- main scan
@@ -1811,9 +1925,27 @@ static bool run_logic_scan() {
         (unsigned long)logic, off, (int)g_ln.size(), (int)bodies.size(), nS, nP, (unsigned long)g_bias);
     for (size_t i = 0; i < g_ln.size(); i++) {
         const LNode& n = g_ln[i];
-        if (n.depth <= 1) {
+        std::string rt = ln_rtti(n.vt);
+        bool libcxx = rt.compare(0, 6, "NSt6__") == 0 || rt.compare(0, 3, "ZZN") == 0;
+        if (n.depth <= 1 || (!rt.empty() && !libcxx))
+            LOG("LSCAN node n%zu@%lx depth=%d from=n%d+%d vt_rva=0x%lx rtti=%s", i, (unsigned long)n.addr, n.depth, n.from, n.fromOff, (unsigned long)n.vt, rt.empty() ? "-" : rt.substr(0, 110).c_str());
+    }
+    for (const LBody& b : bodies) {
+        double x = lb_x(b), y = lb_y(b);
+        LOG("LSCAN bpos b%d %c obj@%lx x=%.17g y=%.17g float_exact=%d", b.idx, b.kind, (unsigned long)b.obj, x, y, (int)((double)(float)x == x && (double)(float)y == y));
+    }
+    // raw look at the TableLogic block itself and at readable C++ classes next to it (not libc++ internals)
+    {
+        int shownCtx = 0;
+        for (size_t i = 0; i < g_ln.size() && shownCtx < 6; i++) {
+            const LNode& n = g_ln[i];
             std::string rt = ln_rtti(n.vt);
-            LOG("LSCAN node n%zu@%lx depth=%d from=n%d+%d vt_rva=0x%lx rtti=%s", i, (unsigned long)n.addr, n.depth, n.from, n.fromOff, (unsigned long)n.vt, rt.empty() ? "-" : rt.c_str());
+            bool libcxx = rt.compare(0, 6, "NSt6__") == 0 || rt.compare(0, 3, "ZZN") == 0;
+            if (i != 0 && (rt.empty() || libcxx || n.depth > 1)) continue;
+            char tg[60]; snprintf(tg, sizeof(tg), "nctx n%zu", i);
+            ctx_rows(tg, n.raw, 0, i == 0 ? 320 : 256);
+            int cc = 0; consts_in(n.raw.size() > 256 ? std::vector<uint8_t>(n.raw.begin(), n.raw.begin() + 256) : n.raw, tg, 0, cc, 20);
+            shownCtx++;
         }
     }
     int ch = 0;
@@ -1843,7 +1975,7 @@ static bool run_logic_scan() {
     LOG("LSCAN heap search shift 0: %d hits in %ld ms", (int)hh.size(), now_ms() - h0);
     std::vector<HHit> best;
     bool found = h_pick_best(hh, best);
-    if (!found) {
+    if (!found && kHShiftPass) {
         h0 = now_ms();
         std::vector<HHit> h2;
         heap_find_positions(bodies, 1, 3, h2, ex);
@@ -1860,16 +1992,51 @@ static bool run_logic_scan() {
         for (const HHit& h : best) {
             if ((int)g_w.size() >= kWatchMax) break;
             Watch w; w.addr = h.addr; w.body = h.body; w.kind = bodies[h.body].kind; w.before = 0;
-            if (w_init(w)) g_w.push_back(w);
+            if (w_init(w, true)) g_w.push_back(w);
         }
         LOG("LSCAN watching %d windows (%zu bytes before / %zu after the matched x where readable)", (int)g_w.size(), kWBefore, kWAfter);
         int wc = 0;
         for (const Watch& w : g_w) { char tg[40]; snprintf(tg, sizeof(tg), "b%d@%lx", w.body, (unsigned long)w.addr); consts_in(w.raw, tg, (long)w.before, wc, 80); }
         LOG("LSCAN const hits next to bodies: %d", wc);
         for (size_t i = 0; i < g_w.size() && i < 2; i++) w_context(g_w[i]);
-        g_wReady = !g_w.empty();
     } else {
-        LOG("LSCAN: no body array found by position (scales 1, 0.1, 0.01, 1/32; shifts 0, +-254.1). Next: other origin / fixed point, or follow the dyn output.");
+        LOG("LSCAN: no body array found by plain (x,y) pairs (scales 1, 0.1, 0.01, 1/32, shift 0). Trying exact single values and the node's own pointers.");
+    }
+    {   // exact single-value search (double bits / float bits), results grouped per body
+        long e0 = now_ms();
+        std::vector<XHit> xh;
+        heap_find_exact(bodies, xh, ex);
+        std::sort(xh.begin(), xh.end(), xh_less);
+        LOG("LSCAN exact search: %d hits in %ld ms", (int)xh.size(), now_ms() - e0);
+        std::map<int, std::vector<int> > cnt;
+        for (const XHit& h : xh) { std::vector<int>& c = cnt[h.body]; if (c.empty()) c.assign(4, 0); c[h.type * 2 + h.axis]++; }
+        for (auto& kv : cnt) LOG("LSCAN xcount b%d f32x=%d f32y=%d f64x=%d f64y=%d", kv.first, kv.second[0], kv.second[1], kv.second[2], kv.second[3]);
+        std::vector<std::string> items; char b[80];
+        for (size_t i = 0; i < xh.size() && i < 80; i++) {
+            snprintf(b, sizeof(b), "%lx(b%d %c %s)", (unsigned long)xh[i].addr, xh[i].body, xh[i].axis ? 'y' : 'x', xh[i].type ? "f64" : "f32");
+            items.push_back(b);
+        }
+        log_chunked("LSCAN xhit (address order):", items);
+        // x and y of the SAME body within 512 bytes of each other, same type
+        int pairs = 0;
+        for (size_t i = 0; i < xh.size() && pairs < 40; i++) {
+            if (xh[i].axis != 0) continue;
+            for (size_t j = 0; j < xh.size(); j++) {
+                if (xh[j].axis != 1 || xh[j].body != xh[i].body || xh[j].type != xh[i].type) continue;
+                long d = (long)xh[j].addr - (long)xh[i].addr;
+                if (d > 512 || d < -512) continue;
+                LOG("LSCAN xpair b%d %s x@%lx y@%lx dy=%+ld", xh[i].body, xh[i].type ? "f64" : "f32", (unsigned long)xh[i].addr, (unsigned long)xh[j].addr, d);
+                pairs++;
+            }
+        }
+    }
+    node_ptr_scan(bodies);
+    g_wReady = !g_w.empty();
+    if (g_wReady) {
+        LOG("LSCAN watching %d windows in total", (int)g_w.size());
+        // windows that came from node pointers: show the first two raw
+        int sh = 0;
+        for (const Watch& w : g_w) { if (w.before == 0 && sh < 2) { w_context(w); sh++; } }
     }
     g_lnReady = true;
     LOG("LSCAN end: %ld ms. Changed slots follow after the next %d shots (LSCAN wdyn / LSCAN dyn).", now_ms() - t0, kDynShots);
@@ -2067,7 +2234,7 @@ static void* worker(void*) {
 }
 
 __attribute__((constructor)) static void init() {
-    LOG("carprobe v5.4 loaded (prediction + logic scan %s, ObjC dump %s; test write kTestMaxGuides=%d)", kLogicScan ? "ON" : "off", kDumpEnabled ? "ON" : "off", kTestMaxGuides);
+    LOG("carprobe v5.5 loaded (prediction + logic scan %s, ObjC dump %s; test write kTestMaxGuides=%d)", kLogicScan ? "ON" : "off", kDumpEnabled ? "ON" : "off", kTestMaxGuides);
     pthread_t th;
     pthread_create(&th, nullptr, worker, nullptr);
     pthread_detach(th);
