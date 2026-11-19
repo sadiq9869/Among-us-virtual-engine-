@@ -9,6 +9,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Handler
@@ -20,41 +21,38 @@ import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
-import android.widget.CheckBox
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 
 /**
- * JNI bridge to libcarprobe.so (Bcore/src/main/cpp/carprobe/carprobe.cpp, v5).
+ * JNI bridge to libcarprobe.so (Bcore/src/main/cpp/carprobe/carprobe.cpp, v6.0).
  * The C++ functions are named Java_top_niunaijun_blackboxa_menu_NativeCarrom_<method>, so this object's
  * package, name and method names must not change. (Keep rule in app/proguard-rules.pro.)
  */
 object NativeCarrom {
     external fun setEnabled(on: Int)
-    // frictionPercent 50..150, maxBounces 0..5, deflection 0/1, recon 0/1 (shot-recording logs for tuning)
+    // frictionPercent 50..150, maxBounces 0..5, deflection 0/1, recon 0/1 (values outside the range are clamped by the native side)
     external fun setOptions(frictionPercent: Int, maxBounces: Int, deflection: Int, recon: Int)
     // [designW, designH, nPaths, {type, nPoints, x, y, ...}...] in design points, y up.
     // type 0 striker (white), 1 coin hit by the striker (red), 2 striker remainder (thin white), 5 coin moved by another coin (orange),
-    // 3 ring "coin potted" (2 points: centre, point on the ring), 4 ring "striker potted = foul".
+    // 3 ring "coin potted" (2 points: centre, point on the ring), 4 ring "striker potted = foul",
+    // 6 ghost: striker where it stops, 7 ghost: coin where it stops, 8 ghost: striker at the first contact (all three: centre + point on the ring).
     external fun lines(): FloatArray
     external fun statusText(): String
+    // text of the last <= 20 shots: start state, predicted ends, real ends, errors (empty string = no shot yet)
+    external fun consoleText(): String
 }
 
 /**
  * Draws the prediction lines. It never consumes touches: the player aims through it.
  * Pixel mapping: the box of the game's SurfaceView (or this view if none is found) is the design area,
  *   px = left + x / designW * w ,  py = top + (designH - y) / designH * h
- * then the user calibration (offset in px, scale in percent around the centre of that box) is applied.
  */
 class CarromLineView(context: Context) : View(context) {
     @Volatile var data: FloatArray = FloatArray(0)
-    var calX = 0f
-    var calY = 0f
-    var calScalePct = 100
     var surface: View? = null
 
     private val density = context.resources.displayMetrics.density
@@ -65,32 +63,46 @@ class CarromLineView(context: Context) : View(context) {
     private val orange = Paint(Paint.ANTI_ALIAS_FLAG)
     private val ringOk = Paint(Paint.ANTI_ALIAS_FLAG)
     private val ringFoul = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val ghostStrikerLine = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val ghostStrikerFill = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val ghostCoinLine = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val ghostCoinFill = Paint(Paint.ANTI_ALIAS_FLAG)
     private val path = Path()
+    private val loc = IntArray(2)
+    private val locSelf = IntArray(2)
 
     init {
         isClickable = false
         isFocusable = false
         isFocusableInTouchMode = false
         setWillNotDraw(false)
-        for (p in listOf(shadow, white, red, thin, orange, ringOk, ringFoul)) {
+        for (p in listOf(shadow, white, red, thin, orange, ringOk, ringFoul, ghostStrikerLine, ghostCoinLine)) {
             p.style = Paint.Style.STROKE
             p.strokeJoin = Paint.Join.ROUND
             p.strokeCap = Paint.Cap.ROUND
         }
+        ghostStrikerFill.style = Paint.Style.FILL
+        ghostCoinFill.style = Paint.Style.FILL
         shadow.color = Color.argb(110, 0, 0, 0)
-        shadow.strokeWidth = 7f * density
+        shadow.strokeWidth = 5.5f * density
         white.color = Color.WHITE
-        white.strokeWidth = 4f * density
+        white.strokeWidth = 3f * density
         red.color = Color.rgb(235, 40, 40)
-        red.strokeWidth = 4f * density
+        red.strokeWidth = 3f * density
         thin.color = Color.argb(215, 255, 255, 255)
-        thin.strokeWidth = 2.5f * density
+        thin.strokeWidth = 2f * density
         orange.color = Color.rgb(255, 150, 30)
-        orange.strokeWidth = 3.5f * density
+        orange.strokeWidth = 2.5f * density
         ringOk.color = Color.rgb(60, 220, 110)
         ringOk.strokeWidth = 3.5f * density
         ringFoul.color = Color.rgb(255, 60, 60)
         ringFoul.strokeWidth = 4.5f * density
+        ghostStrikerLine.color = Color.argb(230, 255, 255, 255)
+        ghostStrikerLine.strokeWidth = 2f * density
+        ghostStrikerFill.color = Color.argb(55, 255, 255, 255)
+        ghostCoinLine.color = Color.argb(235, 255, 90, 90)
+        ghostCoinLine.strokeWidth = 2f * density
+        ghostCoinFill.color = Color.argb(50, 255, 80, 80)
     }
 
     override fun onTouchEvent(event: MotionEvent?): Boolean = false
@@ -108,18 +120,13 @@ class CarromLineView(context: Context) : View(context) {
         var h = height.toFloat()
         val s = surface
         if (s != null && s.isAttachedToWindow && s.width > 0 && s.height > 0) {
-            val a = IntArray(2)
-            val b = IntArray(2)
-            s.getLocationOnScreen(a)
-            getLocationOnScreen(b)
-            left = (a[0] - b[0]).toFloat()
-            top = (a[1] - b[1]).toFloat()
+            s.getLocationOnScreen(loc)
+            getLocationOnScreen(locSelf)
+            left = (loc[0] - locSelf[0]).toFloat()
+            top = (loc[1] - locSelf[1]).toFloat()
             w = s.width.toFloat()
             h = s.height.toFloat()
         }
-        val cs = calScalePct / 100f
-        val cx = left + w / 2f
-        val cy = top + h / 2f
 
         val nPaths = d[2].toInt()
         var i = 3
@@ -137,28 +144,40 @@ class CarromLineView(context: Context) : View(context) {
             for (j in 0 until n) {
                 val x = d[i + 2 * j]
                 val y = d[i + 2 * j + 1]
-                var px = left + x / designW * w
-                var py = top + (designH - y) / designH * h
-                px = cx + (px - cx) * cs + calX
-                py = cy + (py - cy) * cs + calY
+                val px = left + x / designW * w
+                val py = top + (designH - y) / designH * h
                 if (j == 0) { path.moveTo(px, py); rx0 = px; ry0 = py } else path.lineTo(px, py)
                 if (j == 1) { rx1 = px; ry1 = py }
             }
             i += 2 * n
-            if (type == 3 || type == 4) {
-                val rad = Math.hypot((rx1 - rx0).toDouble(), (ry1 - ry0).toDouble()).toFloat()
-                canvas.drawCircle(rx0, ry0, rad, if (type == 4) ringFoul else ringOk)
-            } else {
-                canvas.drawPath(path, shadow)
-                canvas.drawPath(path, when (type) { 1 -> red; 2 -> thin; 5 -> orange; else -> white })
+            when (type) {
+                3, 4 -> {
+                    val rad = Math.hypot((rx1 - rx0).toDouble(), (ry1 - ry0).toDouble()).toFloat()
+                    canvas.drawCircle(rx0, ry0, rad, if (type == 4) ringFoul else ringOk)
+                }
+                6, 8 -> {
+                    val rad = Math.hypot((rx1 - rx0).toDouble(), (ry1 - ry0).toDouble()).toFloat()
+                    canvas.drawCircle(rx0, ry0, rad, ghostStrikerFill)
+                    canvas.drawCircle(rx0, ry0, rad, ghostStrikerLine)
+                }
+                7 -> {
+                    val rad = Math.hypot((rx1 - rx0).toDouble(), (ry1 - ry0).toDouble()).toFloat()
+                    canvas.drawCircle(rx0, ry0, rad, ghostCoinFill)
+                    canvas.drawCircle(rx0, ry0, rad, ghostCoinLine)
+                }
+                else -> {
+                    canvas.drawPath(path, shadow)
+                    canvas.drawPath(path, when (type) { 1 -> red; 2 -> thin; 5 -> orange; else -> white })
+                }
             }
         }
     }
 }
 
 /**
- * In-game menu for Carrom Pool (com.miniclip.carrom): a small draggable "C" button, a panel with the
- * prediction on/off button, and the full-screen line overlay. Started from BlackBoxLoader.afterApplicationOnCreate.
+ * In-game menu for Carrom Pool (com.miniclip.carrom): a small draggable "C" button; its panel has only the
+ * prediction on/off button and a console box (last shots: prediction vs. real result) with Copy and Close buttons.
+ * Plus the full-screen line overlay. Started from BlackBoxLoader.afterApplicationOnCreate.
  */
 object CarromMenu {
     private const val TAG = "CarromMenu"
@@ -168,30 +187,14 @@ object CarromMenu {
     private var registered = false
     private val ui = Handler(Looper.getMainLooper())
 
-    // settings (saved in SharedPreferences, best effort)
     private var enabled = true
-    private var frictionPct = 100
-    private var maxBounces = 3
-    private var deflection = true
-    private var recon = true
-    private var calX = 0
-    private var calY = 0
-    private var calScale = 100
 
     private fun dp(activity: Activity, v: Int): Int =
         (v * activity.resources.displayMetrics.density + 0.5f).toInt()
 
     private fun loadPrefs(activity: Activity) {
         try {
-            val p = activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            enabled = p.getBoolean("enabled", true)
-            frictionPct = p.getInt("friction", 100).coerceIn(50, 150)
-            maxBounces = p.getInt("bounces", 3).coerceIn(0, 5)
-            deflection = p.getBoolean("deflection", true)
-            recon = p.getBoolean("recon", true)
-            calX = p.getInt("calX", 0).coerceIn(-600, 600)
-            calY = p.getInt("calY", 0).coerceIn(-600, 600)
-            calScale = p.getInt("calScale", 100).coerceIn(50, 150)
+            enabled = activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("enabled", true)
         } catch (t: Throwable) {
             Log.w(TAG, "prefs load failed: $t")
         }
@@ -199,25 +202,17 @@ object CarromMenu {
 
     private fun savePrefs(activity: Activity) {
         try {
-            activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .putBoolean("enabled", enabled)
-                .putInt("friction", frictionPct)
-                .putInt("bounces", maxBounces)
-                .putBoolean("deflection", deflection)
-                .putBoolean("recon", recon)
-                .putInt("calX", calX)
-                .putInt("calY", calY)
-                .putInt("calScale", calScale)
-                .apply()
+            activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("enabled", enabled).apply()
         } catch (t: Throwable) {
             Log.w(TAG, "prefs save failed: $t")
         }
     }
 
+    // friction 100 %, 5 wall bounces, striker line after the hit on, shot recording on (the console needs it)
     private fun pushToNative() {
         try {
             NativeCarrom.setEnabled(if (enabled) 1 else 0)
-            NativeCarrom.setOptions(frictionPct, maxBounces, if (deflection) 1 else 0, if (recon) 1 else 0)
+            NativeCarrom.setOptions(100, 5, 1, 1)
         } catch (t: Throwable) {
             Log.e(TAG, "native call failed (is libcarprobe loaded?): $t")
         }
@@ -228,6 +223,13 @@ object CarromMenu {
             NativeCarrom.statusText()
         } catch (t: Throwable) {
             "Native library not loaded ($t)"
+        }
+
+    private fun readConsole(): String =
+        try {
+            NativeCarrom.consoleText()
+        } catch (t: Throwable) {
+            ""
         }
 
     private fun findSurface(v: View): SurfaceView? {
@@ -241,40 +243,6 @@ object CarromMenu {
         }
         walk(v)
         return best
-    }
-
-    // Copies the probe's shot lines (BURST / AIM released / PRED) from this process's own logcat to the clipboard,
-    // so they can be pasted into the chat without adb. Keeps the last 500 lines, at most 200000 characters.
-    private fun copyShotLog(activity: Activity) {
-        Thread {
-            val msg: String = try {
-                val p = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "raw", "-s", "CARPROBE1:V"))
-                val raw = p.inputStream.bufferedReader().readLines()
-                p.destroy()
-                val keep = raw.filter {
-                    it.startsWith("BURST") || it.startsWith("B ") || it.startsWith("AIM released") || it.startsWith("PRED")
-                }
-                val tail = if (keep.size > 500) keep.takeLast(500) else keep
-                val joined = tail.joinToString("\n")
-                val text = if (joined.length > 200000) joined.takeLast(200000) else joined
-                if (tail.isEmpty()) {
-                    "No shot lines in logcat yet (take a shot first)"
-                } else {
-                    ui.post {
-                        try {
-                            val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            cm.setPrimaryClip(ClipData.newPlainText("carrom shot log", text))
-                        } catch (t: Throwable) {
-                            Log.e(TAG, "clipboard failed: $t")
-                        }
-                    }
-                    "Copied ${tail.size} lines - paste them in the chat"
-                }
-            } catch (t: Throwable) {
-                "Copy failed: $t"
-            }
-            ui.post { Toast.makeText(activity, msg, Toast.LENGTH_LONG).show() }
-        }.start()
     }
 
     fun init(application: Application?) {
@@ -328,25 +296,22 @@ object CarromMenu {
 
         // ---- line layer (below the button and the panel, never takes touches)
         val lineView = CarromLineView(activity)
-        lineView.calX = calX.toFloat()
-        lineView.calY = calY.toFloat()
-        lineView.calScalePct = calScale
         overlay.addView(lineView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
-        // ---- panel
+        // ---- panel: title, ON/OFF button, console box, Copy + Close
         val panel = LinearLayout(activity)
         panel.orientation = LinearLayout.VERTICAL
         val bg = GradientDrawable()
-        bg.setColor(Color.argb(235, 24, 26, 33))
+        bg.setColor(Color.argb(240, 24, 26, 33))
         bg.cornerRadius = dp(activity, 12).toFloat()
         bg.setStroke(dp(activity, 1), Color.argb(255, 90, 94, 110))
         panel.background = bg
-        panel.setPadding(dp(activity, 12), dp(activity, 12), dp(activity, 12), dp(activity, 12))
+        panel.setPadding(dp(activity, 10), dp(activity, 10), dp(activity, 10), dp(activity, 10))
 
         val title = TextView(activity)
-        title.text = "Carrom Menu - prediction line"
+        title.text = "Carrom prediction"
         title.setTextColor(Color.WHITE)
-        title.textSize = 16f
+        title.textSize = 15f
         panel.addView(title)
 
         val toggle = Button(activity)
@@ -372,134 +337,77 @@ object CarromMenu {
             lineView.invalidate()
         }
 
-        val status = TextView(activity)
-        status.setTextColor(Color.argb(255, 190, 195, 210))
-        status.textSize = 11f
-        status.text = readStatus()
-        val statusLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        statusLp.topMargin = dp(activity, 6)
-        statusLp.bottomMargin = dp(activity, 6)
-        panel.addView(status, statusLp)
+        // console box: one status line, then the last shots (newest at the bottom)
+        val dm = activity.resources.displayMetrics
+        val consoleText = TextView(activity)
+        consoleText.setTextColor(Color.argb(255, 170, 235, 180))
+        consoleText.typeface = Typeface.MONOSPACE
+        consoleText.textSize = 9.5f
+        consoleText.setPadding(dp(activity, 6), dp(activity, 4), dp(activity, 6), dp(activity, 4))
+        val consoleBg = GradientDrawable()
+        consoleBg.setColor(Color.argb(255, 8, 10, 14))
+        consoleBg.cornerRadius = dp(activity, 6).toFloat()
+        consoleBg.setStroke(dp(activity, 1), Color.argb(255, 60, 64, 78))
+        val consoleScroll = ScrollView(activity)
+        consoleScroll.background = consoleBg
+        consoleScroll.addView(consoleText)
+        val consoleLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (dm.heightPixels * 0.42f).toInt())
+        consoleLp.topMargin = dp(activity, 8)
+        panel.addView(consoleScroll, consoleLp)
 
-        fun label(text: String): TextView {
-            val t = TextView(activity)
-            t.text = text
-            t.setTextColor(Color.WHITE)
-            t.textSize = 12f
-            return t
+        var lastConsole = "\u0000"
+        var lastStatus = ""
+        fun refreshConsole(force: Boolean) {
+            val log = readConsole()
+            val st = readStatus()
+            if (!force && log == lastConsole && st == lastStatus) return
+            val grew = log != lastConsole
+            lastConsole = log
+            lastStatus = st
+            consoleText.text = "STATUS: $st\n\n" + (if (log.isEmpty()) "No shot recorded yet. Take a shot with prediction ON." else log)
+            if (grew) consoleScroll.post { consoleScroll.fullScroll(View.FOCUS_DOWN) }
         }
 
-        // friction slider 50..150 %
-        val fricLabel = label("Friction: $frictionPct %  (lower = lines run longer)")
-        panel.addView(fricLabel)
-        val fricBar = SeekBar(activity)
-        fricBar.max = 100
-        fricBar.progress = frictionPct - 50
-        panel.addView(fricBar)
-        fricBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                frictionPct = 50 + p
-                fricLabel.text = "Friction: $frictionPct %  (lower = lines run longer)"
-                if (fromUser) pushToNative()
-            }
-            override fun onStartTrackingTouch(sb: SeekBar?) {}
-            override fun onStopTrackingTouch(sb: SeekBar?) { pushToNative(); savePrefs(activity) }
-        })
-
-        // bounces slider 0..5
-        val bounceLabel = label("Wall bounces drawn: $maxBounces")
-        panel.addView(bounceLabel)
-        val bounceBar = SeekBar(activity)
-        bounceBar.max = 5
-        bounceBar.progress = maxBounces
-        panel.addView(bounceBar)
-        bounceBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                maxBounces = p
-                bounceLabel.text = "Wall bounces drawn: $maxBounces"
-                if (fromUser) pushToNative()
-            }
-            override fun onStartTrackingTouch(sb: SeekBar?) {}
-            override fun onStopTrackingTouch(sb: SeekBar?) { pushToNative(); savePrefs(activity) }
-        })
-
-        val defl = CheckBox(activity)
-        defl.text = "Short striker line after the hit"
-        defl.setTextColor(Color.WHITE)
-        defl.textSize = 12f
-        defl.isChecked = deflection
-        defl.setOnCheckedChangeListener { _, c -> deflection = c; pushToNative(); savePrefs(activity) }
-        panel.addView(defl)
-
-        val rec = CheckBox(activity)
-        rec.text = "Log shots to logcat (for tuning)"
-        rec.setTextColor(Color.WHITE)
-        rec.textSize = 12f
-        rec.isChecked = recon
-        rec.setOnCheckedChangeListener { _, c -> recon = c; pushToNative(); savePrefs(activity) }
-        panel.addView(rec)
-
-        // calibration rows
-        val calLabel = label("Line position calibration (move the line until it starts exactly at the striker)")
-        calLabel.textSize = 11f
-        val calLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        calLp.topMargin = dp(activity, 6)
-        panel.addView(calLabel, calLp)
-
-        fun applyCal() {
-            lineView.calX = calX.toFloat()
-            lineView.calY = calY.toFloat()
-            lineView.calScalePct = calScale
-            lineView.invalidate()
-            savePrefs(activity)
-        }
-
-        fun calRow(name: String, getter: () -> Int, step: Int, change: (Int) -> Unit, unit: String) {
-            val row = LinearLayout(activity)
-            row.orientation = LinearLayout.HORIZONTAL
-            row.gravity = Gravity.CENTER_VERTICAL
-            val t = label("$name ${getter()}$unit")
-            row.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            val minus = Button(activity)
-            minus.text = "-"
-            styleButton(activity, minus)
-            val plus = Button(activity)
-            plus.text = "+"
-            styleButton(activity, plus)
-            minus.setOnClickListener { change(-step); t.text = "$name ${getter()}$unit"; applyCal() }
-            plus.setOnClickListener { change(step); t.text = "$name ${getter()}$unit"; applyCal() }
-            row.addView(minus, LinearLayout.LayoutParams(dp(activity, 48), dp(activity, 34)))
-            row.addView(plus, LinearLayout.LayoutParams(dp(activity, 48), dp(activity, 34)))
-            panel.addView(row)
-        }
-        calRow("X offset", { calX }, 2, { calX = (calX + it).coerceIn(-600, 600) }, " px")
-        calRow("Y offset", { calY }, 2, { calY = (calY + it).coerceIn(-600, 600) }, " px")
-        calRow("Scale", { calScale }, 1, { calScale = (calScale + it).coerceIn(50, 150) }, " %")
-
+        val btnRow = LinearLayout(activity)
+        btnRow.orientation = LinearLayout.HORIZONTAL
         val copyBtn = Button(activity)
-        copyBtn.text = "Copy shot log (paste in chat)"
+        copyBtn.text = "Copy"
         styleButton(activity, copyBtn)
-        copyBtn.setOnClickListener { copyShotLog(activity) }
-        val copyLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        copyLp.topMargin = dp(activity, 8)
-        panel.addView(copyBtn, copyLp)
-
         val closeBtn = Button(activity)
         closeBtn.text = "Close"
         styleButton(activity, closeBtn)
-        val closeLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        closeLp.topMargin = dp(activity, 8)
-        panel.addView(closeBtn, closeLp)
+        val half1 = LinearLayout.LayoutParams(0, dp(activity, 38), 1f)
+        half1.rightMargin = dp(activity, 4)
+        val half2 = LinearLayout.LayoutParams(0, dp(activity, 38), 1f)
+        half2.leftMargin = dp(activity, 4)
+        btnRow.addView(copyBtn, half1)
+        btnRow.addView(closeBtn, half2)
+        val rowLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        rowLp.topMargin = dp(activity, 8)
+        panel.addView(btnRow, rowLp)
 
-        val scroll = ScrollView(activity)
-        scroll.visibility = View.GONE
-        scroll.addView(panel)
-        val dm = activity.resources.displayMetrics
-        val scrollLp = FrameLayout.LayoutParams(dp(activity, 290), (dm.heightPixels * 0.78f).toInt())
-        scrollLp.gravity = Gravity.TOP or Gravity.START
-        scrollLp.leftMargin = dp(activity, 16)
-        scrollLp.topMargin = dp(activity, 64)
-        overlay.addView(scroll, scrollLp)
+        val panelLp = FrameLayout.LayoutParams(minOf(dp(activity, 330), (dm.widthPixels * 0.94f).toInt()), ViewGroup.LayoutParams.WRAP_CONTENT)
+        panelLp.gravity = Gravity.TOP or Gravity.START
+        panelLp.leftMargin = dp(activity, 8)
+        panelLp.topMargin = dp(activity, 64)
+        panel.visibility = View.GONE
+        overlay.addView(panel, panelLp)
+
+        copyBtn.setOnClickListener {
+            try {
+                refreshConsole(true)
+                val log = readConsole()
+                val text = "STATUS: " + readStatus() + "\n\n" + log
+                val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("carrom shot console", text))
+                val shots = if (log.isEmpty()) 0 else log.split("\n\n").size
+                Toast.makeText(activity, if (shots == 0) "Copied status only (no shot yet)" else "Copied $shots shot(s) - paste in the chat", Toast.LENGTH_LONG).show()
+            } catch (t: Throwable) {
+                Log.e(TAG, "copy failed: $t")
+                Toast.makeText(activity, "Copy failed: $t", Toast.LENGTH_LONG).show()
+            }
+        }
+        closeBtn.setOnClickListener { panel.visibility = View.GONE }
 
         // ---- draggable round button
         val size = dp(activity, 44)
@@ -548,11 +456,11 @@ object CarromMenu {
                 }
                 MotionEvent.ACTION_UP -> {
                     if (!dragged) {
-                        if (scroll.visibility == View.VISIBLE) {
-                            scroll.visibility = View.GONE
+                        if (panel.visibility == View.VISIBLE) {
+                            panel.visibility = View.GONE
                         } else {
-                            status.text = readStatus()
-                            scroll.visibility = View.VISIBLE
+                            refreshConsole(true)
+                            panel.visibility = View.VISIBLE
                         }
                     }
                     true
@@ -560,25 +468,25 @@ object CarromMenu {
                 else -> false
             }
         }
-        closeBtn.setOnClickListener { scroll.visibility = View.GONE }
 
-        // ---- refresh: lines about every 33 ms, status text once a second while the panel is open, surface lookup every 2 s
+        // ---- refresh: lines about every 16 ms (redraw only when they changed), console about once a second while the panel is open
         val refresher = object : Runnable {
             var n = 0
             override fun run() {
                 if (overlay.parent == null) return
                 try {
-                    if (n % 60 == 0) lineView.surface = findSurface(root)
+                    if (n % 120 == 0) lineView.surface = findSurface(root)
                     val arr = if (enabled) NativeCarrom.lines() else FloatArray(0)
-                    val had = lineView.data.isNotEmpty()
-                    lineView.data = arr
-                    if (arr.isNotEmpty() || had) lineView.invalidate()
-                    if (scroll.visibility == View.VISIBLE && n % 30 == 0) status.text = readStatus()
+                    if (!java.util.Arrays.equals(arr, lineView.data)) {
+                        lineView.data = arr
+                        lineView.invalidate()
+                    }
+                    if (panel.visibility == View.VISIBLE && n % 60 == 0) refreshConsole(false)
                 } catch (t: Throwable) {
                     if (n % 300 == 0) Log.e(TAG, "refresh failed: $t")
                 }
                 n++
-                ui.postDelayed(this, 33)
+                ui.postDelayed(this, 16)
             }
         }
 
@@ -586,6 +494,6 @@ object CarromMenu {
             overlay,
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         )
-        ui.postDelayed(refresher, 33)
+        ui.postDelayed(refresher, 16)
     }
 }
