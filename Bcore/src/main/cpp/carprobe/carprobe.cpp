@@ -1,3 +1,9 @@
+// carprobe.cpp  v6.0 = v5.5 prediction + (a) the line now runs to where the striker / coins are predicted to stop, with ghost circles
+//   (striker at first contact = type 8, striker at its stop = type 6, moved coins at their stop = type 7);
+//   (b) the last prediction stays on screen while the shot runs (+2 s) so it can be compared with the real result;
+//   (c) SHOT CONSOLE: after every shot of the player the probe reads the real end positions and stores one compact block
+//       (start state, predicted ends, real ends, errors) of the last 20 shots; Kotlin shows/copies it (NativeCarrom.consoleText);
+//   (d) the one-time logic scan is off (kLogicScan = 0). Physics numbers are still the FITTED round-2 values (nothing read from the game).
 // carprobe.cpp  v5.5 = v5.2 + LOGIC SCAN: heap-wide body search, exact-value search, RTTI names, PuckNode pointer watches (see the v5.4 block; ObjC dump off by default).
 // (older header v5.2) = v5.1 prediction (round-2 physics, coin-coin, pockets, foul) + READ-ONLY DUMP MODE.
 //   NEW in v5.2: DUMP MODE. Once per game start, the first time a match is found (coins + aim objects on the heap), the probe
@@ -629,7 +635,7 @@ static bool same_items(const std::vector<Item>& a, const std::vector<Item>& b) {
 // ---- settings (set from Kotlin through JNI)
 static std::atomic<int> g_enabled{0};       // prediction on/off (the Kotlin button)
 static std::atomic<int> g_fricPct{100};     // friction multiplier in percent (tuning slider)
-static std::atomic<int> g_maxBounces{3};    // wall bounces drawn per path
+static std::atomic<int> g_maxBounces{6};    // wall bounces drawn per path (v6.0: the line runs to where the body stops)
 static std::atomic<int> g_deflect{1};       // draw the short striker remainder after the hit
 static std::atomic<int> g_recon{1};         // 1 = keep the old shot-recording logs (BURST lines) for tuning
 
@@ -658,7 +664,7 @@ static const double kPocketRing         = 22.0;   // drawn ring radius around a 
 static const double kAimTol        = 3.0;      // LOCAL._center must be this close to a table striker
 static const int    kMaxFrames     = 700;
 static const double kStopSpeed     = 0.05;
-static const double kDeflectMaxLen = 120.0;    // the short striker remainder after the hit is cut at this length
+static const double kDeflectMaxLen = 1.0e9;    // v6.0: the striker line after the hit is no longer cut (was 120): it runs to the predicted stop
 static const double kBoardBound    = 260.0;    // coins outside +-this are ignored (garbage / flying in)
 
 struct V2 { double x, y; };
@@ -981,26 +987,49 @@ static double launch_speed(double dist) {
 static long g_lastPredAt = 0;
 static bool g_wasAiming = false;
 
+// ---- v6.0: what the prediction said at the moment of release, kept so the real result can be compared with it afterwards
+struct ShotRec {
+    bool valid; long at; int n; int firstHit;
+    double ang, dist, v0, sx, sy;
+    u64 sObj; double spx, spy; int spocket;
+    struct C { u64 o; int idx; double x0, y0, px, py; int ppocket; bool pmoved; };
+    std::vector<C> coins;
+    std::vector<V2> pockets;
+    ShotRec() : valid(false), at(0), n(0), firstHit(-1), ang(0), dist(0), v0(0), sx(0), sy(0), sObj(0), spx(0), spy(0), spocket(-1) {}
+};
+static ShotRec g_rec;                 // written by pred_tick (worker thread only)
+static bool g_trkOn = false;          // a shot is being watched
+static long g_holdUntil = 0;          // the last prediction stays on screen until this time (ms) so it can be compared with the real result
+static bool g_lineShown = false;
+
 static void pred_tick(const Aim& a, long t) {
-    if (!g_enabled.load()) { if (g_wasAiming) { std::vector<float> e; pred_set(e, "Prediction: OFF"); g_wasAiming = false; } return; }
+    std::vector<float> none;
+    if (!g_enabled.load()) {
+        g_rec.valid = false;
+        if (g_wasAiming || g_lineShown) { pred_set(none, "Prediction: OFF"); g_wasAiming = false; g_lineShown = false; }
+        return;
+    }
     if (!a.ok || a.act != 1) {
-        if (g_wasAiming) { std::vector<float> e; pred_set(e, a.ok ? "Prediction: waiting for aim" : "Prediction: aim objects not found yet"); g_wasAiming = false; }
-        else if (!a.ok) { std::vector<float> e; pred_set(e, "Prediction: aim objects not found yet (heap scan every few seconds)"); }
+        g_wasAiming = false;
+        if (g_lineShown && (g_trkOn || t < g_holdUntil)) return;   // v6.0: keep the line while the shot runs
+        if (g_lineShown) { pred_set(none, a.ok ? "Prediction: waiting for aim" : "Prediction: aim objects not found yet"); g_lineShown = false; }
+        else if (!a.ok) pred_set(none, "Prediction: aim objects not found yet (heap scan every few seconds)");
         return;
     }
     if (t - g_lastPredAt < 25) return;
     g_lastPredAt = t;
+    g_rec.valid = false;
     char st[400];
     bool newAim = !g_wasAiming;
     g_wasAiming = true;
-    if (!a.hasCenter) { std::vector<float> e; pred_set(e, "Prediction: LOCAL._center unreadable"); return; }
+    if (!a.hasCenter) { pred_set(none, "Prediction: LOCAL._center unreadable"); return; }
     if (newAim || !g_world.ok || g_world.localObj != a.obj || t - g_world.at > 400) refresh_world(a.obj, a.cx, a.cy, t);
     const World& w = g_world;
-    if (!w.ok) { std::vector<float> e; snprintf(st, sizeof(st), "Prediction: %s", w.why.c_str()); pred_set(e, st); return; }
+    if (!w.ok) { snprintf(st, sizeof(st), "Prediction: %s", w.why.c_str()); pred_set(none, st); return; }
     double sx, sy;
-    if (!read_pos(w.striker, sx, sy)) { std::vector<float> e; pred_set(e, "Prediction: striker position unreadable"); return; }
+    if (!read_pos(w.striker, sx, sy)) { pred_set(none, "Prediction: striker position unreadable"); return; }
     if (a.dist <= kMinDrag) {
-        std::vector<float> e; snprintf(st, sizeof(st), "Prediction: drag %.1f too short (needs > %.1f)", a.dist, kMinDrag); pred_set(e, st); return;
+        snprintf(st, sizeof(st), "Prediction: drag %.1f too short (needs > %.1f)", a.dist, kMinDrag); pred_set(none, st); return;
     }
     double v0 = launch_speed(a.dist);
     double fs = g_fricPct.load() / 100.0;
@@ -1034,20 +1063,164 @@ static void pred_tick(const Aim& a, long t) {
     }
     bool foul = (s0.pocket >= 0);
     if (foul) { put_ring(out, 4, w.pockets[s0.pocket], kPocketRing, w.toRoot); nPaths++; }
+    // v6.0 ghost circles: striker at the first contact (8), striker where it stops (6), every moved coin where it stops (7)
+    if (hi) { put_ring(out, 8, s0.pts[hi], kStrikerRadius, w.toRoot); nPaths++; }
+    if (s0.moved && s0.pocket < 0) { put_ring(out, 6, V2{s0.x, s0.y}, kStrikerRadius, w.toRoot); nPaths++; }
+    for (size_t i = 1; i < B.size(); i++) {
+        const SBody& c = B[i];
+        if (c.moved && c.pocket < 0 && c.alive) { put_ring(out, 7, V2{c.x, c.y}, c.r, w.toRoot); nPaths++; }
+    }
     out[idxN] = (float)nPaths;
 
     char hitTxt[120] = "striker hits no coin";
     if (first >= 0) snprintf(hitTxt, sizeof(hitTxt), "first hit coin %d at (%.1f,%.1f)", first, w.coins[first].x, w.coins[first].y);
     V2 origin = xf_apply(w.toRoot, 0, 0);
-    snprintf(st, sizeof(st), "Prediction ON | ang %.1f deg  drag %.1f  v0 %.2f/step | coins %d pockets %d | %s | coins moved %d potted %d%s | table origin in design (%.1f,%.1f) root %.0fx%.0f",
-             a.ang * 180.0 / M_PI, a.dist, v0, (int)w.coins.size(), (int)w.pockets.size(), hitTxt, movedCoins, potted, foul ? " | FOUL: striker potted" : "",
-             origin.x, origin.y, w.rootW, w.rootH);
+    snprintf(st, sizeof(st), "Prediction ON | ang %.1f deg  drag %.1f  v0 %.2f/step | coins %d pockets %d | %s | coins moved %d potted %d%s",
+             a.ang * 180.0 / M_PI, a.dist, v0, (int)w.coins.size(), (int)w.pockets.size(), hitTxt, movedCoins, potted, foul ? " | FOUL: striker potted" : "");
+    (void)origin;
     pred_set(out, st);
+    g_lineShown = true;
     {
         std::lock_guard<std::mutex> lk(g_predMx);
         snprintf(g_predLastLog, sizeof(g_predLastLog), "ang=%.4f dist=%.2f v0=%.3f start=%.2f,%.2f striker_end=%.1f,%.1f%s | %s |%s", a.ang, a.dist, v0, sx, sy,
                  s0.x, s0.y, foul ? "[POT=FOUL]" : "", hitTxt, coinLog);
     }
+    ShotRec r;
+    r.valid = true; r.at = t; r.firstHit = first; r.ang = a.ang; r.dist = a.dist; r.v0 = v0; r.sx = sx; r.sy = sy;
+    r.sObj = w.striker; r.spx = s0.x; r.spy = s0.y; r.spocket = s0.pocket; r.pockets = w.pockets;
+    for (size_t i = 0; i < w.coins.size(); i++) {
+        ShotRec::C c; c.o = w.coins[i].o; c.idx = (int)i; c.x0 = w.coins[i].x; c.y0 = w.coins[i].y;
+        c.px = B[i + 1].x; c.py = B[i + 1].y; c.ppocket = B[i + 1].pocket; c.pmoved = B[i + 1].moved;
+        r.coins.push_back(c);
+    }
+    g_rec = r;
+}
+
+// ================================================================== v6.0 SHOT CONSOLE (prediction vs. real result, read-only)
+// At the release the last prediction is copied; the real positions are read every loop until everything has stopped; then one compact
+// text block per shot (start state, predicted ends, real ends, errors in table units) goes into a ring buffer of the last 20 shots.
+// Kotlin shows that buffer in the panel's console box (NativeCarrom.consoleText) and copies it with the Copy button.
+static const size_t kConShots   = 20;
+static const double kRealPotDist = 20.0;      // a coin that rests this close to a pocket centre counts as potted
+static std::mutex g_conMx;
+static std::vector<std::string> g_con;
+static int g_shotNo = 0;
+static ShotRec g_trk;
+static std::vector<V2> g_trkPrev;
+static long g_trkStart = 0, g_trkLastMove = 0;
+static bool g_trkMoved = false;
+
+static void con_add(const std::string& s) {
+    std::lock_guard<std::mutex> lk(g_conMx);
+    g_con.push_back(s);
+    while (g_con.size() > kConShots) g_con.erase(g_con.begin());
+}
+
+static void trk_read(const ShotRec& r, std::vector<V2>& cur) {
+    cur.assign(r.coins.size() + 1, V2{NAN, NAN});
+    double x, y;
+    if (read_pos(r.sObj, x, y)) cur[0] = V2{x, y};
+    for (size_t i = 0; i < r.coins.size(); i++) if (read_pos(r.coins[i].o, x, y)) cur[i + 1] = V2{x, y};
+}
+
+static bool on_table(const V2& p) { return isfinite(p.x) && isfinite(p.y) && fabs(p.x) <= kBoardBound && fabs(p.y) <= kBoardBound; }
+
+static int nearest_pocket(const std::vector<V2>& pk, const V2& p, double lim) {
+    int best = -1; double bd = lim;
+    for (size_t k = 0; k < pk.size(); k++) { double d = hypot(p.x - pk[k].x, p.y - pk[k].y); if (d < bd) { bd = d; best = (int)k; } }
+    return best;
+}
+
+static void shot_finish(const std::vector<V2>& cur, long t, const char* why) {
+    const ShotRec& r = g_trk;
+    char b[300];
+    std::string s;
+    snprintf(b, sizeof(b), "#%d ang=%.4f d=%.1f v0=%.2f S0=%.1f,%.1f rest=%ldms (%s)", r.n, r.ang, r.dist, r.v0, r.sx, r.sy, t - g_trkStart, why);
+    s += b;
+    s += "\nC0:";
+    for (const ShotRec::C& c : r.coins) { snprintf(b, sizeof(b), " %d=%.1f,%.1f", c.idx, c.x0, c.y0); s += b; }
+    snprintf(b, sizeof(b), "\nP: S=%.1f,%.1f%s", r.spx, r.spy, r.spocket >= 0 ? "[FOUL]" : ""); s += b;
+    if (r.firstHit >= 0) { snprintf(b, sizeof(b), " hit=c%d", r.firstHit); s += b; }
+    for (const ShotRec::C& c : r.coins) {
+        if (!c.pmoved) continue;
+        snprintf(b, sizeof(b), " c%d=%.1f,%.1f%s", c.idx, c.px, c.py, c.ppocket >= 0 ? "[POT]" : ""); s += b;
+    }
+    s += "\nR:";
+    const V2& rs = cur[0];
+    if (on_table(rs)) {
+        int pk = nearest_pocket(r.pockets, rs, 12.0);
+        snprintf(b, sizeof(b), " S=%.1f,%.1f%s", rs.x, rs.y, pk >= 0 ? "[POCKET]" : ""); s += b;
+    } else s += " S=OUT";
+    std::vector<int> rstate(r.coins.size(), 0);     // 0 still, 1 moved on the table, 2 potted (rests at a pocket, or left the table)
+    for (size_t i = 0; i < r.coins.size(); i++) {
+        const ShotRec::C& c = r.coins[i];
+        const V2& p = cur[i + 1];
+        if (!on_table(p)) { rstate[i] = 2; snprintf(b, sizeof(b), " c%d=OUT", c.idx); s += b; continue; }
+        if (hypot(p.x - c.x0, p.y - c.y0) <= 0.3) continue;
+        int pk = nearest_pocket(r.pockets, p, kRealPotDist);
+        rstate[i] = (pk >= 0) ? 2 : 1;
+        snprintf(b, sizeof(b), " c%d=%.1f,%.1f%s", c.idx, p.x, p.y, pk >= 0 ? "[POT]" : ""); s += b;
+    }
+    s += "\nE:";
+    if (on_table(rs) && !(r.spocket >= 0)) {
+        snprintf(b, sizeof(b), " S d=%.1f,%.1f len=%.1f", rs.x - r.spx, rs.y - r.spy, hypot(rs.x - r.spx, rs.y - r.spy)); s += b;
+    } else if (r.spocket >= 0) {
+        s += on_table(rs) && nearest_pocket(r.pockets, rs, 12.0) >= 0 ? " S foul-ok" : " S pred FOUL, real not";
+    } else s += " S real OUT, pred on table";
+    int shown = 0;
+    for (size_t i = 0; i < r.coins.size(); i++) {
+        const ShotRec::C& c = r.coins[i];
+        int ps = c.ppocket >= 0 ? 2 : (c.pmoved ? 1 : 0), rsx = rstate[i];
+        if (ps == 0 && rsx == 0) continue;
+        shown++;
+        if (ps != 0 && rsx != 0) {
+            if (ps == 2 && rsx == 2) snprintf(b, sizeof(b), " c%d pot-ok", c.idx);
+            else if (ps == rsx) snprintf(b, sizeof(b), " c%d len=%.1f", c.idx, hypot(cur[i + 1].x - c.px, cur[i + 1].y - c.py));
+            else snprintf(b, sizeof(b), " c%d POT-MISMATCH(pred %s, real %s)", c.idx, ps == 2 ? "pot" : "table", rsx == 2 ? "pot" : "table");
+        } else if (ps != 0) snprintf(b, sizeof(b), " c%d pred-only", c.idx);
+        else snprintf(b, sizeof(b), " c%d real-only", c.idx);
+        s += b;
+    }
+    if (!shown) s += " (no coin moved in the prediction or in the game)";
+    con_add(s);
+    LOG("SHOT %s", s.c_str());     // same text to logcat (the lines of one block are joined with | there)
+}
+
+static void shot_begin(long t) {
+    if (g_trkOn) { std::vector<V2> cur = g_trkPrev; shot_finish(cur, t, "next shot started"); g_trkOn = false; }
+    int n = ++g_shotNo;
+    if (!g_rec.valid || t - g_rec.at > 500) {
+        char st[400];
+        { std::lock_guard<std::mutex> lk(g_predMx); snprintf(st, sizeof(st), "%s", g_predStatus); }
+        char b[480]; snprintf(b, sizeof(b), "#%d no prediction at release: %s", n, st);
+        con_add(b);
+        return;
+    }
+    g_trk = g_rec; g_trk.n = n;
+    g_trkOn = true; g_trkStart = t; g_trkLastMove = t; g_trkMoved = false;
+    trk_read(g_trk, g_trkPrev);
+    g_rec.valid = false;
+}
+
+static void shot_track(long t) {
+    if (!g_trkOn) return;
+    std::vector<V2> cur;
+    trk_read(g_trk, cur);
+    if (g_trkPrev.size() == cur.size()) {
+        for (size_t i = 0; i < cur.size(); i++) {
+            bool f1 = isfinite(cur[i].x) && isfinite(cur[i].y), f0 = isfinite(g_trkPrev[i].x) && isfinite(g_trkPrev[i].y);
+            if (f1 != f0 || (f1 && (fabs(cur[i].x - g_trkPrev[i].x) > 0.05 || fabs(cur[i].y - g_trkPrev[i].y) > 0.05))) { g_trkLastMove = t; g_trkMoved = true; break; }
+        }
+    }
+    g_trkPrev = cur;
+    const char* why = nullptr;
+    if (g_trkMoved && t - g_trkStart >= 300 && t - g_trkLastMove >= 250) why = "all stopped";
+    else if (!g_trkMoved && t - g_trkStart > 1500) why = "nothing moved";
+    else if (t - g_trkStart > 15000) why = "timeout 15 s";
+    if (!why) return;
+    shot_finish(cur, t, why);
+    g_trkOn = false;
+    g_holdUntil = t + 2000;
 }
 
 // ================================================================== v5.2 DUMP MODE (read-only)
@@ -1436,7 +1609,7 @@ static void dump_dyn(long dt, int shot) {
 // prints the bytes around the first bodies (constants, radius, mass ... next to the position), and after each shot prints what changed in a small window around EVERY body.
 // Position forms tried: float or double pairs (x,y) with a gap of 4/8/12 (float) or 8/16 (double) bytes, physics = (table + shift) * scale, scales 1, 0.1, 0.01, 1/32,
 // shifts 0 first, then +-254.1 if nothing is found. Everything is read through rd(); nothing is written, no hooks. Not run in the game by an AI.
-static const int    kLogicScan   = 1;
+static const int    kLogicScan   = 0;   // v6.0: off (the v5.5 scan was never run; it needs ~15 s without shooting). 1 = run it again
 static const int    kLnMaxNodes  = 600;
 static const int    kLnMaxDepth  = 3;
 static const int    kLnMaxHits   = 120;
@@ -2147,10 +2320,12 @@ static void* worker(void*) {
                     { std::lock_guard<std::mutex> lk(g_predMx); snprintf(pl, sizeof(pl), "%s", g_predLastLog); }
                     LOG("PRED last: %s", pl);
                 }
+                if (g_enabled.load()) shot_begin(t);
             }
         }
 
         pred_tick(a, t);
+        shot_track(t);
 
         // v5.2: changed ivars of the dumped model objects at +60 / +250 / +600 ms after each of the first 3 shots
         if (dynStep >= 0) {
@@ -2227,14 +2402,14 @@ static void* worker(void*) {
                 }
             }
         }
-        usleep(burst ? 16000 : (aimActive ? 10000 : 100000));
+        usleep((burst || g_trkOn) ? 16000 : (aimActive ? 10000 : 100000));
     }
     LOG("probe finished");
     return nullptr;
 }
 
 __attribute__((constructor)) static void init() {
-    LOG("carprobe v5.5 loaded (prediction + logic scan %s, ObjC dump %s; test write kTestMaxGuides=%d)", kLogicScan ? "ON" : "off", kDumpEnabled ? "ON" : "off", kTestMaxGuides);
+    LOG("carprobe v6.0 loaded (prediction + logic scan %s, ObjC dump %s; test write kTestMaxGuides=%d)", kLogicScan ? "ON" : "off", kDumpEnabled ? "ON" : "off", kTestMaxGuides);
     pthread_t th;
     pthread_create(&th, nullptr, worker, nullptr);
     pthread_detach(th);
@@ -2274,6 +2449,18 @@ JNIEXPORT jstring JNICALL Java_top_niunaijun_blackboxa_menu_NativeCarrom_statusT
     char b[400];
     { std::lock_guard<std::mutex> lk(g_predMx); snprintf(b, sizeof(b), "%s", g_predStatus); }
     return env->NewStringUTF(b);
+}
+
+// v6.0: text of the last <= 20 shots (prediction vs. real result), newest last; ASCII only
+JNIEXPORT jstring JNICALL Java_top_niunaijun_blackboxa_menu_NativeCarrom_consoleText(JNIEnv* env, jobject) {
+    std::string all;
+    {
+        std::lock_guard<std::mutex> lk(g_conMx);
+        for (size_t i = 0; i < g_con.size(); i++) { if (i) all += "\n\n"; all += g_con[i]; }
+    }
+    if (all.size() > 60000) all = all.substr(all.size() - 60000);
+    for (char& c : all) if ((unsigned char)c > 126 || ((unsigned char)c < 32 && c != '\n')) c = '?';
+    return env->NewStringUTF(all.c_str());
 }
 
 }  // extern "C"
