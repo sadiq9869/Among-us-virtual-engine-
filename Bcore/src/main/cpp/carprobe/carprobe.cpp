@@ -1,3 +1,5 @@
+// v6.1 fix: the console now takes the REAL end of each body at the last moment it was physically moving (a jump > 45 units per sample = striker reset / score-tray fly-off freezes it).
+//   v6.0 read the striker after the game had already reset it to the baseline, so every "S" error in the console was wrong. Header also shows en / pw (aim flags at release).
 // carprobe.cpp  v6.0 = v5.5 prediction + (a) the line now runs to where the striker / coins are predicted to stop, with ghost circles
 //   (striker at first contact = type 8, striker at its stop = type 6, moved coins at their stop = type 7);
 //   (b) the last prediction stays on screen while the shot runs (+2 s) so it can be compared with the real result;
@@ -989,13 +991,13 @@ static bool g_wasAiming = false;
 
 // ---- v6.0: what the prediction said at the moment of release, kept so the real result can be compared with it afterwards
 struct ShotRec {
-    bool valid; long at; int n; int firstHit;
+    bool valid; long at; int n; int firstHit; int en, enough;
     double ang, dist, v0, sx, sy;
     u64 sObj; double spx, spy; int spocket;
     struct C { u64 o; int idx; double x0, y0, px, py; int ppocket; bool pmoved; };
     std::vector<C> coins;
     std::vector<V2> pockets;
-    ShotRec() : valid(false), at(0), n(0), firstHit(-1), ang(0), dist(0), v0(0), sx(0), sy(0), sObj(0), spx(0), spy(0), spocket(-1) {}
+    ShotRec() : valid(false), at(0), n(0), firstHit(-1), en(0), enough(0), ang(0), dist(0), v0(0), sx(0), sy(0), sObj(0), spx(0), spy(0), spocket(-1) {}
 };
 static ShotRec g_rec;                 // written by pred_tick (worker thread only)
 static bool g_trkOn = false;          // a shot is being watched
@@ -1101,6 +1103,7 @@ static void pred_tick(const Aim& a, long t) {
 // text block per shot (start state, predicted ends, real ends, errors in table units) goes into a ring buffer of the last 20 shots.
 // Kotlin shows that buffer in the panel's console box (NativeCarrom.consoleText) and copies it with the Copy button.
 static const size_t kConShots   = 20;
+static const double kTeleport    = 45.0;      // one sample (1-2 physics steps, max ~36 units) moving farther than this is a jump, not physics
 static const double kRealPotDist = 20.0;      // a coin that rests this close to a pocket centre counts as potted
 static std::mutex g_conMx;
 static std::vector<std::string> g_con;
@@ -1109,6 +1112,8 @@ static ShotRec g_trk;
 static std::vector<V2> g_trkPrev;
 static long g_trkStart = 0, g_trkLastMove = 0;
 static bool g_trkMoved = false;
+static std::vector<V2> g_trkEnd;          // v6.1: per object the last position where it was still physically moving (frozen at a teleport / vanish)
+static std::vector<char> g_trkFrozen;
 
 static void con_add(const std::string& s) {
     std::lock_guard<std::mutex> lk(g_conMx);
@@ -1132,10 +1137,12 @@ static int nearest_pocket(const std::vector<V2>& pk, const V2& p, double lim) {
 }
 
 static void shot_finish(const std::vector<V2>& cur, long t, const char* why) {
+    (void)t;
     const ShotRec& r = g_trk;
     char b[300];
     std::string s;
-    snprintf(b, sizeof(b), "#%d ang=%.4f d=%.1f v0=%.2f S0=%.1f,%.1f rest=%ldms (%s)", r.n, r.ang, r.dist, r.v0, r.sx, r.sy, t - g_trkStart, why);
+    int nFrozen = 0; for (char f : g_trkFrozen) nFrozen += f ? 1 : 0;
+    snprintf(b, sizeof(b), "#%d ang=%.4f d=%.1f v0=%.2f S0=%.1f,%.1f en=%d pw=%d rest=%ldms frozen=%d (%s)", r.n, r.ang, r.dist, r.v0, r.sx, r.sy, r.en, r.enough, g_trkLastMove - g_trkStart, nFrozen, why);
     s += b;
     s += "\nC0:";
     for (const ShotRec::C& c : r.coins) { snprintf(b, sizeof(b), " %d=%.1f,%.1f", c.idx, c.x0, c.y0); s += b; }
@@ -1186,8 +1193,8 @@ static void shot_finish(const std::vector<V2>& cur, long t, const char* why) {
     LOG("SHOT %s", s.c_str());     // same text to logcat (the lines of one block are joined with | there)
 }
 
-static void shot_begin(long t) {
-    if (g_trkOn) { std::vector<V2> cur = g_trkPrev; shot_finish(cur, t, "next shot started"); g_trkOn = false; }
+static void shot_begin(long t, int en, int enough) {
+    if (g_trkOn) { shot_finish(g_trkEnd, t, "next shot started"); g_trkOn = false; }
     int n = ++g_shotNo;
     if (!g_rec.valid || t - g_rec.at > 500) {
         char st[400];
@@ -1196,9 +1203,11 @@ static void shot_begin(long t) {
         con_add(b);
         return;
     }
-    g_trk = g_rec; g_trk.n = n;
+    g_trk = g_rec; g_trk.n = n; g_trk.en = en; g_trk.enough = enough;
     g_trkOn = true; g_trkStart = t; g_trkLastMove = t; g_trkMoved = false;
     trk_read(g_trk, g_trkPrev);
+    g_trkEnd = g_trkPrev;
+    g_trkFrozen.assign(g_trkPrev.size(), 0);
     g_rec.valid = false;
 }
 
@@ -1208,8 +1217,12 @@ static void shot_track(long t) {
     trk_read(g_trk, cur);
     if (g_trkPrev.size() == cur.size()) {
         for (size_t i = 0; i < cur.size(); i++) {
+            if (g_trkFrozen[i]) continue;
             bool f1 = isfinite(cur[i].x) && isfinite(cur[i].y), f0 = isfinite(g_trkPrev[i].x) && isfinite(g_trkPrev[i].y);
-            if (f1 != f0 || (f1 && (fabs(cur[i].x - g_trkPrev[i].x) > 0.05 || fabs(cur[i].y - g_trkPrev[i].y) > 0.05))) { g_trkLastMove = t; g_trkMoved = true; break; }
+            if (!f1) { g_trkFrozen[i] = 1; continue; }                    // vanished (coin flew into the score tray / was removed)
+            double dd = f0 ? hypot(cur[i].x - g_trkPrev[i].x, cur[i].y - g_trkPrev[i].y) : 0.0;
+            if (dd > kTeleport) { g_trkFrozen[i] = 1; continue; }         // jump = not physics: tray fly-off, striker reset for the next turn
+            if (dd > 0.05) { g_trkEnd[i] = cur[i]; g_trkLastMove = t; g_trkMoved = true; }
         }
     }
     g_trkPrev = cur;
@@ -1218,7 +1231,7 @@ static void shot_track(long t) {
     else if (!g_trkMoved && t - g_trkStart > 1500) why = "nothing moved";
     else if (t - g_trkStart > 15000) why = "timeout 15 s";
     if (!why) return;
-    shot_finish(cur, t, why);
+    shot_finish(g_trkEnd, t, why);
     g_trkOn = false;
     g_holdUntil = t + 2000;
 }
@@ -2320,7 +2333,7 @@ static void* worker(void*) {
                     { std::lock_guard<std::mutex> lk(g_predMx); snprintf(pl, sizeof(pl), "%s", g_predLastLog); }
                     LOG("PRED last: %s", pl);
                 }
-                if (g_enabled.load()) shot_begin(t);
+                if (g_enabled.load()) shot_begin(t, lastAim.en, lastAim.enough);
             }
         }
 
@@ -2409,7 +2422,7 @@ static void* worker(void*) {
 }
 
 __attribute__((constructor)) static void init() {
-    LOG("carprobe v6.0 loaded (prediction + logic scan %s, ObjC dump %s; test write kTestMaxGuides=%d)", kLogicScan ? "ON" : "off", kDumpEnabled ? "ON" : "off", kTestMaxGuides);
+    LOG("carprobe v6.1 loaded (prediction + logic scan %s, ObjC dump %s; test write kTestMaxGuides=%d)", kLogicScan ? "ON" : "off", kDumpEnabled ? "ON" : "off", kTestMaxGuides);
     pthread_t th;
     pthread_create(&th, nullptr, worker, nullptr);
     pthread_detach(th);
