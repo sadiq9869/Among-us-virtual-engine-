@@ -1,4 +1,4 @@
-// cfgscan.cpp  v1  (NEW FILE, separate from carprobe.cpp - it does not touch the prediction code)
+// cfgscan.cpp  v2 (v1 matched pointers read as tiny numbers; v2 rejects them and no longer needs 'nice' decimals)  (NEW FILE, separate from carprobe.cpp - it does not touch the prediction code)
 //
 // WHAT IT DOES: reads the game's OWN physics configuration out of the game's memory (READ-ONLY: no hooks, no writes, no patches).
 // WHY: the game does not keep friction / restitution / mass in its code. Its config loader (build 19.6.1, versionCode 1492,
@@ -55,7 +55,7 @@ static void L(const char* fmt, ...) {
 static long now_ms() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000L + t.tv_nsec / 1000000L; }
 
 // "nice" = a short decimal number (<= 5 decimals) or the double value of the float closest to such a number
-static bool nice(double d) {
+[[maybe_unused]] static bool nice(double d) {
     if (d == 0.0) return true;
     if (!std::isfinite(d)) return false;
     static const double sc[] = {1e2, 1e3, 1e4, 1e5};
@@ -107,44 +107,50 @@ static void add_hit(int type, uint64_t addr, const char* key) {
     if (!g_first[type].count(k)) g_first[type][k] = addr;
 }
 
-static void check(uint64_t addr, const double* d, int32_t idBefore) {
+static int g_ctxLeft[3] = {0, 0, 0};
+static void ctx_print(int type, uint64_t addr, const uint8_t* p, bool ok) {
+    if (!ok || g_ctxLeft[type] <= 0) return;
+    g_ctxLeft[type]--;
+    static const char* nm[3] = {"ball", "table", "general"};
+    char b[800]; int n = snprintf(b, sizeof b, "CFG ctx %s @%llx doubles from -8 to +11 (index 0 = record start):", nm[type], (unsigned long long)addr);
+    for (int k = -8; k < 12 && n < 760; k++) { double v; memcpy(&v, p + k * 8, 8); n += snprintf(b + n, sizeof b - n, " %.9g", v); }
+    L("%s", b);
+}
+// a value that is either exactly 0 or a normal-sized number (rejects denormals = pointers read as doubles)
+static inline bool z_or(double v, double hi) { return v == 0.0 || (v >= 1e-3 && v <= hi); }
+
+static void check(uint64_t addr, const double* d, int32_t idBefore, const uint8_t* p, bool ctxOk) {
     // ball: radius friction restitution mass spinFriction, int id before
     {
         double r = d[0], fr = d[1], re = d[2], m = d[3], sp = d[4];
-        if (in(r, 3, 60) && in(fr, 0, 5) && in(re, 0, 3) && in(m, 0, 1000) && in(sp, 0, 10) && idBefore >= 0 && idBefore <= 10000 &&
-            nice(r) && nice(fr) && nice(re) && nice(m) && nice(sp)) {
-            int nz = (fr != 0) + (re != 0) + (m != 0) + (sp != 0);
-            if (nz >= 3) {
+        if (in(r, 5, 40) && z_or(fr, 5) && z_or(re, 3) && in(m, 0.01, 1000) && z_or(sp, 10) && idBefore >= 0 && idBefore <= 10000) {
+            int nz = (fr != 0) + (re != 0) + (sp != 0);
+            if (nz >= 2) {
                 char k[300];
                 snprintf(k, sizeof k, "id=%d radius=%.10g friction=%.10g restitution=%.10g mass=%.10g spinFriction=%.10g", idBefore, r, fr, re, m, sp);
-                add_hit(0, addr, k);
+                add_hit(0, addr, k); ctx_print(0, addr, p, ctxOk);
             }
         }
     }
     // table: friction restitution pocketRadius ballInPocketSpeedFactor puckInPocketSpeedFactor pocketLogicalRadiusFactor
     {
         double fr = d[0], re = d[1], pr = d[2], bi = d[3], pi = d[4], lf = d[5];
-        if (in(fr, 0, 5) && in(re, 0, 3) && in(pr, 5, 100) && in(bi, 0, 50) && in(pi, 0, 50) && in(lf, 0, 10) &&
-            nice(fr) && nice(re) && nice(pr) && nice(bi) && nice(pi) && nice(lf)) {
-            int nz = (fr != 0) + (re != 0) + (bi != 0) + (pi != 0) + (lf != 0);
-            if (nz >= 4) {
+        if (z_or(fr, 5) && z_or(re, 3) && in(pr, 5, 100) && z_or(bi, 50) && z_or(pi, 50) && z_or(lf, 10)) {
+            int nz = (re != 0) + (bi != 0) + (pi != 0) + (lf != 0);
+            if (nz >= 3) {
                 char k[300];
                 snprintf(k, sizeof k, "friction=%.10g restitution=%.10g pocketRadius=%.10g ballInPocketSpeedFactor=%.10g puckInPocketSpeedFactor=%.10g pocketLogicalRadiusFactor=%.10g", fr, re, pr, bi, pi, lf);
-                add_hit(1, addr, k);
+                add_hit(1, addr, k); ctx_print(1, addr, p, ctxOk);
             }
         }
     }
     // general: strikerInputBarWidth puckMaxPickingDistance controlsMinDistanceShot controlsMaxDistanceShot physicsSpeedFactor maxPower minPower
     {
         double bw = d[0], pk = d[1], mn = d[2], mx = d[3], ps = d[4], mxp = d[5], mnp = d[6];
-        if (in(bw, 1, 2000) && in(pk, 1, 500) && in(mn, 0, 300) && in(mx, 1, 2000) && mx >= mn && in(ps, 0.0001, 100) && in(mxp, 0, 1000) && in(mnp, 0, 1000) &&
-            nice(bw) && nice(pk) && nice(mn) && nice(mx) && nice(ps) && nice(mxp) && nice(mnp)) {
-            int nz = (mn != 0) + (mxp != 0) + (mnp != 0);
-            if (nz >= 2) {
-                char k[300];
-                snprintf(k, sizeof k, "strikerInputBarWidth=%.10g puckMaxPickingDistance=%.10g controlsMinDistanceShot=%.10g controlsMaxDistanceShot=%.10g physicsSpeedFactor=%.10g maxPower=%.10g minPower=%.10g", bw, pk, mn, mx, ps, mxp, mnp);
-                add_hit(2, addr, k);
-            }
+        if (in(bw, 1, 2000) && in(pk, 1, 500) && in(mn, 1, 300) && in(mx, 1, 2000) && mx > mn && in(ps, 0.001, 100) && in(mxp, 0.1, 1000) && z_or(mnp, 1000)) {
+            char k[300];
+            snprintf(k, sizeof k, "strikerInputBarWidth=%.10g puckMaxPickingDistance=%.10g controlsMinDistanceShot=%.10g controlsMaxDistanceShot=%.10g physicsSpeedFactor=%.10g maxPower=%.10g minPower=%.10g", bw, pk, mn, mx, ps, mxp, mnp);
+            add_hit(2, addr, k); ctx_print(2, addr, p, ctxOk);
         }
     }
 }
@@ -153,7 +159,7 @@ static int g_scanNo = 0;
 
 static void scan_once(int memfd) {
     long t0 = now_ms();
-    for (int t = 0; t < 3; t++) { g_cnt[t].clear(); g_first[t].clear(); }
+    for (int t = 0; t < 3; t++) { g_cnt[t].clear(); g_first[t].clear(); g_ctxLeft[t] = 2; }
     std::vector<Region> R = regions();
     uint64_t bytes = 0;
     static uint8_t* buf = nullptr;
@@ -175,7 +181,7 @@ static void scan_once(int memfd) {
                 double d[7];
                 memcpy(d, buf + i, 56);
                 int32_t idb; memcpy(&idb, buf + i - 8, 4);
-                check(base + i, d, idb);
+                check(base + i, d, idb, buf + i, i >= 72 && i + 96 <= (size_t)got);
             }
             if ((off >> 20) % 16 == 0) usleep(1000);
         }
@@ -197,7 +203,7 @@ static void* worker(void*) {
     usleep((useconds_t)kFirstDelayMs * 1000);
     int fd = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
     if (fd < 0) { L("CFG cannot open /proc/self/mem"); return nullptr; }
-    L("CFG cfgscan v1 started (read-only), %d scans planned", kMaxScans);
+    L("CFG cfgscan v2 started (read-only), %d scans planned", kMaxScans);
     for (g_scanNo = 1; g_scanNo <= kMaxScans; g_scanNo++) {
         scan_once(fd);
         usleep((useconds_t)kPeriodMs * 1000);
