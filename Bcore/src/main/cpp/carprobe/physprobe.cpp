@@ -1,4 +1,4 @@
-// physprobe.cpp  v3  (separate file, READ-ONLY, no hooks, no writes, no calls into the game)
+// physprobe.cpp  v4  (separate file, READ-ONLY, no hooks, no writes, no calls into the game)
 //
 // Goal: find the game's live physics objects by their C++ RTTI names and print
 // what is inside them (words, doubles, floats, pointers that lead to other known objects).
@@ -174,6 +174,13 @@ void discover() {
         g_vptr[vp] = it->second;
         g_vmin = std::min(g_vmin, vp); g_vmax = std::max(g_vmax, vp);
       }
+    }
+  }
+  {
+    uint64_t x = g_libLo + 0x2996428ull;   // seen as first word of 2 objects holding d14,d14 (v3 run)
+    if (x < g_libHi && !g_vptr.count(x)) {
+      g_vptr[x] = "X2996428";
+      g_vmin = std::min(g_vmin, x); g_vmax = std::max(g_vmax, x);
     }
   }
   std::map<std::string, int> per;
@@ -427,7 +434,27 @@ void scan_heap(int scanNo) {
   }
   if (!sum.empty()) L("PH live: %s", sum.c_str());
 
-  if (scanNo >= 3 && scanNo <= 5) {
+  if (scanNo >= 2 && scanNo <= 5) {
+    auto it = by.find("X2996428");
+    if (it != by.end()) {
+      size_t shown = 0;
+      for (uint64_t base : it->second) {
+        if (shown >= 4) break;
+        std::vector<uint64_t> w(0x400 / 8);
+        if (!rd(base, w.data(), 0x400)) continue;
+        shown++;
+        L("PH X @%llx scan=%d", (unsigned long long)base, scanNo);
+        for (size_t k = 0; k < w.size(); k += 4) {
+          bool all0 = !(w[k] | w[k + 1] | w[k + 2] | w[k + 3]);
+          if (all0 && k > 8) continue;
+          std::string t;
+          for (size_t j = 0; j < 4; j++) { if (j) t += " | "; t += fmtword(w[k + j]); }
+          L("PH X @%llx +%zu: %s", (unsigned long long)base, k * 8, t.c_str());
+        }
+      }
+    }
+  }
+  if (scanNo == 3) {
     for (auto& kv : by)
       if (kv.first.find("MatchControllerCarrom") != std::string::npos) walk(kv.second, scanNo);
   }
@@ -437,7 +464,7 @@ void* worker(void*) {
   sleep(45);
   g_fd = open("/proc/self/mem", O_RDONLY);
   if (g_fd < 0) { L("PH cannot open /proc/self/mem"); return nullptr; }
-  L("PH physprobe v3 started (read-only)");
+  L("PH physprobe v4 started (read-only)");
   for (int sc = 1; sc <= 6; sc++) {
     if (!g_disc) {
       if (!find_lib()) L("PH lib '%s' not found yet", PH_LIBNAME);
