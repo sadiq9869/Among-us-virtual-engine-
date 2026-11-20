@@ -1,4 +1,4 @@
-// physprobe.cpp  v1  (separate file, READ-ONLY, no hooks, no writes, no calls into the game)
+// physprobe.cpp  v2  (separate file, READ-ONLY, no hooks, no writes, no calls into the game)
 //
 // Goal: find the game's live physics objects by their C++ RTTI names and print
 // what is inside them (words, doubles, floats, pointers that lead to other known objects).
@@ -255,6 +255,105 @@ bool interesting(const std::string& n) {
   return false;
 }
 
+const double kFit[] = {0.17, 0.0715, 0.73, 0.98, 1.7, 13.1, 17.4, 18.08, 30.3, 0.198, 4.7, 14.0};
+
+// one-line summary of a pointee: sane doubles and values near the old fits
+void summarize(const char* tag, uint64_t addr, uint64_t via, const uint8_t* b, size_t n, int& printed) {
+  const uint64_t* w = (const uint64_t*)b;
+  int sane = 0, fits = 0;
+  std::string fl;
+  for (size_t i = 0; i < n / 8; i++) {
+    double d; memcpy(&d, &w[i], 8);
+    if (std::isfinite(d) && fabs(d) >= 1e-3 && fabs(d) <= 1e4) {
+      sane++;
+      for (double t : kFit)
+        if (fabs(d - t) <= 0.005 * t) {
+          fits++;
+          char t2[48]; snprintf(t2, sizeof t2, "d%.6g@+%zu ", d, i * 8);
+          if (fl.size() < 220) fl += t2;
+          break;
+        }
+    }
+    float f[2]; memcpy(f, &w[i], 8);
+    for (int h = 0; h < 2; h++)
+      if (std::isfinite(f[h]) && f[h] != 0)
+        for (double t : kFit)
+          if (fabs(f[h] - t) <= 0.005 * t) {
+            fits++;
+            char t2[48]; snprintf(t2, sizeof t2, "f%.6g@+%zu ", f[h], i * 8 + h * 4);
+            if (fl.size() < 220) fl += t2;
+            break;
+          }
+  }
+  auto it = g_vptr.find(w[0]);
+  if (it != g_vptr.end() || fits > 0) {
+    if (printed < 90) {
+      L("PH %s @%llx via+%llu first=%s sane=%d fits=%d %s", tag, (unsigned long long)addr,
+        (unsigned long long)via, fmtword(w[0]).c_str(), sane, fits, fl.c_str());
+      printed++;
+    }
+  }
+}
+
+void walk(const std::vector<uint64_t>& objs, int scanNo) {
+  int shown = 0;
+  for (uint64_t base : objs) {
+    if (shown >= 3) break;
+    const size_t SZ = 0x600;
+    std::vector<uint8_t> ob(SZ);
+    if (!rd(base, ob.data(), SZ)) continue;
+    const uint64_t* w = (const uint64_t*)ob.data();
+    int score = 0;
+    for (size_t i = 1; i < SZ / 8; i++) {
+      uint64_t v = w[i];
+      if (v > 0x10000 && (v & 7) == 0 && in_region(v)) {
+        uint64_t first = 0;
+        if (rd(v, &first, 8) && g_vptr.count(first)) score++;
+      }
+    }
+    if (score < 3) continue;       // probably freed / stale
+    shown++;
+    L("PH mc @%llx scan=%d score=%d", (unsigned long long)base, scanNo, score);
+    std::string hint;
+    for (size_t i = 0x558 / 8; i < 0x580 / 8; i++) { hint += fmtword(w[i]); hint += " | "; }
+    L("PH mc hint +0x558..: %s", hint.c_str());
+    int printed = 0;
+    std::vector<uint64_t> seen;
+    seen.push_back(base);
+    std::vector<std::pair<uint64_t, uint64_t>> l1;
+    for (size_t i = 1; i < SZ / 8 && l1.size() < 80; i++) {
+      uint64_t v = w[i];
+      if (v > 0x10000 && (v & 7) == 0 && in_region(v) &&
+          std::find(seen.begin(), seen.end(), v) == seen.end()) {
+        seen.push_back(v);
+        l1.push_back({v, i * 8});
+      }
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> l2;
+    for (auto& pr : l1) {
+      std::vector<uint8_t> pb(0x400);
+      if (!rd(pr.first, pb.data(), pb.size())) continue;
+      summarize("L1", pr.first, pr.second, pb.data(), pb.size(), printed);
+      const uint64_t* pw = (const uint64_t*)pb.data();
+      for (size_t i = 1; i < pb.size() / 8 && l2.size() < 400; i++) {
+        uint64_t v = pw[i];
+        if (v > 0x10000 && (v & 7) == 0 && in_region(v) &&
+            std::find(seen.begin(), seen.end(), v) == seen.end()) {
+          seen.push_back(v);
+          l2.push_back({v, pr.first});
+        }
+      }
+    }
+    for (auto& pr : l2) {
+      std::vector<uint8_t> pb(0x400);
+      if (!rd(pr.first, pb.data(), pb.size())) continue;
+      summarize("L2", pr.first, pr.second, pb.data(), pb.size(), printed);
+    }
+    L("PH mc @%llx walked L1=%zu L2=%zu printed=%d", (unsigned long long)base, l1.size(), l2.size(), printed);
+  }
+  if (shown == 0) L("PH mc: no MatchControllerCarrom with score>=3 in scan %d", scanNo);
+}
+
 void scan_heap(int scanNo) {
   std::vector<Region> regs;
   FILE* f = fopen("/proc/self/maps", "r");
@@ -310,22 +409,9 @@ void scan_heap(int scanNo) {
   }
   if (!sum.empty()) L("PH live: %s", sum.c_str());
 
-  // raw dumps (first 2 objects of each interesting class), only in scans 1 and 3
-  if (scanNo == 1 || scanNo == 3) {
-    for (auto& kv : by) {
-      if (!interesting(kv.first)) continue;
-      for (size_t oi = 0; oi < kv.second.size() && oi < 2; oi++) {
-        uint64_t base = kv.second[oi];
-        const size_t SZ = 512;
-        uint64_t w[SZ / 8];
-        if (!rd(base, w, SZ)) { L("PH obj %s @%llx unreadable", kv.first.c_str(), (unsigned long long)base); continue; }
-        for (size_t k = 0; k < SZ / 8; k += 4) {
-          std::string s;
-          for (size_t j = 0; j < 4; j++) { if (j) s += " | "; s += fmtword(w[k + j]); }
-          L("PH obj %s @%llx +%zu: %s", kv.first.c_str(), (unsigned long long)base, k * 8, s.c_str());
-        }
-      }
-    }
+  if (scanNo >= 3 && scanNo <= 5) {
+    for (auto& kv : by)
+      if (kv.first.find("MatchControllerCarrom") != std::string::npos) walk(kv.second, scanNo);
   }
 }
 
@@ -333,7 +419,7 @@ void* worker(void*) {
   sleep(45);
   g_fd = open("/proc/self/mem", O_RDONLY);
   if (g_fd < 0) { L("PH cannot open /proc/self/mem"); return nullptr; }
-  L("PH physprobe v1 started (read-only)");
+  L("PH physprobe v2 started (read-only)");
   for (int sc = 1; sc <= 6; sc++) {
     if (!g_disc) {
       if (!find_lib()) L("PH lib '%s' not found yet", PH_LIBNAME);
@@ -354,7 +440,7 @@ void ph_test_run() {
   g_fd = open("/proc/self/mem", O_RDONLY);
   if (!find_lib()) { L("PH TEST lib not found"); return; }
   discover();
-  scan_heap(1);
+  scan_heap(3);
 }
 #else
 __attribute__((constructor)) static void ph_ctor() {
