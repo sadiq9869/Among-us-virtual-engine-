@@ -1,4 +1,4 @@
-// fnprobe.cpp v2 - READ-ONLY "state object" finder (no calls, no hooks, no writes)
+// fnprobe.cpp v3.1 - READ-ONLY "state object" finder (no calls, no hooks, no writes)
 // Path: Bcore/src/main/cpp/carprobe/fnprobe.cpp   (replaces v1)
 // Idea: the game's state constructor (orig RVA 0x1b2adc0) stores a vtable
 // pointer = *(base+0x2848188)+0x10 at object+0x100, and similar ones at
@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <map>
 #include <vector>
 
 #define TAG "CARPROBE1"
@@ -26,6 +27,8 @@ namespace {
 const uint64_t kSlots[6] = {0x2848160, 0x2848168, 0x2848170, 0x2848178, 0x2848180, 0x2848188};
 const uint64_t kSigOff[5] = {0x60, 0x90, 0xc0, 0xf0, 0x100};  // vptr-like words
 const size_t kObjSize = 0x240;
+uint64_t gStackLo = 0, gStackHi = 0;       // this thread's own stack (ignored by the scan)
+const uint64_t kXor = 0x5a5a5a5a5a5a5a5aull;  // stored copies are scrambled so they never match
 
 struct Lib { uint64_t base; uint64_t end; char path[200]; };
 
@@ -85,6 +88,7 @@ std::vector<uint64_t> findHits(int fd, uint64_t target, const void* ownBuf, size
                     uint64_t at = a + i * 8;
                     if (at >= (uint64_t)(uintptr_t)chunk && at < (uint64_t)(uintptr_t)chunk + sizeof(chunk)) continue;
                     if (at >= own0 && at < own1) continue;
+                    if (at >= gStackLo && at < gStackHi) continue;
                     hits.push_back(at);
                 }
         }
@@ -110,19 +114,45 @@ void fmt(const Lib& L, int fd, uint64_t w, char* out, size_t n) {
     snprintf(out, n, "x%llx", (unsigned long long)w);
 }
 
+std::map<uint64_t, std::vector<uint64_t> > gFirst;  // first dump of each object
+
 void dumpObj(const Lib& L, int fd, uint64_t B, int idx) {
     uint64_t buf[kObjSize / 8];
     if (!rd(fd, B, buf, sizeof(buf))) { LOGI("ST obj%d @%llx READFAIL", idx, (unsigned long long)B); return; }
+    auto it = gFirst.find(B);
     char t[3][40];
-    for (size_t i = 0; i < kObjSize / 8; i += 3) {
-        for (int k = 0; k < 3; k++) {
-            if (i + k < kObjSize / 8) fmt(L, fd, buf[i + k], t[k], sizeof(t[k])); else t[k][0] = 0;
+    if (it == gFirst.end()) {
+        gFirst[B] = std::vector<uint64_t>(buf, buf + kObjSize / 8);
+        for (auto& w : gFirst[B]) w ^= kXor;
+        for (size_t i = 0; i < kObjSize / 8; i += 3) {
+            for (int k = 0; k < 3; k++) {
+                if (i + k < kObjSize / 8) fmt(L, fd, buf[i + k], t[k], sizeof(t[k])); else t[k][0] = 0;
+            }
+            LOGI("ST obj%d +%03zx: %s | %s | %s", idx, i * 8, t[0], t[1], t[2]);
         }
-        LOGI("ST obj%d +%03zx: %s | %s | %s", idx, i * 8, t[0], t[1], t[2]);
+        return;
     }
+    int changed = 0;
+    for (size_t i = 0; i < kObjSize / 8; i++) {
+        uint64_t old = it->second[i] ^ kXor;
+        if (buf[i] == old) continue;
+        char a[40], b[40];
+        fmt(L, fd, old, a, sizeof(a)); fmt(L, fd, buf[i], b, sizeof(b));
+        if (changed < 40) LOGI("ST obj%d +%03zx changed: %s -> %s", idx, i * 8, a, b);
+        changed++;
+    }
+    LOGI("ST obj%d @%llx: %d words changed since first dump", idx, (unsigned long long)B, changed);
 }
 
 void scanOnce(int n) {
+    {
+        pthread_attr_t at;
+        if (pthread_getattr_np(pthread_self(), &at) == 0) {
+            void* sa = nullptr; size_t ss = 0;
+            if (pthread_attr_getstack(&at, &sa, &ss) == 0) { gStackLo = (uint64_t)(uintptr_t)sa; gStackHi = gStackLo + ss; }
+            pthread_attr_destroy(&at);
+        }
+    }
     Lib L; memset(&L, 0, sizeof(L));
     dl_iterate_phdr(phdrCb, &L);
     if (!L.base) { LOGI("ST scan %d: game lib not found", n); return; }
@@ -153,13 +183,12 @@ void scanOnce(int n) {
         c.push_back({B, score});
     }
     int shown = 0;
-    for (int want = 5; want >= 3 && shown < 4; want--)
-        for (auto& x : c) {
-            if (x.score != want || shown >= 4) continue;
-            LOGI("ST scan %d: object @%llx score=%d/5", n, (unsigned long long)x.B, x.score);
-            dumpObj(L, fd, x.B, shown);
-            shown++;
-        }
+    for (auto& x : c) {
+        if (shown >= 4) break;
+        LOGI("ST scan %d: object @%llx score=%d/5", n, (unsigned long long)x.B, x.score);
+        dumpObj(L, fd, x.B, shown);
+        shown++;
+    }
     LOGI("ST scan %d: done, candidates=%zu shown=%d", n, c.size(), shown);
     close(fd);
 }
