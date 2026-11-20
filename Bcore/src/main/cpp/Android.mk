@@ -67,7 +67,7 @@ include $(BUILD_SHARED_LIBRARY)
 
 include $(CLEAR_VARS)
 LOCAL_MODULE := carprobe
-LOCAL_SRC_FILES := carprobe/carprobe.cpp carprobe/physprobe.cpp
+LOCAL_SRC_FILES := carprobe/carprobe.cpp carprobe/physprobe.cpp carprobe/fnprobe.cpp
 LOCAL_C_INCLUDES += $(LOCAL_PATH)
 LOCAL_CPPFLAGS += -std=c++17 -w
 LOCAL_LDFLAGS += -Wl,-z,max-page-size=16384
