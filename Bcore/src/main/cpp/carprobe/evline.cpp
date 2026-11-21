@@ -1,4 +1,4 @@
-// evline.cpp v1 - READ-ONLY finder for a "polyline of (x,y) doubles" in the heap
+// evline.cpp v2 - READ-ONLY finder for a "polyline of (x,y) doubles" in the heap
 // Path: Bcore/src/main/cpp/carprobe/evline.cpp
 // Why: the other trajectory mod running in the same game process keeps the line it
 // draws as a list of (x, y) double pairs (table coordinates). This probe only READS
@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -28,14 +29,14 @@
 namespace {
 
 const int    kMinPts   = 8;        // shortest list that counts
-const double kMaxAbs   = 320.0;    // table coordinates stay inside this
+const double kMaxAbs   = 40.0;     // the lists are in cm (board half = 37), so stay inside this
 const double kMinStep  = 0.02;     // distance between two neighbouring points
-const double kMaxStep  = 120.0;
-const double kMinLen   = 30.0;     // whole polyline
-const double kMinBox   = 15.0;     // spread of the polyline
-const int    kScans    = 45;
+const double kMaxStep  = 4.0;       // a ball moves at most ~2.8 cm per step
+const double kMinLen   = 10.0;     // whole polyline (cm)
+const double kMinBox   = 5.0;      // spread of the polyline (cm)
+const int    kScans    = 80;
 const int    kPeriodS  = 8;
-const int    kDumpMax  = 300;      // points per dump
+const int    kDumpMax  = 400;      // points per dump
 
 uint64_t gStackLo = 0, gStackHi = 0;
 uint64_t chunkBuf[1 << 17];        // 1 MB read buffer (hits inside it are ignored)
@@ -134,7 +135,7 @@ void scanHeap(int fd, std::map<uint64_t, Run>& out, size_t* regions, uint64_t* m
 
 bool run_more(const Run& a, const Run& b) { return a.n > b.n; }
 
-std::string gLastSig;
+std::set<std::string> gSeen;   // first 3 points of every list already printed
 
 void dumpRun(int fd, const Run& r, int idx) {
     int n = r.n < kDumpMax ? r.n : kDumpMax;
@@ -165,19 +166,29 @@ void scanOnce(int n) {
     std::vector<Run> v;
     for (auto& kv : runs) v.push_back(kv.second);
     std::sort(v.begin(), v.end(), run_more);
-    // signature of the top 6 to print only when something changed
-    std::string sig; char t[200];
-    for (size_t i = 0; i < v.size() && i < 6; i++) { snprintf(t, sizeof(t), "%llx/%d/%.2f;", (unsigned long long)v[i].addr, v[i].n, v[i].p0x + v[i].pnx); sig += t; }
-    bool changed = sig != gLastSig;
-    LOGI("EVL scan %d: regions=%zu MB=%llu ms=%ld lists=%zu %s", n, regions, (unsigned long long)mb, nowMs() - t0, v.size(), changed ? "(changed)" : "(same as before)");
-    if (changed) {
-        gLastSig = sig;
-        for (size_t i = 0; i < v.size() && i < 10; i++) {
-            const Run& r = v[i];
-            LOGI("EVL cand%zu @%llx n=%d len=%.1f box=x[%.1f..%.1f] y[%.1f..%.1f] p0=(%.3f,%.3f) p1=(%.3f,%.3f) last=(%.3f,%.3f)", i,
-                 (unsigned long long)r.addr, r.n, r.len, r.x0, r.x1, r.y0, r.y1, r.p0x, r.p0y, r.p1x, r.p1y, r.pnx, r.pny);
-        }
-        for (size_t i = 0; i < v.size() && i < 2; i++) dumpRun(fd, v[i], (int)i);
+    // drop a list when a neighbour list 8 bytes away (the other pairing) is clearly longer
+    std::vector<Run> keep;
+    for (auto& r : v) {
+        bool shadow = false;
+        auto a1 = runs.find(r.addr - 8), a2 = runs.find(r.addr + 8);
+        if (a1 != runs.end() && a1->second.n > r.n + 1) shadow = true;
+        if (a2 != runs.end() && a2->second.n > r.n + 1) shadow = true;
+        if (!shadow) keep.push_back(r);
+    }
+    int fresh = 0;
+    std::vector<Run> todo;
+    for (auto& r : keep) {
+        double buf3[6];
+        if (pread(fd, buf3, sizeof(buf3), (off_t)r.addr) != (ssize_t)sizeof(buf3)) continue;
+        char sg[160]; snprintf(sg, sizeof(sg), "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f", buf3[0], buf3[1], buf3[2], buf3[3], buf3[4], buf3[5]);
+        if (gSeen.insert(sg).second) { fresh++; if (todo.size() < 8) todo.push_back(r); }
+    }
+    LOGI("EVL scan %d: regions=%zu MB=%llu ms=%ld lists=%zu kept=%zu new=%d", n, regions, (unsigned long long)mb, nowMs() - t0, v.size(), keep.size(), fresh);
+    for (size_t i = 0; i < todo.size(); i++) {
+        const Run& r = todo[i];
+        LOGI("EVL new%zu @%llx n=%d len=%.1f p0=(%.3f,%.3f) p1=(%.3f,%.3f) last=(%.3f,%.3f)", i, (unsigned long long)r.addr, r.n, r.len,
+             r.p0x, r.p0y, r.p1x, r.p1y, r.pnx, r.pny);
+        dumpRun(fd, r, (int)i);
     }
     close(fd);
 }
